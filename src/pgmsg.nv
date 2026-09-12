@@ -1,0 +1,412 @@
+// pgmsg.nv — the version 3 wire protocol as bytes in and messages
+// out, and messages in and bytes out.  No socket anywhere in it.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS MODULE IS THE PACKAGE'S LOAD-BEARING INTERFACE, and it is one
+// enum: `PgBackend`.  Every byte a PostgreSQL server ever sends
+// becomes one of its variants, and `PgReadyForQuery` is the only one
+// that ENDS an exchange.
+//
+// WHY THAT LAST SENTENCE IS THE WHOLE DESIGN.  In the extended query
+// protocol a client sends Parse, Bind, Execute, Sync, and the server
+// answers with a stream that has no length and no count: a
+// ParseComplete, a BindComplete, a RowDescription, some number of
+// DataRows, a CommandComplete, and then ReadyForQuery.  At any point a
+// NoticeResponse, a ParameterStatus or a NotificationResponse can
+// arrive, belonging to nothing in particular.  And when an
+// ErrorResponse arrives the server DISCARDS EVERY FURTHER MESSAGE
+// UNTIL IT SEES A SYNC.
+//
+// That last rule is what makes a pipelining client subtly wrong.  Send
+// Parse/Bind/Execute for two statements with one Sync at the end, have
+// the first fail, and the second never runs — the server skipped it —
+// but a client counting CommandCompletes is still waiting for a result
+// that will never come, and the connection hangs rather than errors.
+// `PgReadyForQuery` carries the transaction status and is the only
+// message that says "everything before this is settled"; a client that
+// acted on a CommandComplete instead is a client that acted inside a
+// transaction the server has already aborted.
+//
+// So: `discards_until_sync` is a public predicate, `PgReadyForQuery`
+// carries `PgTxStatus`, and `pgconn` will not hand a result to a
+// caller before it has one.
+//
+// THE FRAMING, which is two shapes and not one:
+//
+//   * the STARTUP messages — StartupMessage, SSLRequest, GSSENCRequest
+//     and CancelRequest — have NO type byte.  Four bytes of length,
+//     then four bytes that are a version or a request code.  That is
+//     what lets a server tell an old client from a TLS handshake on
+//     byte one.
+//   * every other message has a one-byte type, then four bytes of
+//     length that INCLUDE THEMSELVES and exclude the type byte.  A
+//     decoder that added or forgot those four is off by four for the
+//     rest of the connection.
+//
+// A LENGTH IS THE CALLER'S BUDGET.  A DataRow can legitimately be a
+// gigabyte, and a length field is four bytes an attacker controls.
+// `decode_backend` takes `max_bytes` and refuses past it carrying both
+// numbers, rather than allocating what the wire asked for.
+
+use pgerror
+
+// Which way a value is on the wire.
+//
+// Per COLUMN and per PARAMETER, not per connection: a Bind names a
+// format for each parameter and each result column, and the two lists
+// are independent.  Text is what a `Query` always returns; binary is
+// what an extended-protocol client asks for and is both smaller and
+// unambiguous — a `float8` in text has been through a decimal
+// rendering and back.
+pub enum PgFormat
+    PgText
+    PgBinary
+
+// What `ReadyForQuery` says about the session.
+pub enum PgTxStatus
+    // No transaction open.
+    PgIdle
+    // Inside a transaction block.
+    PgInTransaction
+    // Inside a FAILED transaction block: every statement until the
+    // rollback is refused with SQLSTATE 25P02.  The status a client
+    // must not ignore — continuing to send work here produces a run
+    // of identical errors that look like the application's fault.
+    PgInFailedTransaction
+
+// What the server is asking for at the authentication step.
+pub enum PgAuthRequest
+    // Authentication succeeded.
+    PgAuthOk
+    // Send the password as it is, which means the connection had
+    // better be TLS.
+    PgAuthCleartext
+    // Send `md5` followed by the double-MD5 hex; the salt is four
+    // bytes.
+    PgAuthMd5(salt: Bytes)
+    // Begin SASL with one of these mechanisms — in practice
+    // `SCRAM-SHA-256` and `SCRAM-SHA-256-PLUS`.
+    PgAuthSasl(mechanisms: [Str])
+    // A SASL exchange step; the payload is the server's message.
+    PgAuthSaslContinue(data: Bytes)
+    // The final SASL message, carrying the server's signature.
+    PgAuthSaslFinal(data: Bytes)
+    // Kerberos, GSSAPI, SSPI or SCM credentials — named so the
+    // refusal can say which, because the fix is a server setting.
+    PgAuthUnsupported(method: Str, code: Int)
+
+// One column of a `RowDescription`.
+pub struct PgColumn
+    name: Str
+    // The table this column comes from, by OID, and its position in
+    // that table; both 0 for a computed column.
+    table_oid: Int
+    table_column: Int
+    // The type's OID.  `pgtype` is where the OIDs that matter are
+    // named.
+    type_oid: Int
+    // The type's length in bytes, negative for a variable-length
+    // type.
+    type_size: Int
+    // The type modifier — the `n` in `varchar(n)`, the precision and
+    // scale in `numeric(p, s)` — or -1.
+    type_modifier: Int
+    // Which way THIS column's values arrive.
+    format: PgFormat
+
+// Every message a PostgreSQL server sends.
+//
+// THE PACKAGE'S LOAD-BEARING INTERFACE — see the module comment.
+pub enum PgBackend
+    // `R` — the authentication step the server wants next.
+    PgAuthentication(request: PgAuthRequest)
+    // `K` — the process id and secret key a `CancelRequest` needs.
+    // Arrives once, before the first `ReadyForQuery`, and has to be
+    // kept for the life of the connection: cancelling needs a SECOND
+    // connection and these two numbers.
+    PgBackendKeyData(process_id: Int, secret_key: Int)
+    // `S` — a server parameter's current value.  Arrives at startup
+    // for about a dozen parameters and again whenever one changes,
+    // which includes `client_encoding` and `DateStyle` — both of
+    // which change how text-format values have to be READ.
+    PgParameterStatus(name: Str, value: Str)
+    // `Z` — the end of an exchange, and the only message that is.
+    PgReadyForQuery(status: PgTxStatus)
+    // `T` — the shape of the rows that follow.
+    PgRowDescription(columns: [PgColumn])
+    // `D` — one row.  A NULL column is a length of -1 on the wire and
+    // arrives here as an empty `Bytes` with its position recorded in
+    // `nulls`, because `Bytes` cannot be absent and a zero-length
+    // string is a legitimate non-NULL value.
+    PgDataRow(values: [Bytes], nulls: [Bool])
+    // `C` — the statement finished.  The tag is "SELECT 12",
+    // "INSERT 0 3", "UPDATE 5"; `pgquery.rows_affected` parses it
+    // rather than every caller doing so.
+    PgCommandComplete(tag: Str)
+    // `I` — the statement was an empty string.  Not an error, and not
+    // a `CommandComplete`: a client that expected one hangs.
+    PgEmptyQueryResponse
+    // `E` — see `pgerror.PgFields`.
+    PgErrorResponse(fields: pgerror.PgFields)
+    // `N` — the same field set, and NOT an error.  Arrives at any
+    // moment including inside a result set.
+    PgNoticeResponse(fields: pgerror.PgFields)
+    // `A` — a `NOTIFY` from another session.  Arrives whenever the
+    // server feels like it, so every read loop has to expect it and
+    // not only the one inside `LISTEN`.
+    PgNotification(process_id: Int, channel: Str, payload: Str)
+    // `1` — Parse succeeded.
+    PgParseComplete
+    // `2` — Bind succeeded.
+    PgBindComplete
+    // `3` — Close succeeded.
+    PgCloseComplete
+    // `t` — the parameter types a Describe asked about.
+    PgParameterDescription(type_oids: [Int])
+    // `n` — the described statement returns no rows.
+    PgNoData
+    // `s` — Execute stopped at its row limit and the portal is still
+    // open.  The message that makes a cursor a cursor, and the one a
+    // client that always sends a limit of zero never sees.
+    PgPortalSuspended
+    // `G` — the server is ready for `CopyData` from the client.
+    PgCopyInResponse(format: PgFormat, column_formats: [PgFormat])
+    // `H` — the server is about to send `CopyData`.
+    PgCopyOutResponse(format: PgFormat, column_formats: [PgFormat])
+    // `W` — replication: both directions at once.
+    PgCopyBothResponse(format: PgFormat, column_formats: [PgFormat])
+    // `d` — one chunk of COPY data.  NOT one row: the chunking is the
+    // server's and a row can span two of them.
+    PgCopyData(data: Bytes)
+    // `c` — the COPY stream ended.
+    PgCopyDone
+    // `V` — the result of a fast-path function call.
+    PgFunctionCallResponse(value: Bytes, is_null: Bool)
+    // `v` — the protocol version the server negotiated down to, with
+    // the options it did not recognise.
+    PgNegotiateProtocolVersion(minor: Int, unrecognised: [Str])
+
+// Every message a client sends.
+pub enum PgFrontend
+    // The startup packet: no type byte, a version, and the parameter
+    // pairs.  `user` is required; `database` defaults to the user's
+    // name; `application_name` and `options` are the two other pairs
+    // worth setting.
+    PgStartup(parameters: [Str], values: [Str])
+    // Ask the server whether it will speak TLS.  No type byte, eight
+    // bytes total, and the answer is a single byte `S` or `N` rather
+    // than a message — which is why `pgconn` handles it before the
+    // message loop exists.
+    PgSslRequest
+    // Cancel whatever the session identified by these two numbers is
+    // running.  Sent on a SECOND connection, and the server answers
+    // nothing at all — see `pgconn.cancel`.
+    PgCancelRequest(process_id: Int, secret_key: Int)
+    // `Q` — the simple query protocol: SQL text, possibly several
+    // statements separated by semicolons, always text format, and no
+    // parameters.  Convenient and unparameterised, which is to say it
+    // is where SQL injection lives.
+    PgQuery(sql: Str)
+    // `P` — prepare a statement.  An empty name is the UNNAMED
+    // statement, which every later Parse silently replaces.
+    PgParse(name: Str, sql: Str, parameter_oids: [Int])
+    // `B` — bind values to a prepared statement, producing a portal.
+    // The two format lists are independent and each may be empty
+    // (all text), of length one (that format for every value), or of
+    // the full length.
+    PgBind(portal: Str, statement: Str, parameter_formats: [PgFormat], parameters: [Bytes],
+           parameter_nulls: [Bool], result_formats: [PgFormat])
+    // `E` — run a portal.  `max_rows` of 0 means every row; anything
+    // else stops at that many and answers `PortalSuspended`.
+    PgExecute(portal: Str, max_rows: Int)
+    // `D` — ask for a statement's or a portal's shape.
+    PgDescribeStatement(name: Str)
+    PgDescribePortal(name: Str)
+    // `C` — release a statement or a portal.
+    PgCloseStatement(name: Str)
+    PgClosePortal(name: Str)
+    // `H` — make the server send what it has without ending the
+    // exchange.  What a pipelining client sends instead of Sync when
+    // it wants results but not a transaction boundary.
+    PgFlush
+    // `S` — end the exchange.  THE MESSAGE THAT MATTERS: it closes an
+    // implicit transaction and it is where the server stops
+    // discarding after an error.
+    PgSync
+    // `X` — a clean goodbye.  Not required and worth sending: without
+    // it the server logs every disconnect as unexpected.
+    PgTerminate
+    // `p` — a password, a SASL initial response or a SASL response.
+    // One type byte for three different payloads, which is the
+    // protocol's own decision and is why the STEP has to be tracked
+    // by the client rather than read off the message.
+    PgPasswordMessage(data: Bytes)
+    PgSaslInitialResponse(mechanism: Str, data: Bytes)
+    PgSaslResponse(data: Bytes)
+    // `d`, `c`, `f` — the client's side of a COPY.
+    PgCopyDataOut(data: Bytes)
+    PgCopyDoneOut
+    PgCopyFail(reason: Str)
+
+// ── framing ──────────────────────────────────────────────────────────
+
+// 196608 — protocol version 3.0, as the startup packet spells it.
+pub fn protocol_version() -> Int
+    todo("postgres-nv.pgmsg.protocol_version")
+
+// 80877103 — the `SSLRequest` code, in the four bytes where a version
+// would be.
+pub fn ssl_request_code() -> Int
+    todo("postgres-nv.pgmsg.ssl_request_code")
+
+// 80877102 — the `CancelRequest` code.
+pub fn cancel_request_code() -> Int
+    todo("postgres-nv.pgmsg.cancel_request_code")
+
+// How many bytes of `buf` a complete message occupies, or `None` when
+// the buffer does not hold a whole one yet.
+//
+// THE FIRST THING A READ LOOP CALLS.  A socket read returns whatever
+// the kernel had, which is a message and a half about as often as it
+// is a message; a client that assumed a read was a message works on
+// localhost and fails under load.  This answers "is there a whole one
+// here" without decoding it and without copying.
+//
+// `max_bytes` is the caller's ceiling: a length larger than it is
+// `PgBadMessage` rather than an allocation the wire asked for.
+//
+// ```novo
+// use pgmsg
+// use std.bytes
+//
+// fn main() [io]
+//     match pgmsg.frame_length(bytes.zeros(0), 0, 1048576)
+//         Ok(n)  => println("a whole message")
+//         Err(_) => println("not yet, or refused")
+// ```
+pub fn frame_length(buf: Bytes, offset: Int, max_bytes: Int) -> Result<?Int, pgerror.PgFault>
+    todo("postgres-nv.pgmsg.frame_length")
+
+// The type byte of the message at `offset`, or `None` when there is
+// not one yet.
+pub fn frame_kind(buf: Bytes, offset: Int) -> ?Int
+    todo("postgres-nv.pgmsg.frame_kind")
+
+// Decode one backend message.
+//
+// `buf` must hold a whole one — `frame_length` is what says so.
+//
+// ```novo
+// use pgmsg
+// use std.bytes
+//
+// fn main() [io]
+//     match pgmsg.decode_backend(bytes.zeros(0), 0, 1048576)
+//         Ok(m)  => println("decoded")
+//         Err(_) => println("not a message")
+// ```
+pub fn decode_backend(buf: Bytes, offset: Int, max_bytes: Int) -> Result<PgBackend, pgerror.PgFault>
+    todo("postgres-nv.pgmsg.decode_backend")
+
+// Encode a frontend message into the bytes that go on the wire.
+//
+// Answers bytes rather than writing them, because this module has no
+// socket — `pgconn` is what sends them, and a pooler or a test double
+// is what else might.
+//
+// ```novo
+// use pgmsg
+// use std.bytes
+//
+// fn main() [io]
+//     match pgmsg.encode_frontend(pgmsg.PgSync)
+//         Ok(b)  => println("${bytes.len(b)}")
+//         Err(_) => println("could not encode")
+// ```
+pub fn encode_frontend(m: PgFrontend) -> Result<Bytes, pgerror.PgFault>
+    todo("postgres-nv.pgmsg.encode_frontend")
+
+// Encode several frontend messages into one buffer.
+//
+// What pipelining IS: Parse, Bind, Execute and Sync in one write
+// rather than four, which turns four round trips into one.  The
+// function exists so that a caller does not concatenate by hand and
+// so that `discards_until_sync`'s warning has somewhere to live.
+pub fn encode_batch(ms: [PgFrontend]) -> Result<Bytes, pgerror.PgFault>
+    todo("postgres-nv.pgmsg.encode_batch")
+
+// ── the rule ─────────────────────────────────────────────────────────
+
+// True when this message is one the server sends before it starts
+// discarding — i.e. when it is an `ErrorResponse`.
+//
+// THE PREDICATE THE MODULE COMMENT EXISTS FOR.  After an
+// `ErrorResponse` in the extended protocol, the server ignores every
+// message until a `Sync`.  A pipelining client that kept counting
+// results is waiting for a statement the server skipped, and the
+// connection hangs rather than failing.
+//
+// ```novo
+// use pgmsg
+//
+// fn main() [io]
+//     println("${pgmsg.discards_until_sync(pgmsg.PgParseComplete)}")
+// ```
+pub fn discards_until_sync(m: PgBackend) -> Bool
+    todo("postgres-nv.pgmsg.discards_until_sync")
+
+// True when this message ENDS an exchange — `ReadyForQuery` and
+// nothing else.
+//
+// ```novo
+// use pgmsg
+//
+// fn main() [io]
+//     println("${pgmsg.ends_exchange(pgmsg.PgReadyForQuery(status: pgmsg.PgIdle))}")
+// ```
+pub fn ends_exchange(m: PgBackend) -> Bool
+    todo("postgres-nv.pgmsg.ends_exchange")
+
+// True when this message can arrive at ANY moment and belongs to no
+// exchange: `ParameterStatus`, `NoticeResponse`, `NotificationResponse`.
+//
+// Every read loop in this package routes on it first.  A client that
+// did not is one whose `SELECT` occasionally returns a notification
+// where a row should be.
+//
+// ```novo
+// use pgmsg
+//
+// fn main() [io]
+//     println("${pgmsg.is_asynchronous(pgmsg.PgNoData)}")
+// ```
+pub fn is_asynchronous(m: PgBackend) -> Bool
+    todo("postgres-nv.pgmsg.is_asynchronous")
+
+// The transaction status a `ReadyForQuery` carries, or `None` for
+// every other message.
+pub fn tx_status(m: PgBackend) -> ?PgTxStatus
+    todo("postgres-nv.pgmsg.tx_status")
+
+// The rows a `CommandComplete` tag reports: 12 from "SELECT 12", 3
+// from "INSERT 0 3", 0 from "CREATE TABLE".
+//
+// Published because the tag's shape is not uniform — `INSERT` carries
+// an OID before its count, for historical reasons, and every other
+// command does not — and because a caller that split on a space gets
+// the OID.
+//
+// ```novo
+// use pgmsg
+//
+// fn main() [io]
+//     println("${pgmsg.tag_rows("INSERT 0 3")}")
+// ```
+pub fn tag_rows(tag: Str) -> Int
+    todo("postgres-nv.pgmsg.tag_rows")
+
+// The command a `CommandComplete` tag names: "SELECT", "INSERT",
+// "UPDATE", "CREATE TABLE".
+pub fn tag_command(tag: Str) -> Str
+    todo("postgres-nv.pgmsg.tag_command")

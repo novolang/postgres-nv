@@ -1,0 +1,383 @@
+// pgconn.nv — the socket, the startup handshake, and the read loop
+// that turns bytes into `pgmsg.PgBackend`.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[net]` AND NOT `[io, net]`.  `std.net`'s free functions —
+// `net.connect`, `net.send_bytes`, `net.recv_bytes`, `net.close` —
+// declare `[net]` alone, so a client built on them costs `[net]` and
+// the `[io]` a `TcpStream` method would add is not owed.  `[time]`
+// appears only on the functions that consult a deadline, and nothing
+// here prints.
+//
+// TLS IS A HOOK AND NOT A DEPENDENCY.  A driver that chose a TLS
+// implementation would choose it for every program that links the
+// driver.  `PgTransport` is the seam: a caller supplies the two
+// functions that move bytes, and the default pair is `std.net`'s.
+// PostgreSQL's own `SSLRequest` is one eight-byte packet before any of
+// it — the server answers a single BYTE, `S` or `N`, not a message —
+// so the negotiation happens here and the handshake happens in the
+// caller's code.
+//
+// A SERVER THAT ANSWERS `N` HAS NOT FAILED, AND THAT IS THE DANGER.
+// It has said "no TLS", and a client that continued has silently
+// downgraded to plaintext on a connection the user asked to encrypt.
+// `PgSslMode` is therefore an argument with no default, spelling out
+// which of the five behaviours the caller wants, and `PgSslRequire`
+// and above refuse rather than continue.
+//
+// THE READ LOOP IS THE PACKAGE'S ONE LOOP.  Every message from the
+// server arrives through `next_message`, which:
+//
+//   * reassembles across socket reads, because a read returns whatever
+//     the kernel had and that is a message and a half about as often
+//     as it is a message;
+//   * routes `ParameterStatus` into `PgConn.settings` — the text
+//     formats depend on them and a client that ignored them reads
+//     dates wrong;
+//   * queues `NotificationResponse` rather than dropping it, because
+//     a `NOTIFY` arrives in the middle of anything;
+//   * and hands back everything else.
+//
+// CANCELLATION NEEDS A SECOND CONNECTION AND ANSWERS NOTHING.  A
+// `CancelRequest` cannot be sent on the connection it cancels — that
+// one is busy — so `cancel` opens a new socket, sends sixteen bytes,
+// and closes it.  The server replies with nothing at all, ever,
+// whether it cancelled anything or not, so `cancel` answering `Ok`
+// means "the request was sent" and never "the query stopped".  Saying
+// so in the signature is impossible; saying so here is the next best
+// thing.
+
+use pgauth
+use pgerror
+use pgmsg
+use pgtype
+
+// What the caller wants done about TLS.
+pub enum PgSslMode
+    // Never ask.  The only honest mode for a Unix socket.
+    PgSslDisable
+    // Ask, and carry on in the clear if the server says no.
+    // Encryption when it is free, and no guarantee — which is
+    // worth having and is not security.
+    PgSslPrefer
+    // Ask, and refuse the connection if the server says no.
+    PgSslRequire
+    // As require, and also check that the certificate chains to a
+    // trusted root.  The checking is the caller's transport's.
+    PgSslVerifyCa
+    // As verify-ca, and also check that the certificate names the
+    // host asked for.  The only mode that resists an active attacker,
+    // and the reason the weaker ones have to be named rather than
+    // defaulted into.
+    PgSslVerifyFull
+
+// How bytes get to the server and back.
+//
+// The seam TLS goes through — see the module comment.  A caller that
+// wants plaintext uses `plain_transport`; one that wants TLS wraps its
+// own handshake and supplies these three.
+//
+// The functions are NAMED FUNCTIONS and not lambdas: a lambda that
+// becomes a value is refused at `@tier(embedded)`, and while this
+// package makes no device claim, the shape is the one the rest of the
+// grid uses and there is no reason for this to be the exception.
+pub struct PgTransport
+    // Send every byte, or answer the fault.  `handle` is whatever the
+    // caller's `connect` produced — a socket for plaintext, a session
+    // for TLS.
+    send: fn(Int, Bytes) -> ?pgerror.PgFault
+    // Read up to `n` bytes.  An empty answer means the peer closed.
+    recv: fn(Int, Int) -> Result<Bytes, pgerror.PgFault>
+    // Close it.
+    close: fn(Int) -> ?pgerror.PgFault
+
+// Where and as whom to connect.
+pub struct PgConnectOptions
+    // A host name or address, or a filesystem path for a Unix socket
+    // — `std.net`'s `unix_connect` takes the same handle type, so one
+    // field covers both and `is_unix_socket` is the question.
+    host: Str
+    port: Int
+    user: Str
+    password: Str
+    // Empty means the user's own name, which is PostgreSQL's rule.
+    database: Str
+    // Sent as the `application_name` parameter, which is what shows
+    // up in `pg_stat_activity`.  A client that leaves it empty is one
+    // nobody can find when it is the one holding the lock.
+    application_name: Str
+    // What to do about TLS.  No default — see the module comment.
+    ssl_mode: PgSslMode
+    // Allow `AuthenticationCleartextPassword` over a connection that
+    // is not encrypted.  False by default, because the alternative is
+    // sending the password in the clear because a server asked.
+    allow_cleartext: Bool
+    // What the caller can bind the SCRAM exchange to.
+    channel_binding: pgauth.PgChannelBinding
+    // Refuse a message larger than this.  A `DataRow` can
+    // legitimately be a gigabyte, so the ceiling is the caller's
+    // rather than a constant.
+    max_message_bytes: Int
+    // How long to wait for the connection and for a read.  Zero means
+    // no deadline, which is what a long `COPY` wants and what an
+    // interactive client must not use.
+    connect_timeout_ms: Int
+    read_timeout_ms: Int
+
+// An open connection.
+pub struct PgConn
+    // The handle the transport's `connect` produced.
+    handle: Int
+    transport: PgTransport
+    options: PgConnectOptions
+    // The process id and secret key, for `cancel`.  Kept for the life
+    // of the connection because a cancel needs both and they arrive
+    // once, at startup.
+    process_id: Int
+    secret_key: Int
+    // Every `ParameterStatus` the server has sent, most recent value
+    // per name.
+    parameter_names: [Str]
+    parameter_values: [Str]
+    // The ones that change how text decodes.
+    settings: pgtype.PgTextSettings
+    // Bytes read and not yet framed.  A socket read is not a message
+    // — see the module comment.
+    inbox: Bytes
+    // `NOTIFY` messages that arrived while something else was being
+    // read.  Queued rather than dropped.
+    notifications: [pgmsg.PgBackend]
+    // The last `ReadyForQuery` status, or `PgIdle` before the first.
+    // THE FIELD A CALLER CHECKS before it decides a statement
+    // succeeded — see `pgmsg`'s module comment.
+    status: pgmsg.PgTxStatus
+    // True once the connection is unusable.
+    broken: Bool
+
+// ── transports ───────────────────────────────────────────────────────
+
+// The plaintext transport over `std.net`.
+//
+// ```novo
+// use pgconn
+//
+// fn main() [io]
+//     let t = pgconn.plain_transport()
+//     println("ready")
+// ```
+pub fn plain_transport() -> PgTransport
+    todo("postgres-nv.pgconn.plain_transport")
+
+// Sensible options for a local server: 127.0.0.1, port 5432, TLS
+// preferred, a one-megabyte message ceiling and a ten-second connect
+// deadline.
+//
+// A function and not a constant so that a caller starts from
+// something rather than filling in fourteen fields, and so that the
+// defaults are readable in one place.
+//
+// ```novo
+// use pgconn
+//
+// fn main() [io]
+//     println("${pgconn.default_options("postgres").port}")
+// ```
+pub fn default_options(user: Str) -> PgConnectOptions
+    todo("postgres-nv.pgconn.default_options")
+
+// True when `host` names a filesystem path rather than a host — it
+// begins with a `/`.
+//
+// PostgreSQL's own rule, and the one that decides between
+// `net.connect` and `net.unix_connect`.
+pub fn is_unix_socket(host: Str) -> Bool
+    todo("postgres-nv.pgconn.is_unix_socket")
+
+// ── connecting ───────────────────────────────────────────────────────
+
+// Open a connection: socket, `SSLRequest`, startup packet,
+// authentication, and every message up to the first
+// `ReadyForQuery`.
+//
+// Answers a connection that is ready for work, which means the
+// `BackendKeyData` and every startup `ParameterStatus` have already
+// been absorbed.
+//
+// ```novo
+// use pgconn
+//
+// fn main() [io, net, time]
+//     match pgconn.connect(pgconn.default_options("postgres"), pgconn.plain_transport())
+//         Ok(c)  => println("${c.process_id}")
+//         Err(_) => println("could not connect")
+// ```
+pub fn connect(o: PgConnectOptions, t: PgTransport) -> Result<PgConn, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgconn.connect")
+
+// Ask the server whether it will speak TLS, and answer what it said.
+//
+// Published separately because a caller doing TLS has to run its
+// handshake BETWEEN this and the startup packet, which no single
+// `connect` can do for it.  `true` means the server said `S` and the
+// caller should hand back a transport that encrypts; `false` means
+// `N`, and `PgSslRequire` and above turn that into `PgTlsRefused`
+// rather than continuing — see the module comment.
+//
+// ```novo
+// use pgconn
+//
+// fn main() [io, net, time]
+//     println("negotiation is a separate step")
+// ```
+pub fn negotiate_tls(handle: Int, t: PgTransport,
+                     mode: PgSslMode) -> Result<Bool, pgerror.PgFault> [net]
+    todo("postgres-nv.pgconn.negotiate_tls")
+
+// Close the connection, sending `Terminate` first.
+//
+// Without the `Terminate` the server logs every disconnect as
+// unexpected, which is a log full of noise and a real problem hidden
+// in it.
+pub fn close(c: PgConn) -> ?pgerror.PgFault [net]
+    todo("postgres-nv.pgconn.close")
+
+// ── the read loop ────────────────────────────────────────────────────
+
+// The next message from the server that belongs to the caller.
+//
+// THE PACKAGE'S ONE LOOP — see the module comment.  Reassembles across
+// socket reads, absorbs `ParameterStatus` into `settings`, queues
+// `NotificationResponse`, and hands back everything else.
+//
+// ```novo
+// use pgconn
+// use pgmsg
+//
+// fn main() [io, net, time]
+//     match pgconn.connect(pgconn.default_options("postgres"), pgconn.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  =>
+//             match pgconn.next_message(c)
+//                 Ok(r)  => println("a message")
+//                 Err(_) => println("connection lost")
+// ```
+pub struct PgReceived
+    conn: PgConn
+    message: pgmsg.PgBackend
+
+// Read one message.
+pub fn next_message(c: PgConn) -> Result<PgReceived, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgconn.next_message")
+
+// Send one message.
+pub fn send(c: PgConn, m: pgmsg.PgFrontend) -> Result<PgConn, pgerror.PgFault> [net]
+    todo("postgres-nv.pgconn.send")
+
+// Send several messages in one write.
+//
+// What pipelining IS: `Parse`, `Bind`, `Execute` and `Sync` in one
+// write rather than four, which turns four round trips into one.
+// Read `pgmsg.discards_until_sync` before pipelining two statements
+// under one `Sync`.
+pub fn send_batch(c: PgConn, ms: [pgmsg.PgFrontend]) -> Result<PgConn, pgerror.PgFault> [net]
+    todo("postgres-nv.pgconn.send_batch")
+
+// Read until `ReadyForQuery`, discarding everything in between.
+//
+// What a client does after an error: the server is discarding until
+// `Sync`, so the client sends one and drains to the boundary.  The
+// alternative — carrying on — is a client reading the previous
+// statement's results as this one's.
+pub fn drain_to_ready(c: PgConn) -> Result<PgConn, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgconn.drain_to_ready")
+
+// ── what arrived on its own ──────────────────────────────────────────
+
+// The `NOTIFY` messages that have arrived and not been taken.
+//
+// A `LISTEN` is an ordinary statement; the notifications it produces
+// arrive whenever the server feels like it, including in the middle
+// of an unrelated result set.  So they are queued on the connection
+// rather than returned by a listening call, and this is how a caller
+// collects them.
+//
+// ```novo
+// use pgconn
+// use std.list
+//
+// fn main() [io, net, time]
+//     match pgconn.connect(pgconn.default_options("postgres"), pgconn.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  => println("${list.len(pgconn.take_notifications(c).notifications)}")
+// ```
+pub struct PgNotifications
+    conn: PgConn
+    notifications: [pgmsg.PgBackend]
+
+// Take the queued notifications, leaving the queue empty.
+pub fn take_notifications(c: PgConn) -> PgNotifications
+    todo("postgres-nv.pgconn.take_notifications")
+
+// Wait up to `ms` for a notification, reading nothing else.
+//
+// The one call that blocks on purpose, for a program whose whole job
+// is to wait for a `NOTIFY`.  Zero notifications back means the
+// deadline passed, not that the connection is broken.
+pub fn wait_notification(c: PgConn, ms: Int) -> Result<PgNotifications, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgconn.wait_notification")
+
+// A server parameter's current value, or empty.
+//
+// `server_version`, `server_encoding`, `TimeZone`, `in_hot_standby` —
+// the last of which is how a client discovers it has connected to a
+// replica and cannot write.
+pub fn parameter(c: PgConn, name: Str) -> Str
+    todo("postgres-nv.pgconn.parameter")
+
+// ── cancellation ─────────────────────────────────────────────────────
+
+// Ask the server to cancel whatever this connection is running.
+//
+// Opens a SECOND connection, sends sixteen bytes, and closes it.  The
+// server answers NOTHING, ever, whether it cancelled anything or not
+// — so `None` here means "the request was sent" and never "the query
+// stopped".  See the module comment.
+//
+// The process id and secret key are the ones from `BackendKeyData`,
+// which is why `PgConn` keeps them: a connection that lost them
+// cannot be cancelled at all.
+//
+// ```novo
+// use pgconn
+//
+// fn main() [io, net, time]
+//     match pgconn.connect(pgconn.default_options("postgres"), pgconn.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  =>
+//             match pgconn.cancel(c)
+//                 None    => println("the request was sent")
+//                 Some(_) => println("could not send it")
+// ```
+pub fn cancel(c: PgConn) -> ?pgerror.PgFault [net, time]
+    todo("postgres-nv.pgconn.cancel")
+
+// The two numbers a cancel needs, so a caller can keep them somewhere
+// else — another task, another process — and cancel a query whose
+// connection it does not hold.
+//
+// Which is the realistic case: the thing that wants to cancel is
+// usually a timeout or a signal handler, and the connection is busy.
+pub struct PgCancelKey
+    host: Str
+    port: Int
+    process_id: Int
+    secret_key: Int
+
+// The cancel key of a connection.
+pub fn cancel_key(c: PgConn) -> PgCancelKey
+    todo("postgres-nv.pgconn.cancel_key")
+
+// Send a cancel request from a key alone, with no connection.
+pub fn cancel_by_key(k: PgCancelKey, t: PgTransport) -> ?pgerror.PgFault [net, time]
+    todo("postgres-nv.pgconn.cancel_by_key")

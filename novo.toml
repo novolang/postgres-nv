@@ -1,0 +1,93 @@
+[package]
+name        = "postgres-nv"
+version     = "0.0.1"
+description = "A PostgreSQL client with no libpq: the version 3 wire protocol as a codec that performs nothing, SCRAM-SHA-256 and MD5 authentication, the simple and extended query protocols, the text and binary formats for the types a program actually selects, COPY both ways, LISTEN/NOTIFY, out-of-band cancellation, a TLS hook the caller supplies, a connection pool with a policy, and a std.sql driver.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and the split inside it is the point of the package.
+#
+# `pgmsg`, `pgtype`, `pgauth` and `pgerror` are `[]` throughout: bytes
+# in, messages out, messages in, bytes out, and not one socket.  That
+# is what makes the protocol testable against the wire captures
+# PostgreSQL's own regression suite produces, with no server running —
+# and it is what lets the same codec serve a client, a connection
+# pooler and a test double.
+#
+# `pgconn`, `pgquery`, `pgcopy`, `pgpool` and `pgdriver` are the half
+# that connects.  They declare `[net]`, `[time]` where a deadline is
+# consulted, and nothing else; no module here prints.
+#
+# The `core` half is a MODULE split and not a package split, and the
+# README argues it: a codec whose only consumer is the client beside
+# it is a second package a reader has to assemble, with no second
+# caller to pay for it.  The row that would change that is a
+# PostgreSQL wire PROXY — a pooler or a protocol-aware load balancer —
+# and if one is ever written, `pgmsg` and `pgtype` move out under the
+# name `pg-codec-nv` with no signature change.  Named here so the
+# decision is a decision rather than an omission.
+layer       = "host"
+
+category    = "databases"
+
+tags        = ["postgresql", "postgres", "wire-protocol", "scram", "database", "driver", "sql", "native-port"]
+repository  = "https://github.com/novolang/postgres-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "The version 3 wire protocol, and the message that ends an exchange"
+
+[dependencies]
+# crypto-nv, and it is not optional: a PostgreSQL server built this
+# decade answers `AuthenticationSASL` and nothing else, so a client
+# without SCRAM-SHA-256 is a client that cannot log in.  What `pgauth`
+# uses is `hashing.hmac_sha256` (the whole of Hi() and every signature
+# in RFC 5802), `hashing.sha256` (the stored key), `hashing.md5` (the
+# older `AuthenticationMD5Password` exchange, which is still what a
+# server with `password_encryption = md5` sends), and `digest.ct_eq`
+# for the server-signature check — which is a comparison against a
+# value an attacker controls and therefore the one comparison in this
+# package that may not be `==`.
+crypto-nv = "^0.1.1"
+
+# calendar-nv, for ONE type, and the reason is that the type is where
+# the trap is.  A PostgreSQL timestamp is microseconds since
+# 2000-01-01, not since 1970, and a driver that handed back a bare
+# integer would be handing back the trap with a plausible name on it —
+# every consumer would write the shift and some of them would write
+# it as the Unix epoch, producing dates thirty years early with no
+# error anywhere.  `civil.CivilDateTime` is the type that cannot be
+# read wrong, calendar-nv is `core` with no dependencies of its own,
+# and `pgtype` is where the two epochs meet exactly once.
+calendar-nv = "^0.0.2"
+
+# NOT uuid-nv, and the refusal is about what comes with it.  uuid-nv
+# depends on rand-nv, so a driver that named `uuid.Uuid` in a
+# signature would put a random-number generator into every program
+# that selects a UUID column — and a driver has no business shipping a
+# v4 generator.  `pgtype` answers `PgUuid` carrying the sixteen bytes
+# the wire sent, in wire order, with `pgtype.uuid_text` for the
+# canonical rendering; a caller that wants uuid-nv's type calls
+# `uuid.from_bytes` on those bytes, in one line, having chosen to.
+#
+# NOT a json package either: `PgJson` carries the document as the text
+# it arrived as, and the standard library's `std.json` parses it.  The
+# wire format for `json` IS text, and for `jsonb` it is a version byte
+# and then the same text, so there is nothing to decode that a
+# dependency would help with.
+#
+# NOT tls-nv, which is planned and is not needed: TLS is a HOOK the
+# caller supplies — see `pgconn.PgTransport` — because a driver that
+# chose a TLS implementation would make that choice for every program
+# that links it, and because `SSLRequest` is one byte exchange before
+# any of it.

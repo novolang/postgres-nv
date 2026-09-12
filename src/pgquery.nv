@@ -1,0 +1,387 @@
+// pgquery.nv — the two query protocols, and the one rule that makes
+// the second of them safe to pipeline.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// TWO PROTOCOLS, AND ONLY ONE OF THEM HAS PARAMETERS.
+//
+//   * SIMPLE: one `Query` message carrying SQL text, possibly several
+//     statements separated by semicolons, always text format, no
+//     parameters.  Convenient, one round trip, and unparameterised —
+//     which is to say it is where SQL injection lives.  Kept because
+//     it is the only way to run `BEGIN; …; COMMIT` in one trip and the
+//     only way to run a script.
+//   * EXTENDED: `Parse`, `Bind`, `Execute`, `Sync`.  Parameters are
+//     sent as values beside the statement, which is what makes
+//     injection structurally impossible rather than a matter of
+//     escaping; results can be binary; and a statement can be
+//     prepared once and run many times.
+//
+// `query` below uses the extended protocol even for a statement with
+// no parameters, and the README says why: the only difference to a
+// caller is that results can be binary, and having ONE path means the
+// parameterised one is the one that is tested.
+//
+// THE RULE: AN ERROR MAKES THE SERVER DISCARD UNTIL `Sync`.  Send
+// Parse/Bind/Execute for two statements with one Sync at the end, have
+// the first fail, and the SECOND NEVER RUNS — the server skipped it —
+// but a client counting `CommandComplete`s is still waiting for a
+// result that will never come, and the connection hangs rather than
+// errors.  `PgPipeline` is the shape that makes this impossible to get
+// wrong: it carries one `Sync` per statement unless the caller
+// explicitly asks for one at the end, and `pipeline_unsynced` is the
+// name of the dangerous form so that using it is a decision.
+//
+// A PREPARED STATEMENT IS NAMED, AND AN EMPTY NAME IS A NAME.  The
+// UNNAMED statement is the one every `Parse` with an empty name
+// replaces, which makes it right for a one-shot query and wrong for
+// anything held across another one.  `prepare` takes the name; `query`
+// uses the unnamed one; and `PgStatement` carries which it is so a
+// caller cannot hold one that has been replaced under it.
+//
+// `Execute` WITH A ROW LIMIT IS WHAT A CURSOR IS.  `max_rows` of zero
+// means every row and is what most callers want; anything else stops
+// at that many and answers `PortalSuspended`, and the portal stays
+// open for the next `Execute`.  That is how a result set larger than
+// memory is read, and it is the reason `PgPortalSuspended` exists in
+// the message enum at all.
+
+use pgconn
+use pgerror
+use pgmsg
+use pgtype
+
+// A prepared statement on a connection.
+pub struct PgStatement
+    // The name the server knows it by; empty is the UNNAMED
+    // statement — see the module comment.
+    name: Str
+    sql: Str
+    // The parameter types, from `ParameterDescription`, or what the
+    // caller named in `Parse`.
+    parameter_oids: [Int]
+    // The result shape, from `RowDescription`; empty for a statement
+    // that returns no rows.
+    columns: [pgmsg.PgColumn]
+
+// A result set held in memory.
+pub struct PgResult
+    columns: [pgmsg.PgColumn]
+    // One list per row, already decoded.
+    rows: [[pgtype.PgValue]]
+    // The `CommandComplete` tag, as it arrived.
+    tag: Str
+    // Rows changed, from the tag — 3 from "INSERT 0 3".  For a
+    // SELECT it is the row count and equals the length of `rows`.
+    affected: Int
+    // Every `NoticeResponse` that arrived during the statement.
+    // Carried rather than dropped: `RAISE NOTICE` is what a stored
+    // procedure reports progress with, and a driver that swallowed it
+    // makes that feature useless.
+    notices: [pgerror.PgFields]
+
+// A portal being read a batch at a time.
+pub struct PgCursor
+    portal: Str
+    statement: PgStatement
+    // How many rows each `Execute` asks for.  Zero would mean every
+    // row, which is what a cursor exists not to do, so `open` refuses
+    // it.
+    batch_rows: Int
+    // True once the server answered `CommandComplete` rather than
+    // `PortalSuspended`.
+    finished: Bool
+
+// ── the simple protocol ──────────────────────────────────────────────
+
+// Run SQL text in one `Query` message.
+//
+// No parameters, text format, and possibly several statements — which
+// means every value has to be inside the string, which means this is
+// the function a caller reaches for when building SQL by
+// concatenation.  It is here because `BEGIN; …; COMMIT` in one round
+// trip and running a migration script have no other spelling; it is
+// NOT here to save typing on a parameterised query, and the README
+// says so.
+//
+// Answers one result per statement, in order.
+//
+// ```novo
+// use pgquery
+// use pgconn
+// use std.list
+//
+// fn main() [io, net, time]
+//     match pgconn.connect(pgconn.default_options("postgres"), pgconn.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  =>
+//             match pgquery.simple(c, "SELECT 1")
+//                 Ok(r)  => println("${list.len(r.results)}")
+//                 Err(_) => println("failed")
+// ```
+pub struct PgSimpleDone
+    conn: pgconn.PgConn
+    results: [PgResult]
+
+// Run a script.
+pub fn simple(c: pgconn.PgConn, sql: Str) -> Result<PgSimpleDone, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgquery.simple")
+
+// ── the extended protocol ────────────────────────────────────────────
+
+// Prepare a statement under a name.
+//
+// `parameter_oids` may be empty, which asks the server to infer the
+// types — usually right and occasionally catastrophic, because an
+// unspecified parameter used twice is inferred once.  `pgtype.oid_for`
+// is how to be explicit instead.
+//
+// ```novo
+// use pgquery
+// use pgconn
+//
+// fn main() [io, net, time]
+//     match pgconn.connect(pgconn.default_options("postgres"), pgconn.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  =>
+//             match pgquery.prepare(c, "by_id", "SELECT * FROM t WHERE id = $1", [])
+//                 Ok(p)  => println(p.statement.name)
+//                 Err(_) => println("refused")
+// ```
+pub struct PgPrepared
+    conn: pgconn.PgConn
+    statement: PgStatement
+
+// Prepare.
+pub fn prepare(c: pgconn.PgConn, name: Str, sql: Str,
+               parameter_oids: [Int]) -> Result<PgPrepared, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgquery.prepare")
+
+// Release a prepared statement.
+//
+// Worth doing: a long-lived connection that prepared a statement per
+// request holds every one of them until it closes, and the server's
+// memory is where that shows up.
+pub fn close_statement(c: pgconn.PgConn,
+                       name: Str) -> Result<pgconn.PgConn, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgquery.close_statement")
+
+// Run a prepared statement with these parameters.
+//
+// `result_format` applies to every column; a caller that wants a
+// mixture builds the `Bind` itself.  Binary is what to ask for — see
+// `pgtype`'s module comment.
+pub struct PgExecuted
+    conn: pgconn.PgConn
+    result: PgResult
+
+// Execute.
+pub fn execute(c: pgconn.PgConn, st: PgStatement, parameters: [pgtype.PgValue],
+               result_format: pgmsg.PgFormat) -> Result<PgExecuted, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgquery.execute")
+
+// Parse, bind, execute and sync, in one round trip, on the unnamed
+// statement.
+//
+// The function most callers want, and the one the README's example
+// uses.  Uses the extended protocol even with no parameters — see the
+// module comment.
+//
+// ```novo
+// use pgquery
+// use pgconn
+// use pgmsg
+// use std.list
+//
+// fn main() [io, net, time]
+//     match pgconn.connect(pgconn.default_options("postgres"), pgconn.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  =>
+//             match pgquery.query(c, "SELECT n FROM t WHERE n > $1", [], pgmsg.PgBinary)
+//                 Ok(e)  => println("${list.len(e.result.rows)}")
+//                 Err(_) => println("failed")
+// ```
+pub fn query(c: pgconn.PgConn, sql: Str, parameters: [pgtype.PgValue],
+             result_format: pgmsg.PgFormat) -> Result<PgExecuted, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgquery.query")
+
+// Run a statement and answer only how many rows it changed.
+//
+// For an `INSERT`, `UPDATE` or `DELETE`, where building a result set
+// of no rows is work nobody asked for.
+pub struct PgAffected
+    conn: pgconn.PgConn
+    affected: Int
+
+// Execute for the count alone.
+pub fn execute_count(c: pgconn.PgConn, sql: Str,
+                     parameters: [pgtype.PgValue]) -> Result<PgAffected, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgquery.execute_count")
+
+// ── pipelining ───────────────────────────────────────────────────────
+
+// Several statements sent in one write, each with its own `Sync`.
+//
+// THE SAFE FORM.  One `Sync` per statement means a failure stops that
+// statement and the next one still runs, and every statement's result
+// is bounded by its own `ReadyForQuery`.  It costs one extra five-byte
+// message per statement and it is what a caller should use.
+//
+// ```novo
+// use pgquery
+// use pgconn
+// use std.list
+//
+// fn main() [io, net, time]
+//     match pgconn.connect(pgconn.default_options("postgres"), pgconn.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  =>
+//             match pgquery.pipeline(c, [], [])
+//                 Ok(p)  => println("${list.len(p.results)}")
+//                 Err(_) => println("failed")
+// ```
+pub struct PgPipelined
+    conn: pgconn.PgConn
+    // One per statement, in order.  A statement that failed is an
+    // `Err` in its own slot rather than ending the batch.
+    results: [PgResult]
+    faults: [?pgerror.PgFault]
+
+// Pipeline with one `Sync` per statement.
+pub fn pipeline(c: pgconn.PgConn, sqls: [Str],
+                parameters: [[pgtype.PgValue]]) -> Result<PgPipelined, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgquery.pipeline")
+
+// Several statements under ONE `Sync` at the end.
+//
+// THE DANGEROUS FORM, and it is named so that using it is a decision.
+// One `Sync` means the whole batch is one implicit transaction — which
+// is sometimes exactly what is wanted — and it means that a failure
+// in statement one makes the server DISCARD statements two onward.
+// The results that come back are then shorter than the statements that
+// went out, and a caller that zipped them by position has attributed
+// every result to the wrong statement.
+//
+// So this answers the results it got AND how many statements the
+// server skipped, and the caller has to look at the second number.
+pub struct PgPipelinedUnsynced
+    conn: pgconn.PgConn
+    results: [PgResult]
+    // The fault that stopped the batch, or `None`.
+    fault: ?pgerror.PgFault
+    // How many statements the server discarded after it.  Zero when
+    // nothing failed.
+    skipped: Int
+
+// Pipeline under one `Sync`.
+pub fn pipeline_unsynced(c: pgconn.PgConn, sqls: [Str],
+                         parameters: [[pgtype.PgValue]]) -> Result<PgPipelinedUnsynced, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgquery.pipeline_unsynced")
+
+// ── cursors ──────────────────────────────────────────────────────────
+
+// Open a portal that answers `batch_rows` at a time.
+//
+// How a result set larger than memory is read.  `batch_rows` of zero
+// is refused: zero means every row to the protocol, which is what a
+// cursor exists not to do, and accepting it would make the mistake
+// silent.
+//
+// ```novo
+// use pgquery
+// use pgconn
+//
+// fn main() [io, net, time]
+//     match pgconn.connect(pgconn.default_options("postgres"), pgconn.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  =>
+//             match pgquery.open_cursor(c, "big", "SELECT * FROM t", [], 500)
+//                 Ok(o)  => println(o.cursor.portal)
+//                 Err(_) => println("refused")
+// ```
+pub struct PgCursorOpened
+    conn: pgconn.PgConn
+    cursor: PgCursor
+
+// Open.
+pub fn open_cursor(c: pgconn.PgConn, portal: Str, sql: Str, parameters: [pgtype.PgValue],
+                   batch_rows: Int) -> Result<PgCursorOpened, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgquery.open_cursor")
+
+// The next batch.  An empty batch with `finished` set is the end.
+pub struct PgBatch
+    conn: pgconn.PgConn
+    cursor: PgCursor
+    rows: [[pgtype.PgValue]]
+
+// Fetch.
+pub fn fetch(c: pgconn.PgConn, cur: PgCursor) -> Result<PgBatch, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgquery.fetch")
+
+// Close a portal before it is exhausted.
+//
+// A portal left open holds its snapshot and its locks until the
+// transaction ends, which is how a "read a million rows and stop at
+// the first bad one" loop blocks a vacuum for an hour.
+pub fn close_cursor(c: pgconn.PgConn,
+                    cur: PgCursor) -> Result<pgconn.PgConn, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgquery.close_cursor")
+
+// ── transactions ─────────────────────────────────────────────────────
+
+// How much a transaction is protected from concurrent ones.
+pub enum PgIsolation
+    // PostgreSQL's default, and NOT what the standard calls read
+    // committed elsewhere: a statement sees a snapshot taken when
+    // THAT STATEMENT started, so two statements in one transaction can
+    // see different data.
+    PgReadCommitted
+    // One snapshot for the whole transaction.  What the standard
+    // calls repeatable read, and PostgreSQL's implementation also
+    // prevents phantom reads, which the standard does not require.
+    PgRepeatableRead
+    // True serialisability, enforced by aborting transactions with
+    // SQLSTATE 40001 — so a caller that asks for it MUST have a retry
+    // loop, and `pgerror.is_retryable` is what it branches on.
+    PgSerializable
+
+// Begin a transaction.
+//
+// A thin wrapper over `BEGIN ISOLATION LEVEL …`, here because the
+// isolation level is a place a caller gets a silent wrong answer:
+// `PgReadCommitted` is the default and does not mean what it means in
+// other engines — see the enum.
+pub fn begin(c: pgconn.PgConn, level: PgIsolation,
+             read_only: Bool) -> Result<pgconn.PgConn, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgquery.begin")
+
+// Commit.
+pub fn commit(c: pgconn.PgConn) -> Result<pgconn.PgConn, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgquery.commit")
+
+// Roll back.
+//
+// Safe to call on a connection whose transaction has already failed,
+// which is the case it exists for: after an error the session is in
+// `PgInFailedTransaction` and every statement but this one is refused.
+pub fn rollback(c: pgconn.PgConn) -> Result<pgconn.PgConn, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgquery.rollback")
+
+// True when the connection is inside a transaction that has FAILED —
+// `pgmsg.PgInFailedTransaction`.
+//
+// The state a caller must not keep sending work in: every statement
+// until the rollback is refused with SQLSTATE 25P02, which produces a
+// run of identical errors that look like the application's fault.
+//
+// ```novo
+// use pgquery
+// use pgconn
+//
+// fn main() [io, net, time]
+//     match pgconn.connect(pgconn.default_options("postgres"), pgconn.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  => println("${pgquery.in_failed_transaction(c)}")
+// ```
+pub fn in_failed_transaction(c: pgconn.PgConn) -> Bool
+    todo("postgres-nv.pgquery.in_failed_transaction")

@@ -1,0 +1,203 @@
+// pgdriver.nv — the `std.sql` driver: a `Database` a program can hold
+// without naming an engine, over the PostgreSQL wire.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE SAME CONTRACT sqlite-nv IMPLEMENTS, over a socket instead of a
+// file.  A program written against `dyn Database` runs over either,
+// with nothing in it naming either:
+//
+//   fn migrate(db: dyn Database) -> Str [io, fs, net]
+//       match db.exec("CREATE TABLE t (n INTEGER)")
+//
+// THE EFFECT ROW ON THIS IMPL IS `[net, time]`, AND THE TRAIT SAYS
+// `[io]`.  That is legal — a trait with no effect parameter does not
+// pin its impls' rows, and the standard library's own `SqliteDb`
+// already declares `[fs]` against the same `[io]` — and it is worth
+// writing down what it costs, because the cost is somebody else's.
+//
+// A `dyn Database` call is charged the UNION over every impl in the
+// program (SPEC § 5.6).  So a program that links this package makes
+// EVERY `dyn Database` call in it cost `[net, time]`, including the
+// ones that only ever hold a SQLite file.  A concrete `PgDatabase`
+// receiver is charged `[net, time]` and a concrete `SqDatabase`
+// receiver `[fs]`, so the union is only paid where the engine really
+// is unknown — which is the right place to pay it and is still more
+// than the trait's own declaration suggests.
+//
+// This is the same obstruction `Connection` records in its own header
+// and has the same fix: an effect parameter on the trait
+// (`trait Database[e]`, SPEC § 5.6), so that each impl supplies what
+// it costs and a `dyn` caller is charged the union of the impls that
+// are actually in the program rather than of the ones that could be.
+// It is a CONTRACT change and belongs in a feature file; this package
+// names it rather than working around it.
+//
+// THE CONTRACT IS NARROW AND THE ROWS ARE ELSEWHERE.  `Database` has
+// no Rows/Row surface, so `close`, `exec` and `query_count` are what
+// crosses the engine boundary and `pgquery`'s functions are what
+// returns rows.  A caller that wants rows has chosen PostgreSQL by
+// then, which is the trade the contract makes on purpose.
+
+use pgconn
+use pgerror
+use pgpool
+use pgtype
+
+// A PostgreSQL database, as a `Database`.
+//
+// Named `PgDatabase` and not `Postgres` or `Database`: struct
+// identity is keyed by NAME across a whole assembly (E2004), and a
+// package that names a common noun takes it from every consumer.
+pub struct PgDatabase
+    conn: pgconn.PgConn
+    // The fault behind the last `DbError`, which the contract has no
+    // room for.  See `last_fault`.
+    last: ?pgerror.PgFault
+
+// The prelude `Database` contract, over the PostgreSQL wire.
+//
+// ```novo
+// use pgdriver
+// use pgconn
+//
+// fn main() [io, net, time]
+//     match pgdriver.open(pgconn.default_options("postgres"), pgconn.plain_transport())
+//         Err(_) => println("no")
+//         Ok(db) =>
+//             match db.exec("CREATE TABLE t (n INTEGER)")
+//                 Some(e) => println("failed")
+//                 None    => println("ok")
+// ```
+impl Database for PgDatabase
+    // Send `Terminate` and close the socket.
+    fn close(self) [net, time]
+        todo("postgres-nv.pgdriver.close")
+
+    // Run a statement that returns no rows.
+    //
+    // `None` is success.  The server's SQLSTATE is what decides the
+    // `DbError` variant, never the message text — 23xxx is a
+    // `ConstraintViolation`, 42xxx a `SyntaxError`, 08xxx and 57xxx a
+    // `ConnectionError`, and everything else `DbOther`.  The full
+    // field set is not lost: `last_fault` answers it with the
+    // constraint name, the column and the byte position the contract
+    // has no room for.
+    fn exec(self, sql: Str) -> ?DbError [net, time]
+        todo("postgres-nv.pgdriver.exec")
+
+    // How many rows `sql` produces.
+    //
+    // Runs the statement and counts.  There is no plan-time estimate
+    // here and `EXPLAIN`'s would be one — inventing it would make a
+    // caller think it had asked a cheap question and had got a true
+    // answer, and it would be neither.
+    fn query_count(self, sql: Str) -> Result<Int, DbError> [net, time]
+        todo("postgres-nv.pgdriver.query_count")
+
+// Open a database over a fresh connection.
+//
+// ```novo
+// use pgdriver
+// use pgconn
+//
+// fn main() [io, net, time]
+//     match pgdriver.open(pgconn.default_options("postgres"), pgconn.plain_transport())
+//         Ok(db) => println("connected")
+//         Err(_) => println("could not connect")
+// ```
+pub fn open(o: pgconn.PgConnectOptions,
+            t: pgconn.PgTransport) -> Result<PgDatabase, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgdriver.open")
+
+// Wrap a connection the caller already has — one borrowed from a
+// pool, for instance.
+//
+// Does NOT close it on `close`: a pooled connection is the pool's,
+// and a driver that closed one would empty the pool a request at a
+// time.  `close` on a borrowed database resets the session instead,
+// and the caller still has to `pgpool.release`.
+pub fn of_conn(c: pgconn.PgConn) -> PgDatabase
+    todo("postgres-nv.pgdriver.of_conn")
+
+// Take a connection from a pool and wrap it.
+//
+// The shape a request handler uses: acquire, work, release.  Answers
+// the pool as well, because the pool is a value.
+pub struct PgBorrowed
+    pool: pgpool.PgPool
+    db: PgDatabase
+
+// Borrow.
+pub fn borrow(p: pgpool.PgPool, now_ms: Int) -> Result<PgBorrowed, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgdriver.borrow")
+
+// Give a borrowed database back to its pool.
+pub fn give_back(p: pgpool.PgPool, db: PgDatabase,
+                 now_ms: Int) -> Result<pgpool.PgPool, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgdriver.give_back")
+
+// The fault behind the last `DbError` this handle answered, or
+// `None`.
+//
+// The prelude's `DbError` has five variants and a message; a
+// `pgerror.PgFault` carries the SQLSTATE, the constraint name, the
+// column, the byte position and everything else the server sent.  A
+// caller written against `dyn Database` gets the first; one that has
+// chosen this engine can ask for the second, which is the only place
+// "the unique index `users_email_key`" survives the contract.
+//
+// ```novo
+// use pgdriver
+// use pgconn
+//
+// fn main() [io, net, time]
+//     match pgdriver.open(pgconn.default_options("postgres"), pgconn.plain_transport())
+//         Err(_) => println("no")
+//         Ok(db) =>
+//             match pgdriver.last_fault(db)
+//                 Some(f) => println("something went wrong")
+//                 None    => println("nothing has yet")
+// ```
+pub fn last_fault(db: PgDatabase) -> ?pgerror.PgFault
+    todo("postgres-nv.pgdriver.last_fault")
+
+// The connection underneath, for the rows the contract cannot carry.
+//
+// `pgquery.query` takes it.  Published rather than hidden because a
+// driver that made the rows unreachable would be one nobody could
+// use for a `SELECT`.
+pub fn conn_of(db: PgDatabase) -> pgconn.PgConn
+    todo("postgres-nv.pgdriver.conn_of")
+
+// Every row of a query, as the values this package decodes.
+//
+// The convenience over `pgquery.query` for a caller holding a
+// `PgDatabase` rather than a connection.
+pub struct PgRows
+    db: PgDatabase
+    rows: [[pgtype.PgValue]]
+
+// Query.
+pub fn query(db: PgDatabase, sql: Str,
+             parameters: [pgtype.PgValue]) -> Result<PgRows, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgdriver.query")
+
+// The `DbError` a fault maps to, by SQLSTATE.
+//
+// Published because the mapping is a judgement and a caller may
+// disagree with it — an application that treats a deadlock as a
+// connection problem rather than as `DbOther`, say — and because a
+// mapping nobody can see is one nobody can check.
+//
+// ```novo
+// use pgdriver
+// use pgerror
+//
+// fn main() [io]
+//     match pgdriver.to_db_error(pgerror.PgTimedOut(operation: "query", ms: 1000))
+//         ConnectionError(m) => println("a connection problem")
+//         e                  => println("something else")
+// ```
+pub fn to_db_error(f: pgerror.PgFault) -> DbError
+    todo("postgres-nv.pgdriver.to_db_error")

@@ -1,0 +1,231 @@
+// pgerror.nv — what the server says went wrong, and what went wrong
+// before the server got a chance to.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// AN ERROR FROM POSTGRESQL IS A FIELD SET, NOT A STRING, and throwing
+// the fields away is the commonest thing a thin client does.  An
+// `ErrorResponse` carries a severity, a five-character SQLSTATE, a
+// primary message, and up to fifteen more fields: the detail, the
+// hint, the byte position in the query, the schema, the table, the
+// column, the data type and the constraint that failed.  A caller
+// that wants to answer "which unique index did this insert violate"
+// needs `constraint`; one that wants to underline the offending token
+// needs `position`.  A driver that collapsed all of it into
+// `"ERROR: duplicate key value"` has made both impossible and made
+// its own error messages worse.
+//
+// THE SQLSTATE IS THE PART TO BRANCH ON, and never the message text.
+// The message is localised — a server with `lc_messages = de_DE`
+// sends German — while `23505` is `unique_violation` on every server
+// in every locale forever.  `PgSqlState` is therefore a `Str` of
+// exactly five characters and not an enum: PostgreSQL defines about
+// two hundred and fifty of them and extensions add their own, so an
+// enum would be a list that is wrong the first time somebody installs
+// PostGIS.  The CLASS — the first two characters — is the useful
+// grouping and `sqlstate_class` is how to get it.
+//
+// A NOTICE IS THE SAME SHAPE AND IS NOT AN ERROR.  `NoticeResponse`
+// carries the identical field set and arrives at any moment, including
+// in the middle of a result set; a client that treated it as an error
+// fails a query that succeeded, and one that ignored it drops the
+// `RAISE NOTICE` output a stored procedure exists to produce.
+
+// A field set from an `ErrorResponse` or a `NoticeResponse`.
+//
+// The named fields are the ones a caller branches on; `extra` keeps
+// every other field code with its value, so a field PostgreSQL adds
+// in a later release reaches a caller rather than being dropped by
+// this decoder.
+pub struct PgFields
+    // "ERROR", "FATAL", "PANIC", "WARNING", "NOTICE", "DEBUG",
+    // "INFO" or "LOG" — localised, so branch on `severity_code`.
+    severity: Str
+    // The same, never localised.  Present since PostgreSQL 9.6;
+    // empty from an older server, in which case `severity` is all
+    // there is.
+    severity_code: Str
+    // The five-character SQLSTATE.  THE FIELD TO BRANCH ON.
+    code: Str
+    // The primary message, localised, one line, no trailing newline.
+    message: Str
+    // A second line with more detail, or empty.
+    detail: Str
+    // A suggestion, or empty.  PostgreSQL's hints are advice and can
+    // be wrong, which is why they are a separate field and not part
+    // of the message.
+    hint: Str
+    // A byte position in the query text, 1-based, or 0.  What
+    // underlines the offending token.
+    position: Int
+    // The same for an internally generated query, with the query in
+    // `internal_query`.
+    internal_position: Int
+    internal_query: Str
+    // The call stack when the error happened — a PL/pgSQL function's
+    // line, for instance.
+    context: Str
+    // The object the error is about, when the server knows: which
+    // schema, which table, which column, which type, which
+    // constraint.  The four that make a constraint violation
+    // actionable rather than merely reported.
+    schema_name: Str
+    table_name: Str
+    column_name: Str
+    datatype_name: Str
+    constraint_name: Str
+    // Where in the server's own source, for a bug report against
+    // PostgreSQL.
+    source_file: Str
+    source_line: Int
+    source_routine: Str
+    // Every other field code, and its value, in arrival order.
+    extra_codes: [Str]
+    extra_values: [Str]
+
+// A fault talking to a PostgreSQL server.
+pub enum PgFault
+    // The server sent an `ErrorResponse`.  The whole field set is
+    // carried; see the module comment for why.
+    PgServerError(fields: PgFields)
+    // The socket could not be opened, or the host did not resolve.
+    PgConnectFailed(host: Str, port: Int, detail: Str)
+    // The connection went away mid-exchange.  Distinguished from a
+    // clean close because a client that was waiting for a result and
+    // one that was idle want different answers.
+    PgConnectionLost(during: Str)
+    // A message's declared length disagrees with the bytes, is
+    // shorter than its own header, or is larger than the caller's
+    // ceiling.  The ceiling is the caller's because a `DataRow` can
+    // legitimately be a gigabyte.
+    PgBadMessage(kind: Int, length: Int, detail: Str)
+    // A message type byte this codec does not know.  Carried rather
+    // than ignored: an unknown message in a stream means the client
+    // and the server disagree about where the next one starts.
+    PgUnknownMessage(kind: Int)
+    // The server asked for an authentication method this client does
+    // not implement — Kerberos, GSSAPI, SSPI, SCM credentials.  Named
+    // rather than reported as a failure, because the fix is a server
+    // setting and the message should say which one.
+    PgUnsupportedAuth(method: Str)
+    // Authentication failed inside SCRAM: a malformed server message,
+    // a nonce the server did not extend, an iteration count below the
+    // floor, or a server signature that did not verify.  The last of
+    // those means the server does not know the password — a mutual
+    // authentication failure — and is NOT the same as a wrong
+    // password, which arrives as `PgServerError` with SQLSTATE 28P01.
+    PgScramFailed(step: Str, detail: Str)
+    // The caller asked for TLS and supplied no transport, or the
+    // server refused the `SSLRequest`.  The second is the dangerous
+    // one: a client that continued in the clear after asking for TLS
+    // has silently downgraded.
+    PgTlsRefused(detail: Str)
+    // A parameter list whose length does not match the statement's
+    // parameter count, a format list that is neither empty, of length
+    // one, nor of the column count, or a value too large for the wire.
+    PgBadParameters(want: Int, got: Int)
+    // A deadline passed.  `[time]` is declared wherever this can be
+    // raised.
+    PgTimedOut(operation: Str, ms: Int)
+    // The pool has no connection and its policy says not to wait or
+    // not to open another.
+    PgPoolExhausted(in_use: Int, limit: Int)
+    // A COPY was ended by the caller with `pgcopy.fail`, or the
+    // server rejected the data.
+    PgCopyFailed(detail: Str)
+
+// One line naming what went wrong, for a report a person reads.
+//
+// For a server error it is the severity, the SQLSTATE and the primary
+// message and nothing else; the detail and the hint are separate
+// fields because a one-line report that pasted all three is not one
+// line.
+//
+// ```novo
+// use pgerror
+//
+// fn main() [io]
+//     println(pgerror.describe(pgerror.PgUnknownMessage(kind: 122)))
+// ```
+pub fn describe(f: PgFault) -> Str
+    todo("postgres-nv.pgerror.describe")
+
+// An empty field set — what a decoder starts from.
+pub fn fields_new() -> PgFields
+    todo("postgres-nv.pgerror.fields_new")
+
+// Set one field by its code byte, as the wire spells it: `S`, `V`,
+// `C`, `M`, `D`, `H`, `P`, `p`, `q`, `W`, `s`, `t`, `c`, `d`, `n`,
+// `F`, `L`, `R`.
+//
+// A code this decoder does not know goes into `extra_codes` rather
+// than being dropped — see the struct's comment.
+//
+// ```novo
+// use pgerror
+//
+// fn main() [io]
+//     println(pgerror.set_field(pgerror.fields_new(), "C", "23505").code)
+// ```
+pub fn set_field(f: PgFields, code: Str, value: Str) -> PgFields
+    todo("postgres-nv.pgerror.set_field")
+
+// The SQLSTATE of a fault, or empty when it did not come from the
+// server.
+//
+// THE FUNCTION TO BRANCH ON.  Never the message — see the module
+// comment.
+//
+// ```novo
+// use pgerror
+//
+// fn main() [io]
+//     println(pgerror.sqlstate(pgerror.PgTimedOut(operation: "query", ms: 5000)))
+// ```
+pub fn sqlstate(f: PgFault) -> Str
+    todo("postgres-nv.pgerror.sqlstate")
+
+// The two-character CLASS of a SQLSTATE: "23" for every integrity
+// constraint violation, "40" for every transaction rollback, "08" for
+// every connection exception.
+//
+// The grouping worth branching on when the exact code is too
+// specific: a retry loop wants class "40" and does not care whether
+// it was a deadlock or a serialization failure.
+//
+// ```novo
+// use pgerror
+//
+// fn main() [io]
+//     println(pgerror.sqlstate_class("23505"))
+// ```
+pub fn sqlstate_class(code: Str) -> Str
+    todo("postgres-nv.pgerror.sqlstate_class")
+
+// True when a fault is worth retrying as it stands: a serialization
+// failure, a deadlock, an admin shutdown, a connection that went
+// away.
+//
+// Published because "which errors are retryable" is a question every
+// application answers and most answer by pattern-matching on message
+// text.  The answer here is by SQLSTATE class and is checkable.
+//
+// ```novo
+// use pgerror
+//
+// fn main() [io]
+//     println("${pgerror.is_retryable(pgerror.PgConnectionLost(during: "query"))}")
+// ```
+pub fn is_retryable(f: PgFault) -> Bool
+    todo("postgres-nv.pgerror.is_retryable")
+
+// True when the connection is no longer usable and has to be
+// discarded rather than returned to a pool.
+//
+// A `FATAL` or `PANIC` severity, a lost connection, or an
+// authentication failure.  An ordinary `ERROR` does NOT make a
+// connection unusable — the transaction is aborted and a `ROLLBACK`
+// restores it, which is what `pgpool` does rather than opening a
+// fresh socket for every constraint violation.
+pub fn is_fatal(f: PgFault) -> Bool
+    todo("postgres-nv.pgerror.is_fatal")

@@ -1,0 +1,253 @@
+// pgpool.nv — a connection pool as a VALUE with a POLICY, and the
+// three things a pool has to do that a list of sockets does not.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A POOL IS A POLICY, AND THE POLICY IS THE PART WORTH PUBLISHING.
+// Keeping sockets in a list is the easy half and nobody gets it
+// wrong.  What a pool is actually for is three decisions, each of
+// which is a wrong answer waiting to happen:
+//
+//   1. WHEN TO OPEN ANOTHER.  A pool that opens on demand up to a
+//      limit converts a traffic spike into a connection storm, and a
+//      PostgreSQL server's cost per connection is a process.  The
+//      limit is therefore not advice — past it, `acquire` WAITS or
+//      REFUSES, and which one is `PgPoolPolicy.wait_ms`.
+//   2. WHETHER A RETURNED CONNECTION IS STILL GOOD.  This is the one
+//      that produces the famous bug: a connection returned in the
+//      middle of a transaction hands the NEXT borrower an open
+//      transaction, and that borrower's first statement runs inside
+//      somebody else's.  `release` therefore checks
+//      `pgmsg.PgReadyForQuery`'s status and rolls back rather than
+//      trusting the borrower — see `reset_on_release`.
+//   3. WHEN TO THROW ONE AWAY.  An idle connection can be closed by
+//      the server, by a firewall, or by `idle_in_transaction_session_timeout`,
+//      and none of those tells the client.  So a connection past
+//      `max_idle_ms` is closed rather than lent, and one that has
+//      served `max_uses` is recycled — which is also what bounds the
+//      memory a long-lived backend accumulates from prepared
+//      statements.
+//
+// THE POOL IS A VALUE AND EVERY OPERATION ANSWERS A NEW ONE, which
+// means it does not synchronise anything and cannot: two tasks
+// sharing one pool share it the way they share any other value in
+// this language, which is to say through whatever the program uses
+// for that.  Saying so is better than a lock this package cannot make
+// correct — `cell.pool` is how novo-lang programs own shared state,
+// and a pool per cell with no sharing at all is the shape that
+// actually runs.  The README says this rather than leaving a reader
+// to find out.
+//
+// `[time]` IS DECLARED because every one of the three decisions above
+// is about a clock: a wait deadline, an idle age, a lifetime.  A pool
+// without a clock is a list.
+
+use pgconn
+use pgerror
+
+// What the pool is allowed to do.
+pub struct PgPoolPolicy
+    // The most connections this pool will ever have open.  Not
+    // advice: past it `acquire` waits or refuses.
+    max_connections: Int
+    // The fewest to keep open when idle.  Zero is right for a program
+    // that runs occasionally; a server wants enough to absorb a burst
+    // without a handshake on the critical path.
+    min_connections: Int
+    // How long `acquire` waits for one to come back before answering
+    // `PgPoolExhausted`.  ZERO MEANS REFUSE IMMEDIATELY, which is the
+    // right answer for a request handler with its own deadline — a
+    // pool that waits forever turns a slow query into a stalled
+    // service.
+    wait_ms: Int
+    // Close an idle connection older than this.  Guards against the
+    // server, a firewall or an idle timeout having closed it without
+    // telling anyone.
+    max_idle_ms: Int
+    // Recycle a connection that has served this many times.  What
+    // bounds the memory a long-lived backend accumulates from
+    // prepared statements and temporary tables.  Zero means never.
+    max_uses: Int
+    // Roll back and reset a connection as it comes back, rather than
+    // trusting the borrower to have left it clean.  True by default,
+    // and the reason is in the module comment.
+    reset_on_release: Bool
+    // Run this SQL on every freshly opened connection — a
+    // `SET search_path`, a `SET statement_timeout`.  Empty for none.
+    on_connect_sql: Str
+
+// A pool.
+//
+// A VALUE — see the module comment.
+pub struct PgPool
+    options: pgconn.PgConnectOptions
+    transport: pgconn.PgTransport
+    policy: PgPoolPolicy
+    // The connections not currently lent out, and when each last came
+    // back.
+    idle: [pgconn.PgConn]
+    idle_since_ms: [Int]
+    // How many are lent out.  A count rather than the connections
+    // themselves, because a borrowed connection is the borrower's and
+    // the pool has nothing to do with it until `release`.
+    lent: Int
+    // How many times each idle connection has been lent, for
+    // `max_uses`.
+    uses: [Int]
+    // Counters a caller reports on.
+    opened_total: Int
+    closed_total: Int
+    waits_total: Int
+    timeouts_total: Int
+
+// A pool and a connection taken from it.
+pub struct PgAcquired
+    pool: PgPool
+    conn: pgconn.PgConn
+
+// A sensible policy: ten connections, none kept idle, a five-second
+// wait, a five-minute idle ceiling, reset on release.
+//
+// ```novo
+// use pgpool
+//
+// fn main() [io]
+//     println("${pgpool.default_policy().max_connections}")
+// ```
+pub fn default_policy() -> PgPoolPolicy
+    todo("postgres-nv.pgpool.default_policy")
+
+// An empty pool.
+//
+// Opens nothing: `min_connections` is honoured by `warm`, so that a
+// program can decide whether the handshakes happen at start-up or on
+// the first request.
+//
+// ```novo
+// use pgpool
+// use pgconn
+//
+// fn main() [io]
+//     let p = pgpool.new_pool(pgconn.default_options("postgres"),
+//                             pgconn.plain_transport(), pgpool.default_policy())
+//     println("${p.lent}")
+// ```
+pub fn new_pool(o: pgconn.PgConnectOptions, t: pgconn.PgTransport, policy: PgPoolPolicy) -> PgPool
+    todo("postgres-nv.pgpool.new_pool")
+
+// Open up to `min_connections` now.
+//
+// So that the handshakes — a TCP connect, a TLS handshake and four
+// thousand rounds of SCRAM each — happen at start-up rather than on
+// the first request, which is when somebody is watching.
+pub fn warm(p: PgPool) -> Result<PgPool, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgpool.warm")
+
+// Take a connection.
+//
+// Lends an idle one that is still good, opens a new one if the limit
+// allows, or waits up to `wait_ms` — and answers `PgPoolExhausted`
+// carrying both numbers when it cannot.  A `wait_ms` of zero refuses
+// immediately, which is what a request handler with its own deadline
+// wants.
+//
+// `now_ms` is the CALLER's clock reading, so that a test can age a
+// pool without sleeping and so that a program with one clock read per
+// request does not take another here.
+//
+// ```novo
+// use pgpool
+// use pgconn
+//
+// fn main() [io, net, time]
+//     let p = pgpool.new_pool(pgconn.default_options("postgres"),
+//                             pgconn.plain_transport(), pgpool.default_policy())
+//     match pgpool.acquire(p, 0)
+//         Ok(a)  => println("${a.pool.lent}")
+//         Err(_) => println("exhausted")
+// ```
+pub fn acquire(p: PgPool, now_ms: Int) -> Result<PgAcquired, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgpool.acquire")
+
+// Give a connection back.
+//
+// THE OPERATION THAT MATTERS — see the module comment.  Checks the
+// transaction status and, when `reset_on_release` is set, rolls back
+// rather than trusting the borrower; a connection left in
+// `PgInFailedTransaction` or `PgInTransaction` would otherwise hand
+// the next borrower somebody else's transaction.  A connection that
+// is broken, too old or too used is closed instead of kept.
+//
+// ```novo
+// use pgpool
+// use pgconn
+//
+// fn main() [io, net, time]
+//     let p = pgpool.new_pool(pgconn.default_options("postgres"),
+//                             pgconn.plain_transport(), pgpool.default_policy())
+//     match pgpool.acquire(p, 0)
+//         Err(_) => println("exhausted")
+//         Ok(a)  =>
+//             match pgpool.release(a.pool, a.conn, 0)
+//                 Ok(p2) => println("${p2.lent}")
+//                 Err(_) => println("could not reset")
+// ```
+pub fn release(p: PgPool, c: pgconn.PgConn,
+               now_ms: Int) -> Result<PgPool, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgpool.release")
+
+// Give a connection back and throw it away.
+//
+// What a caller does when it knows the connection is no good — it
+// cancelled a query on it, or it caught a `pgerror.is_fatal` — rather
+// than making the pool work it out.
+pub fn discard(p: PgPool, c: pgconn.PgConn) -> PgPool [net]
+    todo("postgres-nv.pgpool.discard")
+
+// Close every idle connection older than `max_idle_ms`, and top back
+// up to `min_connections`.
+//
+// Called by a program's own timer; this package starts no thread and
+// has no timer of its own, which is what keeps it a value.
+pub fn reap(p: PgPool, now_ms: Int) -> Result<PgPool, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgpool.reap")
+
+// Close everything.
+pub fn close_pool(p: PgPool) -> ?pgerror.PgFault [net]
+    todo("postgres-nv.pgpool.close_pool")
+
+// ── what a caller reports on ─────────────────────────────────────────
+
+// A pool's counters, for a metrics endpoint.
+pub struct PgPoolStats
+    idle: Int
+    lent: Int
+    limit: Int
+    opened_total: Int
+    closed_total: Int
+    // How many `acquire` calls had to wait, and how many gave up.
+    // The pair that says whether the limit is too low: waits without
+    // timeouts is a pool at capacity and coping, waits WITH timeouts
+    // is a pool that is losing requests.
+    waits_total: Int
+    timeouts_total: Int
+
+// The counters.
+//
+// ```novo
+// use pgpool
+// use pgconn
+//
+// fn main() [io]
+//     let p = pgpool.new_pool(pgconn.default_options("postgres"),
+//                             pgconn.plain_transport(), pgpool.default_policy())
+//     println("${pgpool.stats(p).limit}")
+// ```
+pub fn stats(p: PgPool) -> PgPoolStats
+    todo("postgres-nv.pgpool.stats")
+
+// Whether the pool would lend right now without opening or waiting.
+//
+// The question a load shedder asks before it accepts a request.
+pub fn has_idle(p: PgPool, now_ms: Int) -> Bool
+    todo("postgres-nv.pgpool.has_idle")

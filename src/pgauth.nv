@@ -1,0 +1,258 @@
+// pgauth.nv — SCRAM-SHA-256 and MD5, as arithmetic over the bytes the
+// server sent.  No socket, no clock, no randomness.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// SCRAM IS A FOUR-MESSAGE EXCHANGE AND THE STATE IS A VALUE.  A
+// client-first, a server-first, a client-final, a server-final — and
+// between them a running `PgScram` holding the nonce, the salted
+// password and the auth message.  Modelling it as a value rather than
+// as a sequence of calls on a connection is what lets the whole
+// handshake be tested against RFC 7677's published vectors with no
+// server anywhere, which is the only way to be sure a signature is
+// right: a wrong one fails to log in, and every wrong one fails to log
+// in identically.
+//
+// THE NONCE AND THE CHANNEL BINDING ARE THE CALLER'S.  This module has
+// no randomness — it is `[]` — so `begin` takes the client nonce as an
+// argument.  That is not a shortcut around the effect budget: it is
+// what lets a test supply RFC 7677's nonce and compare every
+// intermediate value with the RFC's own hex.  `pgconn` is what draws a
+// real one.
+//
+// THE SERVER SIGNATURE IS CHECKED, AND IT IS NOT OPTIONAL.  SCRAM is
+// MUTUAL authentication: the server's final message proves it knows
+// the stored key, and a client that skipped the check has downgraded
+// SCRAM to a password send.  `verify_server` does it with
+// `digest.ct_eq` — a constant-time comparison, because the value it
+// compares against is one an attacker supplies.
+//
+// THE ITERATION COUNT IS AN ATTACK SURFACE.  `i=1` is a legal SCRAM
+// message and makes Hi() free, which is what a hostile server sends to
+// turn a client into an offline-cracking oracle for its own password.
+// `min_iterations` is a floor this module enforces and the caller can
+// raise.
+//
+// WHAT IS NOT HERE, and why.  `SCRAM-SHA-256-PLUS` — channel binding
+// over the TLS connection — needs the peer certificate's hash, which
+// only the TLS transport can produce.  `PgChannelBinding` is declared
+// so the caller can supply it, and `begin` refuses the PLUS mechanism
+// with no binding rather than silently negotiating the weaker one,
+// which is precisely the downgrade channel binding exists to stop.
+
+use pgerror
+
+// What a client can prove about the channel it is on.
+pub enum PgChannelBinding
+    // No TLS, or TLS whose transport cannot produce a binding.  The
+    // mechanism is then `SCRAM-SHA-256`.
+    PgBindingNone
+    // The caller supplies `tls-server-end-point`: the hash of the
+    // server's certificate, computed by whatever terminated the TLS.
+    // The mechanism is then `SCRAM-SHA-256-PLUS`.
+    PgBindingEndPoint(hash: Bytes)
+
+// A SCRAM exchange in flight.
+//
+// A value.  Every step answers a new one, so a test can hold the state
+// after the server-first message and assert on the salted password —
+// which is the value RFC 7677 publishes and the one a wrong
+// implementation gets wrong.
+pub struct PgScram
+    // The mechanism this exchange settled on.
+    mechanism: Str
+    // The client nonce, as the caller supplied it.
+    client_nonce: Str
+    // The full nonce after the server extended it.  A server that did
+    // NOT extend it — that answered the client's nonce unchanged — is
+    // refused: the extension is what stops a replay.
+    full_nonce: Str
+    // `client-first-message-bare` — what the auth message starts
+    // with, kept because it cannot be rebuilt from the later
+    // messages.
+    client_first_bare: Str
+    // The salt and iteration count the server named.
+    salt: Bytes
+    iterations: Int
+    // Hi(password, salt, i).  The expensive value, computed once.
+    salted_password: Bytes
+    // `client-first-bare + "," + server-first + "," +
+    // client-final-without-proof`, which every signature is over.
+    auth_message: Str
+    // The channel binding this exchange is using.
+    binding: PgChannelBinding
+
+// 4096 — the iteration floor this module enforces.
+//
+// PostgreSQL's own default, and low enough that no real server is
+// refused.  See the module comment for what a count below it is for.
+//
+// ```novo
+// use pgauth
+//
+// fn main() [io]
+//     println("${pgauth.min_iterations()}")
+// ```
+pub fn min_iterations() -> Int
+    todo("postgres-nv.pgauth.min_iterations")
+
+// The mechanism to use, given what the server offered and what the
+// caller can bind to.
+//
+// `SCRAM-SHA-256-PLUS` when the server offers it AND the caller has a
+// binding; `SCRAM-SHA-256` otherwise.  Refuses when the server offers
+// only PLUS and the caller has no binding, rather than negotiating
+// down — which is the downgrade channel binding exists to stop.
+//
+// ```novo
+// use pgauth
+//
+// fn main() [io]
+//     match pgauth.choose_mechanism(["SCRAM-SHA-256"], pgauth.PgBindingNone)
+//         Ok(m)  => println(m)
+//         Err(_) => println("no mechanism in common")
+// ```
+pub fn choose_mechanism(offered: [Str], binding: PgChannelBinding) -> Result<Str, pgerror.PgFault>
+    todo("postgres-nv.pgauth.choose_mechanism")
+
+// Begin a SCRAM exchange.
+//
+// `client_nonce` is the caller's — see the module comment.  It must be
+// printable ASCII with no comma, which is the character SCRAM's own
+// syntax uses as a separator; a nonce containing one is refused here
+// rather than producing a message the server parses differently from
+// the client.
+//
+// ```novo
+// use pgauth
+//
+// fn main() [io]
+//     match pgauth.begin("SCRAM-SHA-256", "rOprNGfwEbeRWgbNEkqO", pgauth.PgBindingNone)
+//         Ok(s)  => println(s.client_nonce)
+//         Err(_) => println("refused")
+// ```
+pub fn begin(mechanism: Str, client_nonce: Str,
+             binding: PgChannelBinding) -> Result<PgScram, pgerror.PgFault>
+    todo("postgres-nv.pgauth.begin")
+
+// The bytes of the client-first message — the payload of a
+// `SASLInitialResponse`.
+pub fn client_first(s: PgScram) -> Bytes
+    todo("postgres-nv.pgauth.client_first")
+
+// Take the server-first message, and compute the salted password.
+//
+// This is where Hi() runs — `iterations` rounds of HMAC-SHA-256 — and
+// where the iteration floor and the nonce extension are checked.
+//
+// ```novo
+// use pgauth
+// use std.bytes
+//
+// fn main() [io]
+//     match pgauth.begin("SCRAM-SHA-256", "rOprNGfwEbeRWgbNEkqO", pgauth.PgBindingNone)
+//         Err(_) => println("refused")
+//         Ok(s)  =>
+//             match pgauth.server_first(s, bytes.zeros(0), "secret", 4096)
+//                 Ok(s2) => println("${s2.iterations}")
+//                 Err(_) => println("bad server message")
+// ```
+pub fn server_first(s: PgScram, message: Bytes, password: Str,
+                    min_iters: Int) -> Result<PgScram, pgerror.PgFault>
+    todo("postgres-nv.pgauth.server_first")
+
+// The bytes of the client-final message — the payload of a
+// `SASLResponse`, carrying the proof.
+//
+// Must be called after `server_first`; a `PgScram` with no salted
+// password is refused rather than producing a proof over nothing.
+pub fn client_final(s: PgScram) -> Result<Bytes, pgerror.PgFault>
+    todo("postgres-nv.pgauth.client_final")
+
+// Check the server's final message against the expected signature.
+//
+// NOT OPTIONAL — see the module comment.  Compared with
+// `digest.ct_eq`, because the value is one an attacker supplies.
+//
+// ```novo
+// use pgauth
+// use std.bytes
+//
+// fn main() [io]
+//     match pgauth.begin("SCRAM-SHA-256", "rOprNGfwEbeRWgbNEkqO", pgauth.PgBindingNone)
+//         Err(_) => println("refused")
+//         Ok(s)  =>
+//             match pgauth.verify_server(s, bytes.zeros(0))
+//                 None    => println("the server knows the password too")
+//                 Some(f) => println("mutual authentication failed")
+// ```
+pub fn verify_server(s: PgScram, message: Bytes) -> ?pgerror.PgFault
+    todo("postgres-nv.pgauth.verify_server")
+
+// ── the pieces, published because the vectors are published ──────────
+
+// Hi(password, salt, iterations) — PBKDF2-HMAC-SHA-256 with one block.
+//
+// Public because RFC 7677 publishes its value for a known password and
+// salt, and a test that could only check the whole handshake would
+// answer "it failed" when this is what is wrong.
+//
+// ```novo
+// use pgauth
+// use std.bytes
+//
+// fn main() [io]
+//     println("${bytes.len(pgauth.salted_password("pencil", bytes.zeros(16), 4096))}")
+// ```
+pub fn salted_password(password: Str, salt: Bytes, iterations: Int) -> Bytes
+    todo("postgres-nv.pgauth.salted_password")
+
+// The client proof: ClientKey XOR HMAC(H(ClientKey), auth_message).
+pub fn client_proof(salted: Bytes, auth_message: Str) -> Bytes
+    todo("postgres-nv.pgauth.client_proof")
+
+// The server signature: HMAC(HMAC(salted, "Server Key"), auth_message).
+pub fn server_signature(salted: Bytes, auth_message: Str) -> Bytes
+    todo("postgres-nv.pgauth.server_signature")
+
+// SASLprep, as far as PostgreSQL applies it: a password that is pure
+// ASCII passes through unchanged, and one that is not is normalised —
+// or, when normalisation would fail, sent as it is.
+//
+// PostgreSQL's own rule, and it is a rule rather than a spec: RFC 4013
+// says to fail, and the server sends the raw bytes instead, so a
+// client that failed cannot log in to a server that accepted the
+// password.
+pub fn saslprep(password: Str) -> Str
+    todo("postgres-nv.pgauth.saslprep")
+
+// ── the older exchange ───────────────────────────────────────────────
+
+// The `AuthenticationMD5Password` answer: `md5` followed by the hex of
+// MD5(hex(MD5(password + user)) + salt).
+//
+// Still what a server with `password_encryption = md5` sends, and
+// weak: the stored verifier IS the password equivalent, so anyone who
+// reads `pg_authid` can log in.  Implemented because refusing it means
+// refusing to connect to a real server, and named here so nobody has
+// to read the code to learn that.
+//
+// ```novo
+// use pgauth
+// use std.bytes
+//
+// fn main() [io]
+//     println(pgauth.md5_password("secret", "postgres", bytes.zeros(4)))
+// ```
+pub fn md5_password(password: Str, user: Str, salt: Bytes) -> Str
+    todo("postgres-nv.pgauth.md5_password")
+
+// The `AuthenticationCleartextPassword` answer: the password, and a
+// NUL.
+//
+// Declared rather than omitted because a Unix-socket connection to a
+// local server uses it legitimately.  Over TCP without TLS it sends
+// the password in the clear, and `pgconn` refuses that combination
+// unless the caller has said `allow_cleartext`.
+pub fn cleartext_password(password: Str) -> Bytes
+    todo("postgres-nv.pgauth.cleartext_password")

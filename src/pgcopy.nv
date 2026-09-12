@@ -1,0 +1,257 @@
+// pgcopy.nv — `COPY` in both directions: the fastest way to get bulk
+// data in or out of PostgreSQL, and the one that is easiest to corrupt.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `COPY` IS AN ORDER OF MAGNITUDE FASTER THAN `INSERT` and it is the
+// reason this module exists rather than a loop.  A million rows as a
+// million `INSERT`s is a million round trips and a million plans; the
+// same rows as a `COPY FROM STDIN` is one statement and one stream.
+//
+// A `CopyData` MESSAGE IS NOT A ROW.  The chunking is the SERVER's,
+// and a row can span two messages or a message can carry twenty rows.
+// A client that treated one `CopyData` as one row works on small
+// tables and silently truncates on large ones, which is why
+// `PgCopyOut` accumulates and `rows` drains what is complete rather
+// than what arrived.
+//
+// THREE FORMATS, AND THE BINARY ONE HAS A HEADER AND A TRAILER.
+//
+//   * TEXT — tab-separated, `\N` for NULL, backslash escapes.  The
+//     default, and the one where a value containing a tab has to be
+//     escaped by whoever built it.
+//   * CSV — with a quote character and a delimiter, and PostgreSQL's
+//     own CSV rules for NULL.
+//   * BINARY — an eleven-byte signature, flags, a header extension,
+//     then per row a column count and per column a length and the
+//     value in its binary format, then a trailer of -1.  Fast, exact,
+//     and NOT portable between servers of different versions in
+//     general.  The trailer is the part a writer forgets, and a stream
+//     without it is one the server accepts and then reports as
+//     truncated at the very end, after everything has been sent.
+//
+// THE COPY STATE IS A SUB-PROTOCOL AND IT REPLACES THE NORMAL ONE.
+// Between `CopyInResponse` and `CopyDone` the connection carries only
+// `CopyData`, `CopyDone` and `CopyFail`; a client that sent a `Query`
+// in the middle has desynchronised the stream and every later message
+// is misframed.  `PgCopyIn` exists so that the state is a value the
+// type system tracks rather than a rule in a comment.
+//
+// `CopyFail` IS HOW A CLIENT ABORTS, AND IT MUST BE SENT.  A client
+// that decides at row 900,000 that its input is bad and simply closes
+// the socket leaves the server to discover the disconnect; a client
+// that sends `CopyFail` with a reason gets that reason into the
+// server's log and an immediate, clean abort.
+
+use pgconn
+use pgtype
+use pgerror
+use pgmsg
+
+// How the rows on the wire are laid out.
+pub enum PgCopyFormat
+    // Tab-separated with backslash escapes, `\N` for NULL.
+    PgCopyText
+    // PostgreSQL's CSV, with a delimiter and a quote character.
+    PgCopyCsv
+    // The length-prefixed binary form, with a signature and a
+    // trailer.  Exact, fast, and version-sensitive.
+    PgCopyBinary
+
+// A `COPY … FROM STDIN` in flight.
+//
+// The connection is in the copy sub-protocol for as long as this
+// value exists — see the module comment.
+pub struct PgCopyIn
+    conn: pgconn.PgConn
+    format: PgCopyFormat
+    // The per-column formats the server named in `CopyInResponse`.
+    column_formats: [pgmsg.PgFormat]
+    // How many bytes have been sent.  Carried because a caller
+    // streaming a large file wants to report progress, and because
+    // the number is otherwise nowhere.
+    sent_bytes: Int
+    // True once the binary header has gone out, so it goes out once.
+    header_sent: Bool
+
+// A `COPY … TO STDOUT` in flight.
+pub struct PgCopyOut
+    conn: pgconn.PgConn
+    format: PgCopyFormat
+    column_formats: [pgmsg.PgFormat]
+    // Bytes that arrived and are not a complete row yet — see the
+    // module comment on chunking.
+    partial: Bytes
+    received_bytes: Int
+    // True once `CopyDone` arrived.
+    finished: Bool
+
+// ── copying in ───────────────────────────────────────────────────────
+
+// Start a `COPY … FROM STDIN`.
+//
+// `sql` is the whole statement — `COPY t (a, b) FROM STDIN WITH
+// (FORMAT binary)` — because the options belong in the SQL and
+// duplicating them in this API would let the two disagree.  `format`
+// says what this module will ENCODE, and a mismatch with the
+// statement is refused here rather than discovered by the server
+// after a million rows.
+//
+// ```novo
+// use pgcopy
+// use pgconn
+//
+// fn main() [io, net, time]
+//     match pgconn.connect(pgconn.default_options("postgres"), pgconn.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  =>
+//             match pgcopy.begin_in(c, "COPY t FROM STDIN", pgcopy.PgCopyText)
+//                 Ok(s)  => println("${s.sent_bytes}")
+//                 Err(_) => println("refused")
+// ```
+pub fn begin_in(c: pgconn.PgConn, sql: Str,
+                format: PgCopyFormat) -> Result<PgCopyIn, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgcopy.begin_in")
+
+// Send a chunk of already-encoded data.
+//
+// The low-level door: a caller with a file already in PostgreSQL's
+// text format streams it through here without this module encoding
+// anything.
+pub fn send_raw(s: PgCopyIn, data: Bytes) -> Result<PgCopyIn, pgerror.PgFault> [net]
+    todo("postgres-nv.pgcopy.send_raw")
+
+// Send one row, encoded in the stream's format.
+//
+// In binary format this writes the header first if it has not gone
+// out yet — see `header_sent`.
+pub fn send_row(s: PgCopyIn, values: [pgtype.PgValue]) -> Result<PgCopyIn, pgerror.PgFault> [net]
+    todo("postgres-nv.pgcopy.send_row")
+
+// Finish: the binary trailer if the format needs one, then
+// `CopyDone`, then read to `ReadyForQuery`.
+//
+// THE TRAILER IS THE PART A WRITER FORGETS — see the module comment.
+// Answering the row count the server reports is what tells a caller
+// the server agreed about how many rows there were.
+pub struct PgCopyInDone
+    conn: pgconn.PgConn
+    rows: Int
+
+// End the copy.
+pub fn finish_in(s: PgCopyIn) -> Result<PgCopyInDone, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgcopy.finish_in")
+
+// Abort the copy with a reason.
+//
+// MUST be sent rather than closing the socket — see the module
+// comment.  The reason reaches the server's log and the abort is
+// immediate.
+//
+// ```novo
+// use pgcopy
+//
+// fn main() [io, net, time]
+//     println("a client that gives up says why")
+// ```
+pub fn fail_in(s: PgCopyIn, reason: Str) -> Result<pgconn.PgConn, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgcopy.fail_in")
+
+// ── copying out ──────────────────────────────────────────────────────
+
+// Start a `COPY … TO STDOUT`.
+pub fn begin_out(c: pgconn.PgConn, sql: Str,
+                 format: PgCopyFormat) -> Result<PgCopyOut, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgcopy.begin_out")
+
+// Read the next chunk of raw data, whatever the server sent.
+//
+// An empty chunk with `finished` set is the end.
+pub struct PgCopyChunk
+    stream: PgCopyOut
+    data: Bytes
+
+// Read a chunk.
+pub fn recv_raw(s: PgCopyOut) -> Result<PgCopyChunk, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgcopy.recv_raw")
+
+// Read the next COMPLETE rows, whatever the chunking was.
+//
+// The function the module comment exists for: a `CopyData` message is
+// not a row, so this accumulates and answers what is complete,
+// keeping the remainder in `partial` for the next call.  An empty
+// list with `finished` set is the end; an empty list without it means
+// the chunk that arrived did not complete a row and the caller should
+// ask again.
+//
+// ```novo
+// use pgcopy
+// use pgconn
+// use std.list
+//
+// fn main() [io, net, time]
+//     match pgconn.connect(pgconn.default_options("postgres"), pgconn.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  =>
+//             match pgcopy.begin_out(c, "COPY t TO STDOUT", pgcopy.PgCopyText)
+//                 Err(_) => println("refused")
+//                 Ok(s)  =>
+//                     match pgcopy.recv_rows(s)
+//                         Ok(b)  => println("${list.len(b.rows)}")
+//                         Err(_) => println("lost")
+// ```
+pub struct PgCopyRows
+    stream: PgCopyOut
+    rows: [[pgtype.PgValue]]
+
+// Read complete rows.
+pub fn recv_rows(s: PgCopyOut) -> Result<PgCopyRows, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgcopy.recv_rows")
+
+// Read to the end of the copy and return the connection.
+//
+// A caller that stops early still has to drain: the server is sending
+// and the connection is unusable until it stops.
+pub fn finish_out(s: PgCopyOut) -> Result<pgconn.PgConn, pgerror.PgFault> [net, time]
+    todo("postgres-nv.pgcopy.finish_out")
+
+// ── the binary framing, published because it is where a writer goes wrong ──
+
+// The eleven-byte signature every binary `COPY` stream starts with,
+// then four bytes of flags and four of header extension length.
+//
+// Public so a caller writing a file for a later `COPY FROM` — a dump
+// tool — can produce a stream this package would accept, without
+// having a connection.
+//
+// ```novo
+// use pgcopy
+// use std.bytes
+//
+// fn main() [io]
+//     println("${bytes.len(pgcopy.binary_header())}")
+// ```
+pub fn binary_header() -> Bytes
+    todo("postgres-nv.pgcopy.binary_header")
+
+// The trailer: a column count of -1.
+//
+// The part a writer forgets, and a stream without it is one the
+// server accepts and then reports as truncated at the very end.
+pub fn binary_trailer() -> Bytes
+    todo("postgres-nv.pgcopy.binary_trailer")
+
+// Encode one row in the binary format: a column count, then per
+// column a length and the value.
+pub fn encode_binary_row(values: [pgtype.PgValue]) -> Result<Bytes, pgerror.PgFault>
+    todo("postgres-nv.pgcopy.encode_binary_row")
+
+// Encode one row in the text format, with PostgreSQL's own escaping
+// and `\N` for NULL.
+//
+// Published because "produce a file a `COPY` will accept" is a thing
+// programs do without a database connection, and because the escaping
+// is the part everyone gets almost right.
+pub fn encode_text_row(values: [pgtype.PgValue], delimiter: Str,
+                       null_marker: Str) -> Result<Bytes, pgerror.PgFault>
+    todo("postgres-nv.pgcopy.encode_text_row")

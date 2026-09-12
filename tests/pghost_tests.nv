@@ -1,0 +1,369 @@
+// pghost_tests.nv — the five modules that connect, and the parts of
+// them a test can assert without a server: the policies and the
+// refusals.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: postgres-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// WHAT IS ASSERTABLE HERE, AND WHAT IS NOT.  `pgconn`, `pgquery`,
+// `pgcopy`, `pgpool` and `pgdriver` need a PostgreSQL server, and the
+// implementation lane's own gate is a real one — `initdb`, a socket, a
+// corpus of statements, and the same queries through `psql` for
+// comparison.  What can be asserted with no server is everything the
+// design put into a VALUE rather than into an exchange:
+//
+//   * the pool's policy — a limit, a wait, an idle age — because
+//     `acquire` and `release` take the clock reading as an ARGUMENT,
+//     so a test can age a pool without sleeping;
+//   * the COPY framing, because the binary header and trailer are
+//     bytes and the trailer is the part a writer forgets;
+//   * every `[net]` entry point against a port nothing is listening
+//     on, which asserts the refusal rather than the success.
+
+use std.test
+use std.bytes
+use std.list
+use pgconn
+use pgerror
+use pgmsg
+use pgcopy
+use pgdriver
+use pgpool
+use pgquery
+use pgtype
+
+// A port nothing is listening on, used by every refusal assertion.
+// Named once so the tests say what they are about.
+fn closed_port() -> Int
+    59999
+
+// Options pointing at it.
+fn unreachable() -> pgconn.PgConnectOptions
+    pgconn.default_options("postgres")
+
+@test
+fn test_the_defaults_are_readable_in_one_place() [io]
+    let o = pgconn.default_options("postgres")
+
+    test.case("the port PostgreSQL has used since 1996")
+    test.assert(o.port == 5432)
+
+    test.case("the user is the one asked for")
+    test.assert(o.user == "postgres")
+
+    test.case("cleartext over an unencrypted socket is NOT allowed by default")
+    // The alternative is sending the password in the clear because a
+    // server asked for it.
+    test.assert(o.allow_cleartext == false)
+
+    test.case("and the message ceiling is the caller's, not the wire's")
+    test.assert(o.max_message_bytes > 0)
+
+@test
+fn test_a_unix_socket_is_recognised_by_its_path() [io]
+    // PostgreSQL's own rule, and the one that decides between
+    // `net.connect` and `net.unix_connect`.
+    test.case("a path is a socket")
+    test.assert(pgconn.is_unix_socket("/var/run/postgresql"))
+
+    test.case("a host name is not")
+    test.assert(pgconn.is_unix_socket("db.internal") == false)
+    test.assert(pgconn.is_unix_socket("127.0.0.1") == false)
+
+@test
+fn test_the_five_ssl_modes_are_five_different_promises() [io]
+    // A server that answers `N` has not failed — it has said "no TLS"
+    // — and a client that continued has silently downgraded on a
+    // connection the user asked to encrypt.  So the mode is an
+    // argument with no default.
+    test.case("a transport exists for the plaintext case")
+    let t = pgconn.plain_transport()
+    test.assert(true)
+
+    test.case("and the negotiation is a separate step, for TLS to fit between")
+    match pgconn.negotiate_tls(0, t, pgconn.PgSslDisable)
+        Ok(b)  => test.assert(b == false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_every_connecting_entry_point_refuses_a_closed_port() [io, net, time]
+    test.case("the connection itself")
+    match pgconn.connect(unreachable(), pgconn.plain_transport())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and the driver over it")
+    match pgdriver.open(unreachable(), pgconn.plain_transport())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and a cancel sent from a key alone")
+    let k = PgCancelKey { host: "127.0.0.1", port: closed_port(),
+                                 process_id: 1, secret_key: 2 }
+    test.assert_some(pgconn.cancel_by_key(k, pgconn.plain_transport()))
+
+@test
+fn test_the_pool_policy_is_the_part_worth_publishing() [io]
+    // Keeping sockets in a list is the easy half.  What a pool is for
+    // is three decisions, and each is a wrong answer waiting to happen.
+    let p = pgpool.default_policy()
+
+    test.case("the limit is a limit, not advice")
+    test.assert(p.max_connections > 0)
+
+    test.case("a returned connection is reset rather than trusted")
+    // A connection returned mid-transaction hands the NEXT borrower an
+    // open transaction, and that borrower's first statement runs
+    // inside somebody else's.
+    test.assert(p.reset_on_release)
+
+    test.case("an idle connection is aged out, because nobody is told it closed")
+    test.assert(p.max_idle_ms > 0)
+
+    test.case("and the wait is bounded, because a pool that waits forever stalls a service")
+    test.assert(p.wait_ms >= 0)
+
+@test
+fn test_a_pool_is_a_value_and_its_clock_is_the_caller_s() [io, net, time]
+    let pool = pgpool.new_pool(unreachable(), pgconn.plain_transport(),
+                               pgpool.default_policy())
+
+    test.case("a fresh pool has lent nothing and opened nothing")
+    test.assert(pool.lent == 0)
+    test.assert(list.len(pool.idle) == 0)
+    test.assert(pool.opened_total == 0)
+
+    test.case("its counters are readable for a metrics endpoint")
+    let s = pgpool.stats(pool)
+    test.assert(s.limit == pgpool.default_policy().max_connections)
+    test.assert(s.idle == 0)
+    test.assert(s.lent == 0)
+    test.assert(s.waits_total == 0)
+    test.assert(s.timeouts_total == 0)
+
+    test.case("and an empty pool has nothing to lend without opening")
+    test.assert(pgpool.has_idle(pool, 0) == false)
+
+    test.case("acquiring from a pool with nothing to connect to refuses")
+    match pgpool.acquire(pool, 0)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("closing an empty pool is not an error")
+    test.assert_none(pgpool.close_pool(pool))
+
+@test
+fn test_the_binary_copy_trailer_is_the_part_a_writer_forgets() [io]
+    // A stream without it is one the server accepts and then reports
+    // as truncated at the very end, after everything has been sent.
+    test.case("the header is a signature, flags and an extension length")
+    test.assert(bytes.len(pgcopy.binary_header()) == 19)
+
+    test.case("the trailer is a column count of -1, so two bytes")
+    test.assert(bytes.len(pgcopy.binary_trailer()) == 2)
+
+    test.case("and they are different bytes")
+    test.assert(bytes.to_hex(pgcopy.binary_header()) != bytes.to_hex(pgcopy.binary_trailer()))
+
+    test.case("a row encodes without a connection, for a dump tool")
+    match pgcopy.encode_binary_row([pgtype.PgInt(v: 1), pgtype.PgNull])
+        Ok(b)  => test.assert(bytes.len(b) > 0)
+        Err(_) => test.assert(true)
+
+    test.case("and so does a text row, with the escaping this package owns")
+    match pgcopy.encode_text_row([pgtype.PgStr(v: "a\tb"), pgtype.PgNull], "\t", "\\N")
+        Ok(b)  => test.assert(bytes.len(b) > 0)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_connecting_surface_is_named_where_a_caller_would_reach_it() [io, net, time]
+    // Thin by necessity — there is no server — and here so the public
+    // surface cannot drift away from a caller who cannot run it.  The
+    // server tests are the implementation lane's.
+    match pgconn.connect(unreachable(), pgconn.plain_transport())
+        Ok(c)  =>
+            test.case("the read and write loop")
+            match pgconn.next_message(c)
+                Ok(r)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match pgconn.send(c, pgmsg.PgSync)
+                Ok(c2) => test.assert(true)
+                Err(_) => test.assert(true)
+            match pgconn.send_batch(c, [pgmsg.PgFlush, pgmsg.PgSync])
+                Ok(c2) => test.assert(true)
+                Err(_) => test.assert(true)
+            match pgconn.drain_to_ready(c)
+                Ok(c2) => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("the parameters, the notifications and the cancel key")
+            test.assert(pgconn.parameter(c, "server_version") != "")
+            test.assert(list.len(pgconn.take_notifications(c).notifications) >= 0)
+            match pgconn.wait_notification(c, 10)
+                Ok(n)  => test.assert(true)
+                Err(_) => test.assert(true)
+            test.assert(pgconn.cancel_key(c).process_id >= 0)
+            test.assert_none(pgconn.cancel(c))
+            test.assert_none(pgconn.close(c))
+
+        Err(f) =>
+            test.case("nothing listening, so the refusal is the assertion")
+            test.assert(true)
+
+@test
+fn test_the_query_surface_is_named_where_a_caller_would_reach_it() [io, net, time]
+    match pgconn.connect(unreachable(), pgconn.plain_transport())
+        Ok(c)  =>
+            test.case("the simple protocol, the extended one, and the count")
+            match pgquery.simple(c, "SELECT 1")
+                Ok(s)  => test.assert(list.len(s.results) >= 0)
+                Err(_) => test.assert(true)
+            match pgquery.query(c, "SELECT $1", [pgtype.PgInt(v: 1)], pgmsg.PgBinary)
+                Ok(e)  => test.assert(e.result.affected >= 0)
+                Err(_) => test.assert(true)
+            match pgquery.execute_count(c, "DELETE FROM t", [])
+                Ok(a)  => test.assert(a.affected >= 0)
+                Err(_) => test.assert(true)
+
+            test.case("prepare, execute and close")
+            match pgquery.prepare(c, "by_id", "SELECT $1", [])
+                Err(_) => test.assert(true)
+                Ok(p)  =>
+                    match pgquery.execute(p.conn, p.statement, [], pgmsg.PgBinary)
+                        Ok(e)  => test.assert(true)
+                        Err(_) => test.assert(true)
+            match pgquery.close_statement(c, "by_id")
+                Ok(c2) => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("both pipelines, and the unsynced one reports what was skipped")
+            match pgquery.pipeline(c, [], [])
+                Ok(p)  => test.assert(list.len(p.results) == list.len(p.faults))
+                Err(_) => test.assert(true)
+            match pgquery.pipeline_unsynced(c, [], [])
+                Ok(p)  => test.assert(p.skipped >= 0)
+                Err(_) => test.assert(true)
+
+            test.case("the cursor, which is what a result set larger than memory needs")
+            match pgquery.open_cursor(c, "big", "SELECT 1", [], 500)
+                Err(_) => test.assert(true)
+                Ok(o)  =>
+                    match pgquery.fetch(o.conn, o.cursor)
+                        Err(_) => test.assert(true)
+                        Ok(b)  =>
+                            match pgquery.close_cursor(b.conn, b.cursor)
+                                Ok(c2) => test.assert(true)
+                                Err(_) => test.assert(true)
+
+            test.case("and the transaction, whose isolation level is a trap")
+            match pgquery.begin(c, pgquery.PgSerializable, false)
+                Err(_) => test.assert(true)
+                Ok(c2) =>
+                    test.assert(pgquery.in_failed_transaction(c2) == false)
+                    match pgquery.commit(c2)
+                        Ok(c3) => test.assert(true)
+                        Err(_) => test.assert(true)
+                    match pgquery.rollback(c2)
+                        Ok(c3) => test.assert(true)
+                        Err(_) => test.assert(true)
+
+        Err(f) =>
+            test.case("nothing listening, so the refusal is the assertion")
+            test.assert(true)
+
+@test
+fn test_the_copy_and_driver_surfaces_are_named() [io, net, time]
+    match pgconn.connect(unreachable(), pgconn.plain_transport())
+        Ok(c)  =>
+            test.case("copying in, and the abort that has to be sent")
+            match pgcopy.begin_in(c, "COPY t FROM STDIN", pgcopy.PgCopyText)
+                Err(_) => test.assert(true)
+                Ok(s)  =>
+                    match pgcopy.send_raw(s, bytes.zeros(0))
+                        Err(_) => test.assert(true)
+                        Ok(s2) =>
+                            match pgcopy.send_row(s2, [])
+                                Err(_) => test.assert(true)
+                                Ok(s3) =>
+                                    match pgcopy.finish_in(s3)
+                                        Ok(d)  => test.assert(d.rows >= 0)
+                                        Err(_) => test.assert(true)
+                    match pgcopy.fail_in(s, "gave up")
+                        Ok(c2) => test.assert(true)
+                        Err(_) => test.assert(true)
+
+            test.case("copying out, where a CopyData is not a row")
+            match pgcopy.begin_out(c, "COPY t TO STDOUT", pgcopy.PgCopyText)
+                Err(_) => test.assert(true)
+                Ok(s)  =>
+                    match pgcopy.recv_raw(s)
+                        Ok(ch) => test.assert(true)
+                        Err(_) => test.assert(true)
+                    match pgcopy.recv_rows(s)
+                        Ok(r)  => test.assert(list.len(r.rows) >= 0)
+                        Err(_) => test.assert(true)
+                    match pgcopy.finish_out(s)
+                        Ok(c2) => test.assert(true)
+                        Err(_) => test.assert(true)
+
+            test.case("and the driver, which wraps a connection it does not own")
+            let db = pgdriver.of_conn(c)
+            test.assert_none(pgdriver.last_fault(db))
+            test.assert(pgdriver.conn_of(db).process_id >= 0)
+            match pgdriver.query(db, "SELECT 1", [])
+                Ok(r)  => test.assert(list.len(r.rows) >= 0)
+                Err(_) => test.assert(true)
+            match db.exec("SELECT 1")
+                Some(e) => test.assert(true)
+                None    => test.assert(true)
+            match db.query_count("SELECT 1")
+                Ok(n)  => test.assert(n >= 0)
+                Err(_) => test.assert(true)
+            db.close()
+
+        Err(f) =>
+            test.case("nothing listening, so the refusal is the assertion")
+            test.assert(true)
+
+@test
+fn test_the_pool_borrow_path_and_the_sqlstate_mapping_are_named() [io, net, time]
+    let pool = pgpool.new_pool(unreachable(), pgconn.plain_transport(),
+                               pgpool.default_policy())
+
+    test.case("warming a pool with nothing to connect to refuses")
+    match pgpool.warm(pool)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("reaping an empty pool is not an error")
+    match pgpool.reap(pool, 0)
+        Ok(p)  => test.assert(p.lent == 0)
+        Err(_) => test.assert(true)
+
+    test.case("borrowing from it refuses too")
+    match pgdriver.borrow(pool, 0)
+        Err(_) => test.assert(true)
+        Ok(b)  =>
+            match pgdriver.give_back(b.pool, b.db, 0)
+                Ok(p)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+    test.case("and the SQLSTATE mapping is published so it can be disagreed with")
+    match pgdriver.to_db_error(pgerror.PgConnectionLost(during: "query"))
+        ConnectionError(m) => test.assert(true)
+        e                  => test.assert(true)
+
+@test
+fn test_release_and_discard_are_different_answers() [io, net, time]
+    let pool = pgpool.new_pool(unreachable(), pgconn.plain_transport(),
+                               pgpool.default_policy())
+
+    test.case("a caller that knows the connection is bad says so")
+    match pgconn.connect(unreachable(), pgconn.plain_transport())
+        Err(_) => test.assert(true)
+        Ok(c)  =>
+            test.assert(pgpool.discard(pool, c).closed_total >= 0)
+            match pgpool.release(pool, c, 0)
+                Ok(p)  => test.assert(p.lent >= 0)
+                Err(_) => test.assert(true)

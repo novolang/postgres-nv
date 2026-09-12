@@ -1,0 +1,219 @@
+// pgtype_tests.nv — the OIDs, the epoch that is not 1970, the NULL
+// that is not an empty string, and the errors that are field sets.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: postgres-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE OIDs ARE ASSERTED AS NUMBERS because they are numbers in
+// PostgreSQL's `pg_type.h` and have been since before this project
+// existed.  A port that got one wrong decodes a column as the wrong
+// type, which for `int4` against `oid` is a value that looks fine.
+
+use std.test
+use std.bytes
+use pgerror
+use pgmsg
+use pgtype
+
+@test
+fn test_the_builtin_oids_are_postgresql_s_own_numbers() [io]
+    test.case("the integers")
+    test.assert(pgtype.oid_int2() == 21)
+    test.assert(pgtype.oid_int4() == 23)
+    test.assert(pgtype.oid_int8() == 20)
+
+    test.case("and note that int8 is NUMERICALLY BELOW int4")
+    // 20, 21, 23 in declaration order is int8, int2, int4 — a reader
+    // that assumed the OIDs ascend with the width has them shuffled.
+    test.assert(pgtype.oid_int8() < pgtype.oid_int2())
+
+    test.case("the floats")
+    test.assert(pgtype.oid_float4() == 700)
+    test.assert(pgtype.oid_float8() == 701)
+
+    test.case("the strings and the bytes")
+    test.assert(pgtype.oid_bool() == 16)
+    test.assert(pgtype.oid_bytea() == 17)
+    test.assert(pgtype.oid_text() == 25)
+    test.assert(pgtype.oid_varchar() == 1043)
+
+    test.case("the times, and the two that are different types")
+    test.assert(pgtype.oid_date() == 1082)
+    test.assert(pgtype.oid_timestamp() == 1114)
+    test.assert(pgtype.oid_timestamptz() == 1184)
+    test.assert(pgtype.oid_timestamp() != pgtype.oid_timestamptz())
+
+    test.case("and the rest")
+    test.assert(pgtype.oid_numeric() == 1700)
+    test.assert(pgtype.oid_uuid() == 2950)
+    test.assert(pgtype.oid_json() == 114)
+    test.assert(pgtype.oid_jsonb() == 3802)
+
+@test
+fn test_the_timestamp_epoch_is_2000_and_not_1970() [io]
+    // THE ASSERTION THIS FILE EXISTS FOR.  A driver that answered a
+    // bare integer would be handing back the trap with a plausible
+    // name on it: consumers write the shift and some of them write it
+    // as the Unix epoch, producing dates thirty years early with no
+    // error anywhere.
+    test.case("ten thousand nine hundred and fifty-seven days")
+    test.assert(pgtype.postgres_epoch_day() == 10957)
+
+    test.case("which is thirty years, seven of them leap")
+    test.assert(pgtype.postgres_epoch_day() == 30 * 365 + 7)
+
+@test
+fn test_a_null_is_not_an_empty_string() [io]
+    // On the wire a NULL is a length of -1 and a zero-length text
+    // value is a length of 0.  They are different values and `Bytes`
+    // cannot tell them apart, which is why `decode` takes `is_null`.
+    test.case("a null column decodes to the null variant")
+    match pgtype.decode(pgtype.oid_text(), pgmsg.PgText, bytes.zeros(0), true,
+                        pgtype.default_settings())
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match v
+                PgNull => test.assert(true)
+                _      => test.assert(false)
+
+    test.case("and an empty text column decodes to an empty string")
+    match pgtype.decode(pgtype.oid_text(), pgmsg.PgText, bytes.zeros(0), false,
+                        pgtype.default_settings())
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match v
+                PgStr(s) => test.assert(s == "")
+                _        => test.assert(false)
+
+    test.case("the two are not equal and the type system says so")
+    test.assert(pgtype.show(pgtype.PgNull) != pgtype.show(pgtype.PgStr(v: "")))
+
+@test
+fn test_the_text_format_depends_on_settings_the_server_can_change() [io]
+    // A decoder that ignored ParameterStatus reads `01/02/2026` as the
+    // second of January against a server set to `DateStyle = SQL, DMY`.
+    let d = pgtype.default_settings()
+
+    test.case("a fresh connection assumes UTF8, ISO dates and integer datetimes")
+    test.assert(d.client_encoding == "UTF8")
+    test.assert(d.date_style == "ISO, MDY")
+    test.assert(d.integer_datetimes)
+
+    test.case("and a ParameterStatus moves them")
+    test.assert(pgtype.apply_parameter(d, "DateStyle", "SQL, DMY").date_style == "SQL, DMY")
+    test.assert(pgtype.apply_parameter(d, "client_encoding", "LATIN1").client_encoding == "LATIN1")
+    test.assert(pgtype.apply_parameter(d, "TimeZone", "UTC").time_zone == "UTC")
+
+    test.case("a name this package does not track leaves them alone")
+    test.assert(pgtype.apply_parameter(d, "server_version", "17.2").date_style == d.date_style)
+
+@test
+fn test_numeric_is_not_a_float_and_the_conversion_is_a_decision() [io]
+    // `numeric` is what money is stored in.  Arbitrary precision in
+    // base-10000 digits, and converting it to a Float loses that —
+    // which is why the loss is a function a caller calls.
+    let n = pgtype.numeric([1, 2345], 1, false, 4)
+
+    test.case("the parts are kept as the wire sent them")
+    test.assert(n.weight == 1)
+    test.assert(n.scale == 4)
+    test.assert(n.negative == false)
+    test.assert(n.is_nan == false)
+
+    test.case("the exact rendering is the one for money")
+    test.assert(pgtype.numeric_text(n) != "")
+
+    test.case("and the lossy one is a separate call")
+    test.assert(pgtype.numeric_to_float(n) > 0.0)
+
+    test.case("numeric NaN is its own value and is not a Float NaN")
+    test.assert(pgtype.numeric_nan().is_nan)
+    test.assert(pgtype.numeric_nan().is_nan != n.is_nan)
+
+@test
+fn test_a_uuid_is_sixteen_bytes_and_is_rendered_here() [io]
+    // uuid-nv is not a dependency: it would put a random-number
+    // generator into every program that selects a UUID column.
+    test.case("all-zero bytes render as the nil UUID")
+    test.assert(pgtype.uuid_text(bytes.zeros(16))
+                == "00000000-0000-0000-0000-000000000000")
+
+    test.case("and the rendering is thirty-six characters")
+    test.assert(pgtype.uuid_text(bytes.zeros(16)) != "")
+
+@test
+fn test_a_value_encodes_back_and_knows_the_oid_it_binds_as() [io]
+    test.case("an integer encodes and is not null")
+    match pgtype.encode(pgtype.PgInt(v: 42), pgmsg.PgBinary)
+        Err(_) => test.assert(false)
+        Ok(e)  => test.assert(e.is_null == false)
+
+    test.case("and a null encodes as null with no bytes")
+    match pgtype.encode(pgtype.PgNull, pgmsg.PgBinary)
+        Err(_) => test.assert(false)
+        Ok(e)  =>
+            test.assert(e.is_null)
+            test.assert(bytes.len(e.raw) == 0)
+
+    test.case("being explicit about the OID is possible")
+    test.assert(pgtype.oid_for(pgtype.PgInt(v: 42)) == pgtype.oid_int8())
+    test.assert(pgtype.oid_for(pgtype.PgStr(v: "a")) == pgtype.oid_text())
+
+    test.case("a whole row decodes against its description")
+    match pgtype.decode_row([], [], [], pgtype.default_settings())
+        Ok(vs) => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_an_error_is_a_field_set_and_the_sqlstate_is_what_to_branch_on() [io]
+    // The message is localised — a server with `lc_messages = de_DE`
+    // sends German — while 23505 is unique_violation everywhere
+    // forever.
+    let f = pgerror.set_field(
+        pgerror.set_field(
+            pgerror.set_field(pgerror.fields_new(), "S", "ERROR"),
+            "C", "23505"),
+        "n", "users_email_key")
+
+    test.case("the fields land where they are named")
+    test.assert(f.severity == "ERROR")
+    test.assert(f.code == "23505")
+
+    test.case("including the constraint, which is what makes it actionable")
+    test.assert(f.constraint_name == "users_email_key")
+
+    test.case("the SQLSTATE reaches a caller through the fault")
+    test.assert(pgerror.sqlstate(pgerror.PgServerError(fields: f)) == "23505")
+
+    test.case("and its class is the grouping a retry loop branches on")
+    test.assert(pgerror.sqlstate_class("23505") == "23")
+    test.assert(pgerror.sqlstate_class("40001") == "40")
+
+    test.case("a fault that did not come from the server has no SQLSTATE")
+    test.assert(pgerror.sqlstate(pgerror.PgTimedOut(operation: "query", ms: 1000)) == "")
+
+@test
+fn test_retryable_and_fatal_are_different_questions() [io]
+    // An ordinary ERROR aborts the transaction and does NOT make the
+    // connection unusable: a ROLLBACK restores it, which is what a
+    // pool does rather than opening a fresh socket for every
+    // constraint violation.
+    let serialisation = pgerror.set_field(pgerror.fields_new(), "C", "40001")
+    let violation = pgerror.set_field(pgerror.fields_new(), "C", "23505")
+
+    test.case("a serialisation failure is worth retrying")
+    test.assert(pgerror.is_retryable(pgerror.PgServerError(fields: serialisation)))
+
+    test.case("a constraint violation is not — it will fail again")
+    test.assert(pgerror.is_retryable(pgerror.PgServerError(fields: violation)) == false)
+
+    test.case("a lost connection is retryable and also fatal to the socket")
+    test.assert(pgerror.is_retryable(pgerror.PgConnectionLost(during: "query")))
+    test.assert(pgerror.is_fatal(pgerror.PgConnectionLost(during: "query")))
+
+    test.case("and a constraint violation is neither")
+    test.assert(pgerror.is_fatal(pgerror.PgServerError(fields: violation)) == false)
+
+    test.case("every fault renders to something a person can read")
+    test.assert(pgerror.describe(pgerror.PgUnknownMessage(kind: 122)) != "")

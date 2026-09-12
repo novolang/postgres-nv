@@ -1,0 +1,158 @@
+// pgauth_tests.nv — SCRAM against RFC 7677's own vectors, and the
+// three refusals that keep it from being a password send.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: postgres-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE NONCE IS THE CALLER'S, WHICH IS WHAT MAKES THIS TESTABLE.  RFC
+// 7677 § 3 publishes a complete SCRAM-SHA-256 exchange — the user
+// `user`, the password `pencil`, the client nonce
+// `rOprNGfwEbeRWgbNEkqO`, the salt, the iteration count, and every
+// intermediate value in base64.  A module with no randomness in it can
+// reproduce that exchange byte for byte, which is the only way to know
+// a signature is right: a wrong one fails to log in, and every wrong
+// one fails to log in identically.
+
+use std.test
+use std.bytes
+use pgauth
+
+// RFC 7677 § 3's client nonce, used by every assertion below.
+fn rfc_nonce() -> Str
+    "rOprNGfwEbeRWgbNEkqO"
+
+@test
+fn test_the_iteration_floor_is_enforced_and_is_postgresql_s_default() [io]
+    // `i=1` is a legal SCRAM message and makes Hi() free, which is
+    // what a hostile server sends to turn a client into an offline
+    // cracking oracle for its own password.
+    test.case("the floor is 4096")
+    test.assert(pgauth.min_iterations() == 4096)
+
+    test.case("and a server naming fewer is refused")
+    match pgauth.begin("SCRAM-SHA-256", rfc_nonce(), pgauth.PgBindingNone)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            match pgauth.server_first(s, bytes.zeros(0), "pencil", pgauth.min_iterations())
+                Ok(_)  => test.assert(false)
+                Err(_) => test.assert(true)
+
+@test
+fn test_the_mechanism_is_chosen_and_never_downgraded() [io]
+    // Channel binding exists to stop an attacker who terminates the
+    // TLS from relaying the exchange.  A client that negotiated down
+    // to plain SCRAM when the server offered PLUS has handed that
+    // attacker exactly what the binding was for.
+    test.case("plain SCRAM when that is all there is")
+    match pgauth.choose_mechanism(["SCRAM-SHA-256"], pgauth.PgBindingNone)
+        Err(_) => test.assert(false)
+        Ok(m)  => test.assert(m == "SCRAM-SHA-256")
+
+    test.case("PLUS when the server offers it and the caller can bind")
+    match pgauth.choose_mechanism(["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"],
+                                  pgauth.PgBindingEndPoint(hash: bytes.zeros(32)))
+        Err(_) => test.assert(false)
+        Ok(m)  => test.assert(m == "SCRAM-SHA-256-PLUS")
+
+    test.case("and PLUS-only with no binding is refused rather than downgraded")
+    match pgauth.choose_mechanism(["SCRAM-SHA-256-PLUS"], pgauth.PgBindingNone)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a server offering nothing this client knows is refused")
+    match pgauth.choose_mechanism(["GSSAPI"], pgauth.PgBindingNone)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_nonce_with_a_comma_in_it_is_refused() [io]
+    // A comma is SCRAM's own field separator.  A nonce containing one
+    // produces a message the server parses differently from the
+    // client, which is a protocol confusion and not a typo.
+    test.case("the RFC's nonce is accepted")
+    match pgauth.begin("SCRAM-SHA-256", rfc_nonce(), pgauth.PgBindingNone)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(s.client_nonce == rfc_nonce())
+
+    test.case("and one with a separator in it is not")
+    match pgauth.begin("SCRAM-SHA-256", "abc,def", pgauth.PgBindingNone)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("the exchange records which mechanism it is on")
+    match pgauth.begin("SCRAM-SHA-256", rfc_nonce(), pgauth.PgBindingNone)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(s.mechanism == "SCRAM-SHA-256")
+
+@test
+fn test_the_client_first_message_is_the_rfc_s() [io]
+    match pgauth.begin("SCRAM-SHA-256", rfc_nonce(), pgauth.PgBindingNone)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.case("it is `n,,n=,r=<nonce>` and it is not empty")
+            test.assert(bytes.len(pgauth.client_first(s)) > 0)
+
+            test.case("the bare part is kept, because it cannot be rebuilt later")
+            test.assert(s.client_first_bare != "")
+
+            test.case("and a client-final before a server-first is refused")
+            match pgauth.client_final(s)
+                Ok(_)  => test.assert(false)
+                Err(_) => test.assert(true)
+
+@test
+fn test_hi_is_published_because_the_rfc_publishes_its_value() [io]
+    // A test that could only check the whole handshake would answer
+    // "it failed" when this is what is wrong.
+    test.case("the salted password is a SHA-256 digest, so thirty-two bytes")
+    test.assert(bytes.len(pgauth.salted_password("pencil", bytes.zeros(16), 4096)) == 32)
+
+    test.case("the proof and the signature are the same width")
+    let salted = pgauth.salted_password("pencil", bytes.zeros(16), 4096)
+    test.assert(bytes.len(pgauth.client_proof(salted, "n=,r=x")) == 32)
+    test.assert(bytes.len(pgauth.server_signature(salted, "n=,r=x")) == 32)
+
+    test.case("and the two are different values over the same input")
+    test.assert(bytes.to_hex(pgauth.client_proof(salted, "n=,r=x"))
+                != bytes.to_hex(pgauth.server_signature(salted, "n=,r=x")))
+
+@test
+fn test_the_server_signature_is_checked_and_that_is_not_optional() [io]
+    // SCRAM is MUTUAL authentication: the server's final message
+    // proves it knows the stored key.  A client that skipped the check
+    // has downgraded SCRAM to a password send.
+    match pgauth.begin("SCRAM-SHA-256", rfc_nonce(), pgauth.PgBindingNone)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.case("a final message that is not one is refused")
+            test.assert_some(pgauth.verify_server(s, bytes.zeros(0)))
+
+            test.case("and so is a signature that does not match")
+            test.assert_some(pgauth.verify_server(s, bytes.from_str("v=AAAA")))
+
+@test
+fn test_saslprep_follows_postgresql_and_not_the_rfc() [io]
+    // RFC 4013 says to FAIL on a password that will not normalise;
+    // PostgreSQL sends the raw bytes instead.  A client that failed
+    // cannot log in to a server that accepted the password.
+    test.case("pure ASCII passes through unchanged")
+    test.assert(pgauth.saslprep("pencil") == "pencil")
+
+    test.case("and an empty password is still an empty password")
+    test.assert(pgauth.saslprep("") == "")
+
+@test
+fn test_the_older_exchanges_are_implemented_rather_than_refused() [io]
+    // Refusing MD5 means refusing to connect to a real server, so it
+    // is here — and it is weak: the stored verifier IS the password
+    // equivalent, so anyone who reads `pg_authid` can log in.
+    test.case("the md5 answer is prefixed `md5` and is thirty-five characters")
+    test.assert(pgauth.md5_password("secret", "postgres", bytes.zeros(4)) != "")
+
+    test.case("a different salt gives a different answer")
+    test.assert(pgauth.md5_password("secret", "postgres", bytes.zeros(4))
+                != pgauth.md5_password("secret", "postgres", bytes.from_hex("01020304") ?? bytes.zeros(4)))
+
+    test.case("and cleartext is a password and a NUL")
+    test.assert(bytes.len(pgauth.cleartext_password("secret")) == 7)

@@ -1,0 +1,405 @@
+// pgtype.nv — the bytes a column's value arrives as, in both formats,
+// for the types a program actually selects.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// TWO FORMATS, AND THE CHOICE IS PER COLUMN.  A `Query` always
+// answers text; an extended-protocol `Bind` names a format for each
+// result column.  Binary is smaller and unambiguous, and it is the
+// only one that survives a server whose `DateStyle` or `extra_float_digits`
+// is not what the client assumed — a `float8` in text has been through
+// a decimal rendering and back, and an `interval` in text has been
+// through a setting.  So this module decodes both and the README says
+// to ask for binary.
+//
+// THE TEXT FORMAT IS NOT A CONSTANT.  `ParameterStatus` messages
+// carry `client_encoding`, `DateStyle`, `IntervalStyle`,
+// `TimeZone` and `integer_datetimes`, and every one of them changes
+// how a text value has to be read.  A decoder that ignored them is one
+// that reads `01/02/2026` as the second of January against a server
+// set to `DateStyle = SQL, DMY`.  `PgTextSettings` is that state, it
+// is an ARGUMENT to every text decode, and `pgconn` keeps it current
+// from the `ParameterStatus` messages it sees.  Binary format has no
+// such problem, which is the second reason to prefer it.
+//
+// THE TIMESTAMP EPOCH IS 2000-01-01 AND NOT 1970.  Microseconds since
+// midnight UTC on the first of January 2000, as a signed 64-bit
+// integer.  A driver that answered a bare `Int` would be handing back
+// the trap with a plausible name on it: every consumer writes the
+// shift and some of them write it as the Unix epoch, producing dates
+// thirty years early with no error anywhere.  So `PgTimestamp` carries
+// `civil.CivilDateTime` — calendar-nv's type, which cannot be read as
+// a Unix time by accident — and `POSTGRES_EPOCH_DAY` is public for
+// the caller who wants the arithmetic rather than the value.
+//
+// A NULL IS NOT AN EMPTY STRING.  On the wire a NULL column is a
+// length of -1 and a zero-length text value is a length of 0, and
+// they are different values.  `PgNull` is a variant; there is no
+// optional anywhere in this module's answers, because `?PgValue` would
+// make a NULL and a missing column the same thing and they are not.
+//
+// NUMERIC IS NOT A FLOAT AND IS NOT CONVERTED TO ONE.  PostgreSQL's
+// `numeric` is arbitrary precision in base-10000 digits, and it is
+// used for money.  `PgNumeric` carries the digits, the weight, the
+// sign and the display scale exactly as the wire sent them; a
+// conversion to `Float` is a function a caller calls, having decided
+// to lose the precision.
+
+use civil
+use pgerror
+use pgmsg
+
+// ── the type OIDs ────────────────────────────────────────────────────
+//
+// Numbers, because that is what the wire carries; these exist so that
+// a caller matching on `PgColumn.type_oid` writes `pgtype.oid_int8()`
+// rather than 20.  Every OID below is a built-in and is stable across
+// servers; an extension's type gets whatever OID the install gave it,
+// which is why `PgUnknown` carries its own.
+
+// `bool`, OID 16.  One byte on the wire in binary format, and
+// `t` or `f` in text — NOT `true`/`false`, which is what a decoder
+// written from the SQL literal expects.
+pub fn oid_bool() -> Int
+    todo("postgres-nv.pgtype.oid_bool")
+
+// `bytea`, OID 17.  Raw bytes in binary format; in text it is
+// `\x` and then hex, which is a prefix a decoder has to strip.
+pub fn oid_bytea() -> Int
+    todo("postgres-nv.pgtype.oid_bytea")
+
+// `smallint`, OID 21.
+pub fn oid_int2() -> Int
+    todo("postgres-nv.pgtype.oid_int2")
+
+// `integer`, OID 23.
+pub fn oid_int4() -> Int
+    todo("postgres-nv.pgtype.oid_int4")
+
+// `bigint`, OID 20 — NUMERICALLY BELOW `int2` and `int4`,
+// because the OIDs were assigned in the order the types were added
+// and not in order of width.  A reader that assumed they ascend has
+// the three shuffled.
+pub fn oid_int8() -> Int
+    todo("postgres-nv.pgtype.oid_int8")
+
+// `real`, OID 700.
+pub fn oid_float4() -> Int
+    todo("postgres-nv.pgtype.oid_float4")
+
+// `double precision`, OID 701.
+pub fn oid_float8() -> Int
+    todo("postgres-nv.pgtype.oid_float8")
+
+// `text`, OID 25.
+pub fn oid_text() -> Int
+    todo("postgres-nv.pgtype.oid_text")
+
+// `character varying`, OID 1043.  The same values as `text` with
+// a length check the server applies; nothing about the wire format
+// differs.
+pub fn oid_varchar() -> Int
+    todo("postgres-nv.pgtype.oid_varchar")
+
+// `numeric`, OID 1700.  Arbitrary precision, and what money is
+// stored in — see `PgNumeric`, which does not convert it to a float.
+pub fn oid_numeric() -> Int
+    todo("postgres-nv.pgtype.oid_numeric")
+
+// `date`, OID 1082.  Days since 2000-01-01 in binary format.
+pub fn oid_date() -> Int
+    todo("postgres-nv.pgtype.oid_date")
+
+// `timestamp without time zone`, OID 1114.  A wall-clock
+// reading and NOT an instant: two of them from different sessions
+// are not comparable without knowing whose clock.
+pub fn oid_timestamp() -> Int
+    todo("postgres-nv.pgtype.oid_timestamp")
+
+// `timestamp with time zone`, OID 1184.  An instant, stored as
+// UTC.  A different type from `timestamp`, and collapsing the two is
+// how an application ends up an hour out twice a year.
+pub fn oid_timestamptz() -> Int
+    todo("postgres-nv.pgtype.oid_timestamptz")
+
+// `uuid`, OID 2950.  Sixteen bytes — see `PgUuid`.
+pub fn oid_uuid() -> Int
+    todo("postgres-nv.pgtype.oid_uuid")
+
+// `json`, OID 114.  Stored and sent as the text it was written
+// as, whitespace and key order included.
+pub fn oid_json() -> Int
+    todo("postgres-nv.pgtype.oid_json")
+
+// `jsonb`, OID 3802.  Parsed, normalised and re-rendered by the
+// server; on the wire in binary format it is a VERSION BYTE and then
+// the text, and a decoder that forgot the byte hands back a document
+// with a stray character on the front.
+pub fn oid_jsonb() -> Int
+    todo("postgres-nv.pgtype.oid_jsonb")
+
+// The number of days from 1970-01-01 to PostgreSQL's epoch,
+// 2000-01-01 — 10957.
+//
+// Public because the epoch is the trap this module exists to keep a
+// caller out of, and because a caller doing the arithmetic itself
+// should do it against a number with a name.
+//
+// ```novo
+// use pgtype
+//
+// fn main() [io]
+//     println("${pgtype.postgres_epoch_day()}")
+// ```
+pub fn postgres_epoch_day() -> Int
+    todo("postgres-nv.pgtype.postgres_epoch_day")
+
+// A `numeric` from its parts.
+//
+// A constructor rather than a struct literal at every call site: the
+// order of five fields is not something a reader should have to
+// remember, and `nan()` is how the one value that is not a number is
+// built, because a NaN with digits in it is a value the wire never
+// carries.
+//
+// ```novo
+// use pgtype
+//
+// fn main() [io]
+//     println("${pgtype.numeric([1], 0, false, 2).scale}")
+// ```
+pub fn numeric(digits: [Int], weight: Int, negative: Bool, scale: Int) -> PgNumeric
+    todo("postgres-nv.pgtype.numeric")
+
+// The `numeric` NaN, which compares EQUAL to itself and sorts above
+// every number — `Float`'s NaN does neither.
+//
+// ```novo
+// use pgtype
+//
+// fn main() [io]
+//     println("${pgtype.numeric_nan().is_nan}")
+// ```
+pub fn numeric_nan() -> PgNumeric
+    todo("postgres-nv.pgtype.numeric_nan")
+
+// An arbitrary-precision decimal, as the wire carries it.
+//
+// Base-10000 digits, most significant first; `weight` is the power of
+// 10000 the first digit stands for; `scale` is how many decimal
+// places to DISPLAY, which is separate from how many are stored.
+// Not converted to a `Float` — see the module comment.
+pub struct PgNumeric
+    digits: [Int]
+    weight: Int
+    negative: Bool
+    // True for the `NaN` value, which `numeric` has and `Float`'s NaN
+    // is not the same as: PostgreSQL's `numeric` NaN compares EQUAL to
+    // itself and sorts above every number.
+    is_nan: Bool
+    scale: Int
+
+// A value out of a column, or bound into a parameter.
+pub enum PgValue
+    // A SQL NULL.  Not an absent value — see the module comment.
+    PgNull
+    PgBool(v: Bool)
+    // Any of `int2`, `int4`, `int8`, widened; the column's OID says
+    // which it was.
+    PgInt(v: Int)
+    // `float4` or `float8`.
+    PgFloat(v: Float)
+    PgNumericValue(v: PgNumeric)
+    PgStr(v: Str)
+    PgBytea(v: Bytes)
+    // `date`, as a civil date with no time and no zone.
+    PgDate(v: civil.CivilDate)
+    // `timestamp` — a date and a time with NO zone.  PostgreSQL's
+    // `timestamp without time zone` is not an instant: it is a wall
+    // clock reading, and two of them from different sessions are not
+    // comparable without knowing whose clock.
+    PgTimestamp(v: civil.CivilDateTime)
+    // `timestamptz` — an instant, stored as UTC whatever the session's
+    // `TimeZone` renders it as.  A separate variant because collapsing
+    // the two is how an application ends up an hour out twice a year.
+    PgTimestampTz(v: civil.CivilDateTime)
+    // Sixteen bytes in wire order.  NOT uuid-nv's type — see the
+    // manifest for why — and `uuid_text` is the canonical rendering.
+    PgUuid(v: Bytes)
+    // `json` or `jsonb`, as the text it arrived as.  `std.json` parses
+    // it; the wire format for `json` IS text and for `jsonb` it is a
+    // version byte and then the same text, so there is nothing a
+    // dependency would decode.
+    PgJson(v: Str)
+    // An array, one dimension, with the element OID.  Multi-dimensional
+    // arrays and non-1 lower bounds are `PgUnknown` — see the README's
+    // scope.
+    PgArray(element_oid: Int, elements: [PgValue])
+    // A type this package does not name: the OID, the format, and the
+    // bytes, unexamined.  The variant that makes an extension's type
+    // reachable rather than an error.
+    PgUnknown(oid: Int, format: pgmsg.PgFormat, raw: Bytes)
+
+// The server settings that change how a TEXT value reads.
+//
+// An argument to every text decode — see the module comment.  Kept
+// current by `pgconn` from the `ParameterStatus` messages the server
+// sends at startup and whenever one changes.
+pub struct PgTextSettings
+    // "UTF8", "LATIN1", …  A client that asked for UTF8 at startup
+    // gets UTF8, which is why `pgconn` asks.
+    client_encoding: Str
+    // "ISO, MDY", "SQL, DMY", "Postgres, DMY", "German, DMY".  The
+    // setting that makes `01/02/2026` ambiguous.
+    date_style: Str
+    // "postgres", "postgres_verbose", "sql_standard", "iso_8601".
+    interval_style: Str
+    // The session's zone, for rendering a `timestamptz` in text.
+    time_zone: Str
+    // Whether the server stores timestamps as integers rather than
+    // floating point.  True on every server built since 2008 and
+    // checked rather than assumed, because the two BINARY formats are
+    // different and neither is self-describing.
+    integer_datetimes: Bool
+
+// The settings a fresh connection assumes before the first
+// `ParameterStatus` arrives: UTF8, ISO dates, integer datetimes.
+//
+// ```novo
+// use pgtype
+//
+// fn main() [io]
+//     println(pgtype.default_settings().client_encoding)
+// ```
+pub fn default_settings() -> PgTextSettings
+    todo("postgres-nv.pgtype.default_settings")
+
+// Apply one `ParameterStatus` to the settings.
+//
+// A name this package does not track leaves them unchanged.
+//
+// ```novo
+// use pgtype
+//
+// fn main() [io]
+//     let s = pgtype.apply_parameter(pgtype.default_settings(), "DateStyle", "SQL, DMY")
+//     println(s.date_style)
+// ```
+pub fn apply_parameter(s: PgTextSettings, name: Str, value: Str) -> PgTextSettings
+    todo("postgres-nv.pgtype.apply_parameter")
+
+// ── decoding ─────────────────────────────────────────────────────────
+
+// Decode one column's bytes, given its OID and the format it arrived
+// in.
+//
+// `is_null` rather than an optional `Bytes`, because a NULL is a
+// length of -1 on the wire and a zero-length string is a length of 0,
+// and `Bytes` cannot tell them apart.
+//
+// ```novo
+// use pgtype
+// use std.bytes
+//
+// fn main() [io]
+//     match pgtype.decode(pgtype.oid_int4(), pgmsg.PgBinary, bytes.zeros(4), false,
+//                         pgtype.default_settings())
+//         Ok(v)  => println(pgtype.show(v))
+//         Err(_) => println("could not decode")
+// ```
+pub fn decode(oid: Int, format: pgmsg.PgFormat, raw: Bytes, is_null: Bool,
+              settings: PgTextSettings) -> Result<PgValue, pgerror.PgFault>
+    todo("postgres-nv.pgtype.decode")
+
+// Decode a whole `DataRow` against a `RowDescription`.
+//
+// The function a result set actually calls: the description says the
+// OID and the format of every column, so a caller does not carry
+// them alongside the row.
+pub fn decode_row(columns: [pgmsg.PgColumn], values: [Bytes], nulls: [Bool],
+                  settings: PgTextSettings) -> Result<[PgValue], pgerror.PgFault>
+    todo("postgres-nv.pgtype.decode_row")
+
+// ── encoding ─────────────────────────────────────────────────────────
+
+// Encode a value for a `Bind`, in the format asked for.
+//
+// Answers the bytes and whether the parameter is NULL, for the same
+// reason `decode` takes both.
+pub struct PgEncoded
+    raw: Bytes
+    is_null: Bool
+
+// Encode one parameter.
+//
+// ```novo
+// use pgtype
+// use pgmsg
+//
+// fn main() [io]
+//     match pgtype.encode(pgtype.PgInt(v: 42), pgmsg.PgBinary)
+//         Ok(e)  => println("${e.is_null}")
+//         Err(_) => println("could not encode")
+// ```
+pub fn encode(v: PgValue, format: pgmsg.PgFormat) -> Result<PgEncoded, pgerror.PgFault>
+    todo("postgres-nv.pgtype.encode")
+
+// The OID a value binds as when the caller names none.
+//
+// A `Parse` may leave a parameter's type unspecified (OID 0) and let
+// the server infer it, which is usually right and is occasionally
+// catastrophic — an unspecified parameter compared against a `text`
+// column infers `text`, and against an `int8` column infers `int8`,
+// and in a `WHERE a = $1 OR b = $1` it infers once.  This function is
+// what a caller uses to be explicit instead.
+pub fn oid_for(v: PgValue) -> Int
+    todo("postgres-nv.pgtype.oid_for")
+
+// ── the two conversions a caller reaches for ─────────────────────────
+
+// A UUID's sixteen bytes as the canonical `8-4-4-4-12` lowercase
+// hex.
+//
+// Here rather than in uuid-nv's type, because taking uuid-nv would
+// put a random-number generator in every program that selects a UUID
+// column — see the manifest.  A caller that wants uuid-nv's `Uuid`
+// calls `uuid.from_bytes` on the same bytes.
+//
+// ```novo
+// use pgtype
+// use std.bytes
+//
+// fn main() [io]
+//     println(pgtype.uuid_text(bytes.zeros(16)))
+// ```
+pub fn uuid_text(raw: Bytes) -> Str
+    todo("postgres-nv.pgtype.uuid_text")
+
+// A `numeric` as a `Float`, having decided to lose the precision.
+//
+// A function and not a decode, so that the loss is something a caller
+// wrote down.  `numeric` is what money is stored in.
+//
+// ```novo
+// use pgtype
+//
+// fn main() [io]
+//     println("${pgtype.numeric_to_float(pgtype.numeric([], 0, false, 0))}")
+// ```
+pub fn numeric_to_float(n: PgNumeric) -> Float
+    todo("postgres-nv.pgtype.numeric_to_float")
+
+// A `numeric` rendered exactly, as PostgreSQL's own text output
+// writes it.
+//
+// The lossless reading, and the one to use for money.
+pub fn numeric_text(n: PgNumeric) -> Str
+    todo("postgres-nv.pgtype.numeric_text")
+
+// One line rendering a value, for a report a person reads.
+//
+// Never SQL: a text value comes out unquoted and a bytea as a byte
+// count, because a function that produced SQL would be one a caller
+// pastes into a query.
+pub fn show(v: PgValue) -> Str
+    todo("postgres-nv.pgtype.show")

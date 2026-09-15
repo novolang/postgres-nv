@@ -1,6 +1,6 @@
 [package]
 name        = "postgres-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "A PostgreSQL client with no libpq: the version 3 wire protocol as a codec that performs nothing, SCRAM-SHA-256 and MD5 authentication, the simple and extended query protocols, the text and binary formats for the types a program actually selects, COPY both ways, LISTEN/NOTIFY, out-of-band cancellation, a TLS hook the caller supplies, a connection pool with a policy, and a std.sql driver.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 

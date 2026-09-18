@@ -134,6 +134,20 @@ pub enum PgFault
     // server rejected the data.
     PgCopyFailed(detail: Str)
 
+// `PgFault` is an `Error`, which is what lets `Result<T, PgFault>`
+// exist at all — every one of this package's eight other modules
+// answers with one, from `pgmsg`'s decode through `pgauth`'s SCRAM
+// exchange to `pgpool.acquire` and the `pgdriver` behind std.sql.
+impl Error for PgFault
+    // The one-line message: `pgerror.describe`'s sentence — for a
+    // server error the severity, the SQLSTATE and the primary message
+    // and nothing else, because the detail and the hint are separate
+    // fields and a line that pasted all three is not one line.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("postgres-nv.PgFault.message")
+
 // One line naming what went wrong, for a report a person reads.
 //
 // For a server error it is the severity, the SQLSTATE and the primary

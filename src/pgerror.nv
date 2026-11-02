@@ -1,8 +1,6 @@
 // pgerror.nv — what the server says went wrong, and what went wrong
 // before the server got a chance to.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // AN ERROR FROM POSTGRESQL IS A FIELD SET, NOT A STRING, and throwing
 // the fields away is the commonest thing a thin client does.  An
 // `ErrorResponse` carries a severity, a five-character SQLSTATE, a
@@ -138,15 +136,105 @@ pub enum PgFault
 // exist at all — every one of this package's eight other modules
 // answers with one, from `pgmsg`'s decode through `pgauth`'s SCRAM
 // exchange to `pgpool.acquire` and the `pgdriver` behind std.sql.
+// The severity to print for a field set.  `V` is the
+// never-localised severity and is what a report should carry; a
+// server older than 9.6 sends none, and a field set with neither is
+// an error by construction — it arrived as an `ErrorResponse`.
+fn severity_of(f: PgFields) -> Str
+    if f.severity_code != ""
+        f.severity_code
+    elif f.severity != ""
+        f.severity
+    else
+        "ERROR"
+
+// The one-line rendering of a server error: severity, SQLSTATE and
+// the primary message, and nothing else.
+fn server_error_line(f: PgFields) -> Str
+    let sev = severity_of(f)
+    if f.code == ""
+        "${sev}: ${f.message}"
+    else
+        "${sev} ${f.code}: ${f.message}"
+
+// A wire position field is a decimal string, 1-based, and a field the
+// server sent as a non-number is 0 rather than a refusal — the
+// position is a convenience and the message is the payload.
+fn position_of(value: Str) -> Int
+    match str.to_int(value)
+        Some(n) => n
+        None    => 0
+
+// `f` with one named field replaced.  A plain struct's fields are
+// immutable, so a field set is folded rather than written into, which
+// is also what lets a caller keep the field set it passed in.
+fn with_field(f: PgFields, name: Str, text: Str, number: Int) -> PgFields
+    with_extras(f, name, text, number, f.extra_codes, f.extra_values)
+
+// The same, for a field set whose extra lists have grown — a field code
+// this decoder does not name is kept rather than dropped.
+fn with_extras(f: PgFields, name: Str, text: Str, number: Int, codes: [Str],
+               values: [Str]) -> PgFields
+    PgFields {
+        severity: pick_text(name, "severity", text, f.severity),
+        severity_code: pick_text(name, "severity_code", text, f.severity_code),
+        code: pick_text(name, "code", text, f.code),
+        message: pick_text(name, "message", text, f.message),
+        detail: pick_text(name, "detail", text, f.detail),
+        hint: pick_text(name, "hint", text, f.hint),
+        position: pick_number(name, "position", number, f.position),
+        internal_position: pick_number(name, "internal_position", number, f.internal_position),
+        internal_query: pick_text(name, "internal_query", text, f.internal_query),
+        context: pick_text(name, "context", text, f.context),
+        schema_name: pick_text(name, "schema_name", text, f.schema_name),
+        table_name: pick_text(name, "table_name", text, f.table_name),
+        column_name: pick_text(name, "column_name", text, f.column_name),
+        datatype_name: pick_text(name, "datatype_name", text, f.datatype_name),
+        constraint_name: pick_text(name, "constraint_name", text, f.constraint_name),
+        source_file: pick_text(name, "source_file", text, f.source_file),
+        source_line: pick_number(name, "source_line", number, f.source_line),
+        source_routine: pick_text(name, "source_routine", text, f.source_routine),
+        extra_codes: codes,
+        extra_values: values }
+
+// The one field `name` names, from the value being set; every other
+// name answers what the field set already held.
+fn pick_text(name: Str, field: Str, given: Str, prior: Str) -> Str
+    if name == field
+        given
+    else
+        prior
+
+// The same, for the three fields that are a number.
+fn pick_number(name: Str, field: Str, given: Int, prior: Int) -> Int
+    if name == field
+        given
+    else
+        prior
+
+fn with_extra(f: PgFields, code: Str, value: Str) -> PgFields
+    let codes = list.concat(f.extra_codes, [code])
+    let values = list.concat(f.extra_values, [value])
+    with_extras(f, "", "", 0, codes, values)
+
+// The SQLSTATE classes a retry loop should take: 40 transaction
+// rollback, 57 operator intervention, 08 connection exception.  A
+// caller that retried class 23 would retry a constraint violation
+// forever.
+fn retryable_class(cls: Str) -> Bool
+    cls == "40" or cls == "57" or cls == "08"
+
+// The two severities after which the backend is gone.
+fn fatal_severity(sev: Str) -> Bool
+    sev == "FATAL" or sev == "PANIC"
+
 impl Error for PgFault
     // The one-line message: `pgerror.describe`'s sentence — for a
     // server error the severity, the SQLSTATE and the primary message
     // and nothing else, because the detail and the hint are separate
     // fields and a line that pasted all three is not one line.
-    //
-    // Panics with `not implemented` until the bodies land.
     fn message(self) -> Str
-        todo("postgres-nv.PgFault.message")
+        describe(self)
 
 // One line naming what went wrong, for a report a person reads.
 //
@@ -162,11 +250,39 @@ impl Error for PgFault
 //     println(pgerror.describe(pgerror.PgUnknownMessage(kind: 122)))
 // ```
 pub fn describe(f: PgFault) -> Str
-    todo("postgres-nv.pgerror.describe")
+    match f
+        PgServerError(fields)               =>
+            server_error_line(fields)
+        PgConnectFailed(host, port, detail) =>
+            "could not connect to ${host}:${port}: ${detail}"
+        PgConnectionLost(during)            =>
+            "the connection was lost during ${during}"
+        PgBadMessage(kind, length, detail)  =>
+            "malformed message: type ${kind}, length ${length}: ${detail}"
+        PgUnknownMessage(kind)              =>
+            "unknown message type ${kind} — the client and the server disagree about where the next message starts"
+        PgUnsupportedAuth(method)           =>
+            "the server asked for ${method} authentication, which this client does not implement"
+        PgScramFailed(step, detail)         =>
+            "SCRAM failed at ${step}: ${detail}"
+        PgTlsRefused(detail)                =>
+            "TLS was refused: ${detail}"
+        PgBadParameters(want, got)          =>
+            "the statement wants ${want} parameter(s) and ${got} were supplied"
+        PgTimedOut(operation, ms)           =>
+            "${operation} did not finish within ${ms} milliseconds"
+        PgPoolExhausted(in_use, limit)      =>
+            "the pool has ${in_use} of its ${limit} connection(s) lent and none came back in time"
+        PgCopyFailed(detail)                =>
+            "the COPY failed: ${detail}"
 
 // An empty field set — what a decoder starts from.
 pub fn fields_new() -> PgFields
-    todo("postgres-nv.pgerror.fields_new")
+    PgFields { severity: "", severity_code: "", code: "", message: "", detail: "", hint: "",
+               position: 0, internal_position: 0, internal_query: "", context: "",
+               schema_name: "", table_name: "", column_name: "", datatype_name: "",
+               constraint_name: "", source_file: "", source_line: 0, source_routine: "",
+               extra_codes: [], extra_values: [] }
 
 // Set one field by its code byte, as the wire spells it: `S`, `V`,
 // `C`, `M`, `D`, `H`, `P`, `p`, `q`, `W`, `s`, `t`, `c`, `d`, `n`,
@@ -182,7 +298,26 @@ pub fn fields_new() -> PgFields
 //     println(pgerror.set_field(pgerror.fields_new(), "C", "23505").code)
 // ```
 pub fn set_field(f: PgFields, code: Str, value: Str) -> PgFields
-    todo("postgres-nv.pgerror.set_field")
+    match code
+        "S" => with_field(f, "severity", value, 0)
+        "V" => with_field(f, "severity_code", value, 0)
+        "C" => with_field(f, "code", value, 0)
+        "M" => with_field(f, "message", value, 0)
+        "D" => with_field(f, "detail", value, 0)
+        "H" => with_field(f, "hint", value, 0)
+        "P" => with_field(f, "position", "", position_of(value))
+        "p" => with_field(f, "internal_position", "", position_of(value))
+        "q" => with_field(f, "internal_query", value, 0)
+        "W" => with_field(f, "context", value, 0)
+        "s" => with_field(f, "schema_name", value, 0)
+        "t" => with_field(f, "table_name", value, 0)
+        "c" => with_field(f, "column_name", value, 0)
+        "d" => with_field(f, "datatype_name", value, 0)
+        "n" => with_field(f, "constraint_name", value, 0)
+        "F" => with_field(f, "source_file", value, 0)
+        "L" => with_field(f, "source_line", "", position_of(value))
+        "R" => with_field(f, "source_routine", value, 0)
+        _   => with_extra(f, code, value)
 
 // The SQLSTATE of a fault, or empty when it did not come from the
 // server.
@@ -197,7 +332,9 @@ pub fn set_field(f: PgFields, code: Str, value: Str) -> PgFields
 //     println(pgerror.sqlstate(pgerror.PgTimedOut(operation: "query", ms: 5000)))
 // ```
 pub fn sqlstate(f: PgFault) -> Str
-    todo("postgres-nv.pgerror.sqlstate")
+    match f
+        PgServerError(fields) => fields.code
+        _                     => ""
 
 // The two-character CLASS of a SQLSTATE: "23" for every integrity
 // constraint violation, "40" for every transaction rollback, "08" for
@@ -214,7 +351,10 @@ pub fn sqlstate(f: PgFault) -> Str
 //     println(pgerror.sqlstate_class("23505"))
 // ```
 pub fn sqlstate_class(code: Str) -> Str
-    todo("postgres-nv.pgerror.sqlstate_class")
+    if str.len(code) < 2
+        code
+    else
+        str.slice(code, 0, 2)
 
 // True when a fault is worth retrying as it stands: a serialization
 // failure, a deadlock, an admin shutdown, a connection that went
@@ -231,7 +371,17 @@ pub fn sqlstate_class(code: Str) -> Str
 //     println("${pgerror.is_retryable(pgerror.PgConnectionLost(during: "query"))}")
 // ```
 pub fn is_retryable(f: PgFault) -> Bool
-    todo("postgres-nv.pgerror.is_retryable")
+    match f
+        // By CLASS and not by code: 40001 is a serialisation failure
+        // and 40P01 a deadlock, and a retry loop wants both.
+        PgServerError(fields)    => retryable_class(sqlstate_class(fields.code))
+        // Nothing was sent, or nothing arrived, or the answer never
+        // came — in every case the statement is safe to send again.
+        PgConnectFailed(_, _, _) => true
+        PgConnectionLost(_)      => true
+        PgTimedOut(_, _)         => true
+        PgPoolExhausted(_, _)    => true
+        _                        => false
 
 // True when the connection is no longer usable and has to be
 // discarded rather than returned to a pool.
@@ -242,4 +392,18 @@ pub fn is_retryable(f: PgFault) -> Bool
 // restores it, which is what `pgpool` does rather than opening a
 // fresh socket for every constraint violation.
 pub fn is_fatal(f: PgFault) -> Bool
-    todo("postgres-nv.pgerror.is_fatal")
+    match f
+        // A FATAL or a PANIC means the backend has already stopped, or
+        // is about to; an ordinary ERROR leaves a session that a
+        // ROLLBACK restores.
+        PgServerError(fields)    =>
+            fatal_severity(fields.severity_code) or fatal_severity(fields.severity)
+                or sqlstate_class(fields.code) == "28"
+        PgConnectFailed(_, _, _) => true
+        PgConnectionLost(_)      => true
+        PgBadMessage(_, _, _)    => true
+        PgUnknownMessage(_)      => true
+        PgTlsRefused(_)          => true
+        PgUnsupportedAuth(_)     => true
+        PgScramFailed(_, _)      => true
+        _                        => false

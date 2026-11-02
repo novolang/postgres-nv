@@ -1,0 +1,787 @@
+// THE CONNECTING HALF, DRIVEN WITH CONSTRUCTED BYTES.
+//
+// No PostgreSQL server is reachable on the machine this was written on
+// — the CHANGELOG's `### Known` says what was looked for and what was
+// found — so this file takes the other road: a `PgConn` is built from
+// its own public fields with the server's bytes already in its inbox,
+// a file descriptor stands in for the socket so the bytes the client
+// writes can be read back, and the paths that need a real socket get
+// one from a listener in this same process with a scripted transport
+// standing behind it.
+//
+// WHAT THIS DOES NOT PROVE.  That a real server's bytes mean what this
+// package thinks they mean.  Every assertion here is between the
+// package and the version 3 protocol's own spelling; `pgmsg` decodes
+// what `pgwire_edge_tests.nv` says it decodes, and a server that
+// disagreed with both would disagree with both halves of this package
+// and not with a test.
+//
+// NO TEST HERE REACHES A SERVER.  The loopback listener a
+// `pgconn.connect` opens its socket against never accepts anything: a
+// connection that queued in its backlog is a socket that reads and
+// writes, which is all `open_socket` needs, and the server's half of
+// the conversation is the scripted transport.
+//
+// THE TWO LENGTH FIELDS THAT MATTER ARE PINNED WHERE THEY CAN BE: the
+// startup packet with all four parameter pairs is asserted byte for
+// byte against a client on a real socket, and every frame a builder
+// here writes is the same `type byte, u32 length, body` shape
+// `pgmsg`'s own encoder produces.
+
+use std.test
+use std.bytes
+use pgconn
+use pgmsg
+use pgtype
+use pgerror
+use pgauth
+
+// ── the wire, as bytes ───────────────────────────────────────────────
+
+// One NUL-terminated field, terminator included.
+fn cstr(s: Str) -> Bytes
+    bytes.concat([bytes.from_str(s), bytes.zeros(1)])
+
+// A typed frame: 82 is `R`, 90 is `Z`, 75 is `K`, 83 is `S`, 78 is
+// `N`, 69 is `E`, 65 is `A`, 67 is `C`, 68 is `D`, 116 is `t`, 49 is
+// `1`, 50 is `2`, 51 is `3`, 110 is `n`, 115 is `s`, 73 is `I`.
+fn frame(kind: Int, body: Bytes) -> Bytes
+    bytes.concat([bytes.u8(kind), bytes.u32_be(bytes.len(body) + 4), body])
+
+// A frame with no body at all — five bytes.
+fn bare(kind: Int) -> Bytes
+    frame(kind, bytes.zeros(0))
+
+// `AuthenticationOk`, `AuthenticationCleartextPassword` and the two
+// SASL codes are all four bytes of request code.
+fn auth(code: Int) -> Bytes
+    frame(82, bytes.u32_be(code))
+
+// `AuthenticationSASL`: the code, then the mechanism names, each
+// NUL-terminated, closed by an empty name.
+fn auth_sasl(mechanisms: [Str]) -> Bytes
+    var parts: [Bytes] = [bytes.u32_be(10)]
+    for m in mechanisms
+        parts = list.concat(parts, [cstr(m)])
+    parts = list.concat(parts, [bytes.zeros(1)])
+    frame(82, bytes.concat(parts))
+
+// `AuthenticationSASLContinue` (11) and `AuthenticationSASLFinal`
+// (12): the code, then the server's message.
+fn auth_sasl_step(code: Int, data: Str) -> Bytes
+    frame(82, bytes.concat([bytes.u32_be(code), bytes.from_str(data)]))
+
+fn parameter(name: Str, value: Str) -> Bytes
+    frame(83, bytes.concat([cstr(name), cstr(value)]))
+
+fn key_data(pid: Int, key: Int) -> Bytes
+    frame(75, bytes.concat([bytes.u32_be(pid), bytes.u32_be(key)]))
+
+fn ready(status: Int) -> Bytes
+    frame(90, bytes.u8(status))
+
+fn notified(pid: Int, channel: Str, payload: Str) -> Bytes
+    frame(65, bytes.concat([bytes.u32_be(pid), cstr(channel), cstr(payload)]))
+
+fn notice(text: Str) -> Bytes
+    frame(78, bytes.concat([bytes.from_str("S"), cstr("NOTICE"),
+                            bytes.from_str("C"), cstr("00000"),
+                            bytes.from_str("M"), cstr(text), bytes.zeros(1)]))
+
+fn refusal(code: Str, text: Str) -> Bytes
+    frame(69, bytes.concat([bytes.from_str("S"), cstr("ERROR"),
+                            bytes.from_str("C"), cstr(code),
+                            bytes.from_str("M"), cstr(text), bytes.zeros(1)]))
+
+fn command(tag: Str) -> Bytes
+    frame(67, cstr(tag))
+
+// One `DataRow` of one text value.
+fn one_text_row(value: Str) -> Bytes
+    frame(68, bytes.concat([bytes.u16_be(1), bytes.u32_be(str.len(value)),
+                            bytes.from_str(value)]))
+
+// One `ParameterDescription` naming one `int4`.
+fn describes_one_int4() -> Bytes
+    frame(116, bytes.concat([bytes.u16_be(1), bytes.u32_be(23)]))
+
+// `RowDescription` of one `int4` column in text format.
+fn one_int4_column() -> Bytes
+    frame(84, bytes.concat([bytes.u16_be(1), cstr("n"), bytes.u32_be(0),
+                            bytes.u16_be(0), bytes.u32_be(23), bytes.u16_be(4),
+                            bytes.u32_be(-1), bytes.u16_be(0)]))
+
+// ── the fixed values the SCRAM scenarios are computed for ────────────
+
+// The client nonce the scenarios put in the options, the salt and the
+// server's two messages, as `pgwire_server_tests.nv` computes them for
+// the password `pencil`: `hashlib.pbkdf2_hmac('sha256', b'pencil',
+// salt, 4096)` over this exact exchange.
+//
+// `cover_nonce` is the CLIENT'S HALF and only that: the server's
+// `r=` is the client nonce with `SRVCOVER9` appended, because a
+// server-first that echoed the nonce unchanged is refused by
+// `server_first` as a replay — so a scenario that used the whole
+// `r=` value here would never get past that check and would pin
+// nothing about what comes after it.
+fn cover_nonce() -> Str
+    "NVCOVERNONCE"
+fn cover_password() -> Str
+    "pencil"
+fn cover_server_first() -> Str
+    "r=NVCOVERNONCESRVCOVER9,s=cGdzYWx0eXNhbHQwMDAwMA==,i=4096"
+fn cover_server_final() -> Str
+    "v=PLr9ttH54iO214eQGNJokIGCCRbd5xyWB76hgSwGvok="
+
+// ── transports ───────────────────────────────────────────────────────
+
+// A transport that throws the bytes away.  What a scripted scenario
+// needs on the write side: the assertions are about what the client
+// does with what it reads, and the client that wrote into the void is
+// the client whose next move is the interesting one.
+fn drops(fd: Int, data: Bytes) -> ?pgerror.PgFault [io, net]
+    None
+
+// A transport whose close does what `fd_close` does, so a scenario
+// that opens a real socket does not leave the descriptor behind.
+fn shuts(fd: Int) -> ?pgerror.PgFault [io, net]
+    tty.close(fd)
+    None
+
+fn failing_send(fd: Int, data: Bytes) -> ?pgerror.PgFault [io, net]
+    Some(pgerror.PgConnectionLost(during: "write"))
+
+fn failing_recv(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Err(pgerror.PgConnectionLost(during: "read"))
+
+// A transport that writes nothing and refuses the one frame a
+// `PasswordMessage` is — 112 is `p`, and no other frame this client
+// sends during a handshake begins with it.  The startup packet begins
+// with the length's first byte, the `SSLRequest` with the same, and
+// the two SASL answers with `p` as well, which is why this is used for
+// the cleartext scenario and not for those.
+fn refuses_the_password(fd: Int, data: Bytes) -> ?pgerror.PgFault [io, net]
+    if bytes.len(data) > 0 and (bytes.byte_at(data, 0) ?? 0) == 112
+        Some(pgerror.PgConnectionLost(during: "write"))
+    else
+        None
+
+// A transport whose `recv` answers `script` and whose writes are
+// dropped.  The `PgTransport` slots are named functions, so each
+// scenario has its own; `scripting` is what puts one behind the
+// connection.
+fn scripting(r: fn(Int, Int) -> Result<Bytes, pgerror.PgFault> [io, net]) -> PgTransport [io, net]
+    PgTransport { send: drops, recv: r, close: shuts }
+
+// The scripted transports, one per scenario.  Every `recv` answers the
+// WHOLE script whatever it was asked for, because that is what makes
+// one function enough for both callers: `negotiate_tls` reads the
+// first byte of what it is handed and `read_frame` appends the rest to
+// the inbox and takes one message out of it at a time.
+
+// The whole startup exchange: the authentication, the backend's
+// identity, one parameter and the boundary.
+fn recv_startup_ok(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.concat([auth(0), key_data(4711, 305419896), parameter("server_version", "16.4"),
+                     ready(73)]))
+
+// A `NoticeResponse` between the authentication and the boundary.
+fn recv_startup_notice(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.concat([auth(0), notice("there is a notice"), ready(73)]))
+
+// A `DataRow`, which belongs to no startup exchange at all.
+fn recv_startup_data_row(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.concat([auth(0), one_text_row("7"), ready(73)]))
+
+// The server refusing the login.
+fn recv_startup_error(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.concat([auth(0), refusal("28P01", "password authentication failed for user \"postgres\"")]))
+
+// A SASL offer with nothing valid after it, which is as far as the
+// exchange gets before the server gives up.
+fn recv_sasl_offer(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.concat([auth_sasl(["SCRAM-SHA-256"]),
+                     refusal("28P01", "the password did not match")]))
+
+// A SASL offer with nothing after it: the client answers and waits.
+fn recv_sasl_only(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(auth_sasl(["SCRAM-SHA-256"]))
+
+// The mechanism this client does not implement, and nothing else.
+fn recv_sasl_plus_only(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(auth_sasl(["SCRAM-SHA-256-PLUS"]))
+
+// A cleartext password request.
+fn recv_cleartext(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(auth(3))
+
+// A Kerberos request.
+fn recv_kerberos(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(auth(2))
+
+// A continue with no offer before it, and a final with no continue.
+fn recv_sasl_continue_only(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(auth_sasl_step(11, cover_server_first()))
+
+fn recv_sasl_final_only(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(auth_sasl_step(12, cover_server_final()))
+
+// The offer, then a server-first whose iteration count is below the
+// floor this client enforces.
+fn recv_sasl_low_iterations(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.concat([auth_sasl(["SCRAM-SHA-256"]),
+                     auth_sasl_step(11, "r=NVCOVERNONCESRVCOVER9,s=cGdzYWx0eXNhbHQwMDAwMA==,i=10")]))
+
+// The offer, the server-first the exchange really has, and a final
+// signature that is not the one the password proves.
+fn recv_sasl_wrong_signature(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.concat([auth_sasl(["SCRAM-SHA-256"]),
+                     auth_sasl_step(11, cover_server_first()),
+                     auth_sasl_step(12, "v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")]))
+
+// A parameter and a finished statement, outside any handshake: what
+// `next_message` absorbs and what it hands back.
+fn recv_parameter_then_command(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.concat([parameter("server_version", "16.4"), command("SELECT 1")]))
+
+// One notification, and nothing else.
+fn recv_notification(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(notified(4711, "chan", "hi"))
+
+// A frame that belongs to an exchange, which is what a connection
+// waiting for a notification must refuse.
+fn recv_a_data_row(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(one_text_row("7"))
+
+// The one-byte answers to `SSLRequest`, and nothing else: 53 is `S`,
+// 78 is `N` and 89 is `Y`, which is neither.
+fn recv_ssl_yes(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.from_hex("53"))
+
+fn recv_ssl_no(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.from_hex("4e"))
+
+fn recv_ssl_neither(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.from_hex("59"))
+
+// ── connections and options, built by hand ───────────────────────────
+
+// Options pointed at `port` with no deadline on either side.  A
+// connect deadline of zero is "no deadline" — `net.connect_timeout`'s
+// own rule and this package's — and a read deadline of zero is what
+// lets a scripted transport be read without a poll first.
+fn opts_at(port: Int, nonce: Str, clear: Bool, mode: pgconn.PgSslMode) -> PgConnectOptions
+    PgConnectOptions { host: "127.0.0.1", port: port, user: "postgres",
+                       password: cover_password(), database: "", application_name: "",
+                       ssl_mode: mode, allow_cleartext: clear,
+                       channel_binding: pgauth.PgBindingNone, nonce: nonce,
+                       max_message_bytes: 1048576, connect_timeout_ms: 0,
+                       read_timeout_ms: 0 }
+
+// A connection whose server's bytes are already in its inbox.
+fn conn_with(fd: Int, t: PgTransport, o: PgConnectOptions, script: Bytes) -> PgConn
+    PgConn { handle: fd, transport: t, options: o, process_id: 0, secret_key: 0,
+             parameter_names: [], parameter_values: [],
+             settings: pgtype.default_settings(), inbox: script,
+             notifications: [], status: pgmsg.PgIdle, broken: false }
+
+// Options with the two optional startup pairs filled in.  Separate
+// from `opts_at` because a pair that is left out has to be left out:
+// an empty database is the server's own rule applied and not the same
+// packet as a named one.
+fn opts_named(port: Int, database: Str, application: Str) -> PgConnectOptions
+    PgConnectOptions { host: "127.0.0.1", port: port, user: "postgres",
+                       password: cover_password(), database: database,
+                       application_name: application,
+                       ssl_mode: pgconn.PgSslDisable, allow_cleartext: false,
+                       channel_binding: pgauth.PgBindingNone, nonce: "",
+                       max_message_bytes: 1048576, connect_timeout_ms: 0,
+                       read_timeout_ms: 0 }
+
+// The port of a loopback listener, and the listener itself when the
+// test has to read what the client wrote into it.  A connection that
+// queued in the backlog is a socket that reads and writes, and the
+// bytes the client put there stay there until this end takes them.
+fn listener_port() -> Int [net]
+    match net.listen_on("127.0.0.1", 0)
+        None         => 0
+        Some(server) => net.local_port(server)
+
+// ── reading the client's own bytes off the socket ────────────────────
+//
+// These three are the server half of a scenario in which NO server
+// runs: the client connects to a listener nothing answers on, and the
+// test takes the connection out of the backlog afterwards and reads
+// what the client wrote there.  They are written out again here rather
+// than shared with `pgwire_server_tests.nv` because a test file is a
+// program of its own and there is nowhere between two of them to put a
+// helper.  The comment they carry there explains the bounded accept.
+
+// As many bytes as the peer sent, up to `want`, waiting for each read.
+fn filled(peer: net.Sock, want: Int) -> Bytes [net]
+    var out = bytes.zeros(0)
+    while bytes.len(out) < want
+        match net.recv_bytes(peer, want - bytes.len(out))
+            Some(got) =>
+                if bytes.len(got) == 0
+                    return out
+                out = out + got
+            None      =>
+                return out
+    out
+
+// One whole STARTUP packet, which is the one thing on this wire with
+// no type byte in front of its length.
+fn startup_from(peer: net.Sock) -> Bytes [net]
+    let head = filled(peer, 4)
+    if bytes.len(head) < 4
+        return bytes.zeros(0)
+    let n = bytes.u32_be_at(head, 0) ?? 0
+    let rest = filled(peer, n - 4)
+    if bytes.len(rest) < n - 4
+        return bytes.zeros(0)
+    head + rest
+
+// `net.accept` has no deadline, so a client that never arrived would
+// park the test until the runner's own wall clock killed it, with no
+// assertion named.  The listener goes non-blocking for the poll
+// because `SO_RCVTIMEO` does not cover `accept`.
+fn accept_within(server: net.Sock, ms: Int) -> ?(net.Sock, Str) [net]
+    let _ = net.set_nonblocking(server)
+    var waited = 0
+    while waited < ms
+        match net.accept(server)
+            Some(p) =>
+                return Some(p)
+            None    =>
+                let _ = net.fd_wait_readable(server, 100)
+                waited = waited + 100
+    None
+
+// ── a file descriptor as the far end of the wire ─────────────────────
+
+// The path a test's recording file lives at.
+fn scratch_path(name: Str) -> Str
+    "/tmp/pgcover_${name}.bin"
+
+// An empty file, opened for writing: what the client's frames land in
+// and what a read from the same descriptor fails on, which is how a
+// peer that went away is spelled here.
+fn recording(name: Str) -> Int [io, fs]
+    let file = scratch_path(name)
+    let _ = fs.delete(file)
+    fs.open_write(file) ?? -1
+
+// What the client wrote, as hex.
+fn recorded(name: Str) -> Str [io, fs]
+    match fs.read_bytes(scratch_path(name))
+        Some(b) => bytes.to_hex(b)
+        None    => "<unreadable>"
+
+// An empty file opened for reading: a peer that is still there and has
+// nothing left to say, which `io.read_fd` answers with no bytes at all
+// — the other half of the pair above.
+fn quiet(name: Str) -> Int [io, fs]
+    let file = scratch_path(name)
+    let _ = fs.delete(file)
+    let _ = fs.write(file, "")
+    fs.open_read(file) ?? -1
+
+fn is_read_fault(f: pgerror.PgFault) -> Bool
+    str.contains(pgerror.describe(f), "read")
+
+fn is_write_fault(f: pgerror.PgFault) -> Bool
+    str.contains(pgerror.describe(f), "write")
+
+// The fault a `Result` carries, as the sentence it would print.
+fn said(r: Result<PgConn, pgerror.PgFault>) -> Str
+    match r
+        Err(f) => pgerror.describe(f)
+        Ok(_)  => ""
+
+// ── the descriptor, as a transport ───────────────────────────────────
+
+@test
+fn test_a_descriptor_that_refuses_the_write_or_the_read_is_a_lost_connection() [io, fs]
+    // THE CALLS ARE BOUND BEFORE THEY ARE MATCHED.  Not a preference:
+    // a `match` written straight over the answer of a call through a
+    // fn-typed field is the shape novo 0.20.2 leaks one cell per call
+    // for, filed as
+    // `memory-perceus/a-match-that-rebuilds-the-result-of-a-call-through-a-fn-typed-struct-field-leaks`
+    // and fixed in 0.20.3.  Every transport call in this file is read
+    // into a name first for that reason, and the reason goes when the
+    // toolchain does.
+    let t = pgconn.plain_transport()
+    test.case("a write to a descriptor the kernel does not know")
+    let wrote = t.send(999999, bytes.from_str("x"))
+    match wrote
+        None    => test.assert(false)
+        Some(f) => test.assert(is_write_fault(f))
+
+    test.case("a read from it")
+    let read = t.recv(999999, 8)
+    match read
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(is_read_fault(f))
+
+    test.case("a read at the end of a file, which is a peer with nothing to say")
+    let fd = quiet("quiet")
+    test.assert(fd >= 0)
+    let eof = t.recv(fd, 8)
+    match eof
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(is_read_fault(f))
+
+    test.case("and both closings answer nothing, whether or not it worked")
+    test.assert_none(t.close(999999))
+    test.assert_none(t.close(fd))
+
+@test
+fn test_a_connection_whose_script_has_run_out_reports_the_peer_gone() [io, fs]
+    let o = opts_at(5432, "", false, pgconn.PgSslDisable)
+    let c = conn_with(quiet("drained"), pgconn.plain_transport(), o, bytes.zeros(0))
+
+    test.case("the read loop has nothing left to read")
+    match pgconn.next_message(c)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(is_read_fault(f))
+
+    test.case("draining to a boundary that is not coming")
+    match pgconn.drain_to_ready(c)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(is_read_fault(f))
+
+    test.case("waiting for a notification that is not coming")
+    match pgconn.wait_notification(c, 0)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(is_read_fault(f))
+
+@test
+fn test_a_unix_socket_is_a_directory_and_a_port_this_process_cannot_reach() [io, net, time]
+    test.case("the host rule is the leading slash")
+    test.assert(pgconn.is_unix_socket("/var/run/postgresql"))
+    test.assert_false(pgconn.is_unix_socket("127.0.0.1"), "a host name is not a path")
+
+    test.case("and the connect that fails says which socket it could not open")
+    let o = PgConnectOptions { host: "/no/such/postgres", port: 5432, user: "postgres",
+                               password: "", database: "", application_name: "",
+                               ssl_mode: pgconn.PgSslDisable, allow_cleartext: false,
+                               channel_binding: pgauth.PgBindingNone, nonce: "",
+                               max_message_bytes: 1048576, connect_timeout_ms: 0,
+                               read_timeout_ms: 0 }
+    match pgconn.connect(o, pgconn.plain_transport())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f),
+                               "could not connect to /no/such/postgres:5432"))
+
+@test
+fn test_framing_that_is_not_a_message_this_codec_will_read() [io, fs]
+    // The same four parameters as `opts_at` with one difference: a
+    // ceiling low enough that a frame past it is refused.
+    let capped = PgConnectOptions { host: "127.0.0.1", port: 5432, user: "postgres",
+                                    password: cover_password(), database: "",
+                                    application_name: "", ssl_mode: pgconn.PgSslDisable,
+                                    allow_cleartext: false,
+                                    channel_binding: pgauth.PgBindingNone, nonce: "",
+                                    max_message_bytes: 64, connect_timeout_ms: 0,
+                                    read_timeout_ms: 0 }
+
+    test.case("a declared length past the caller's ceiling")
+    let too_big = conn_with(quiet("ceiling"), pgconn.plain_transport(), capped,
+                            frame(75, bytes.zeros(2000)))
+    match pgconn.next_message(too_big)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f),
+                               "past the ceiling this caller set of 64 bytes"))
+
+    test.case("a declared length shorter than the field that carries it")
+    let undersized = conn_with(quiet("undersized"), pgconn.plain_transport(), capped,
+                               bytes.concat([bytes.u8(75), bytes.u32_be(2)]))
+    match pgconn.next_message(undersized)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f),
+                               "shorter than its own four-byte header"))
+
+    test.case("a type byte this codec does not know, which is a reader out of step")
+    // 81 is `Q`, a query — a FRONTEND message arriving at a backend
+    // reader.  Every offset after it would be read from the wrong
+    // place, which is why this is a refusal and not a skip.
+    let confused = conn_with(quiet("confused"), pgconn.plain_transport(), capped,
+                             bytes.concat([bytes.u8(81), bytes.u32_be(6),
+                                           bytes.from_str("ab")]))
+    match pgconn.next_message(confused)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "unknown message type 81"))
+
+// ── the TLS answer ───────────────────────────────────────────────────
+
+@test
+fn test_the_tls_answer_is_one_byte_and_every_mode_that_asks_names_itself() [io, net]
+    test.case("S is a server that will")
+    match pgconn.negotiate_tls(0, scripting(recv_ssl_yes), pgconn.PgSslPrefer)
+        Ok(v)  => test.assert(v)
+        Err(_) => test.assert(false)
+
+    test.case("N is a refusal, which PgSslPrefer continues in the clear on")
+    match pgconn.negotiate_tls(0, scripting(recv_ssl_no), pgconn.PgSslPrefer)
+        Ok(v)  => test.assert_false(v, "N is answered with a false")
+        Err(_) => test.assert(false)
+
+    test.case("N is a failure for every mode above it, and the refusal names the mode")
+    test.assert(str.contains(
+        said_mode(recv_ssl_no, pgconn.PgSslRequire, "PgSslRequire"),
+        "the server refused TLS, and PgSslRequire does not continue in the clear"))
+    test.assert(str.contains(
+        said_mode(recv_ssl_no, pgconn.PgSslVerifyCa, "PgSslVerifyCa"),
+        "PgSslVerifyCa does not continue in the clear"))
+    test.assert(str.contains(
+        said_mode(recv_ssl_no, pgconn.PgSslVerifyFull, "PgSslVerifyFull"),
+        "PgSslVerifyFull does not continue in the clear"))
+
+    test.case("a byte that is neither is the server not understanding the question")
+    test.assert(str.contains(
+        said_mode(recv_ssl_neither, pgconn.PgSslPrefer, "PgSslPrefer"),
+        "which is neither S nor N, asked under PgSslPrefer"))
+
+    test.case("and every mode that asks is named by that refusal too")
+    test.assert(str.contains(
+        said_mode(recv_ssl_neither, pgconn.PgSslRequire, "PgSslRequire"),
+        "asked under PgSslRequire"))
+    test.assert(str.contains(
+        said_mode(recv_ssl_neither, pgconn.PgSslVerifyCa, "PgSslVerifyCa"),
+        "asked under PgSslVerifyCa"))
+    test.assert(str.contains(
+        said_mode(recv_ssl_neither, pgconn.PgSslVerifyFull, "PgSslVerifyFull"),
+        "asked under PgSslVerifyFull"))
+
+    test.case("PgSslDisable asks nothing at all, which is what a unix socket wants")
+    match pgconn.negotiate_tls(0, scripting(recv_ssl_neither), pgconn.PgSslDisable)
+        Ok(v)  => test.assert_false(v, "a socket that needs no TLS is never asked for it")
+        Err(_) => test.assert(false)
+
+    test.case("a write the transport refuses is the negotiation failing")
+    match pgconn.negotiate_tls(0, PgTransport { send: failing_send, recv: recv_ssl_yes,
+                                                close: shuts },
+                                                pgconn.PgSslPrefer)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(is_write_fault(f))
+
+    test.case("and so is a read the transport refuses")
+    match pgconn.negotiate_tls(0, PgTransport { send: drops, recv: failing_recv,
+                                                close: shuts },
+                                                pgconn.PgSslPrefer)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(is_read_fault(f))
+
+// The sentence one `SSLRequest` refusal carries.  `expect` is the mode
+// name that must be in it, which is what proves the arm that names it
+// was the one that ran.
+fn said_mode(r: fn(Int, Int) -> Result<Bytes, pgerror.PgFault> [io, net], mode: pgconn.PgSslMode,
+             expect: Str) -> Str [io, net]
+    match pgconn.negotiate_tls(0, scripting(r), mode)
+        Ok(_)  => "accepted"
+        Err(f) => "${expect}: ${pgerror.describe(f)}"
+
+// ── a whole connect over a script ────────────────────────────────────
+
+// The sentence a failed connect carries, or "connected" when it did.
+// The transport is built into a name before the call for the reason
+// the two `matches` at the top of this file give.
+fn connect_said(o: PgConnectOptions,
+                r: fn(Int, Int) -> Result<Bytes, pgerror.PgFault> [io, net]) -> Str [io, net, time]
+    let t = scripting(r)
+    match pgconn.connect(o, t)
+        Ok(_)  => "connected"
+        Err(f) => pgerror.describe(f)
+
+@test
+fn test_the_startup_packet_carries_every_pair_it_was_given() [io, net, time]
+    // THE LENGTH FIELD AND THE ORDER OF THE PAIRS, on a socket and not
+    // in a buffer: the client writes the startup packet itself — the
+    // write side of the transport is the plain one — and this end
+    // takes the queued connection out of the backlog and reads what
+    // arrived.  A length that counted the wrong bytes is invisible
+    // until a server reads the packet as something else.
+    test.case("user, client_encoding, database and application_name")
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.assert(false)
+        Some(server) =>
+            let port = net.local_port(server)
+            let plain = pgconn.plain_transport()
+            let tap = PgTransport { send: plain.send, recv: recv_startup_ok, close: shuts }
+            match pgconn.connect(opts_named(port, "appdb", "nv"), tap)
+                Err(f) => test.fail(pgerror.describe(f))
+                Ok(c)  =>
+                    test.assert_eq(c.process_id, 4711)
+                    match accept_within(server, 15000)
+                        None            => test.assert(false)
+                        Some((peer, _)) =>
+                            let _ = net.set_recv_timeout(peer, 5000)
+                            // 79 bytes: the length, the protocol
+                            // version, the four pairs with their
+                            // terminators, and the zero byte that ends
+                            // the set.  The pairs are in the order
+                            // `startup_pairs` builds them, which is
+                            // also the order a server reads them in.
+                            test.assert_eq_str(bytes.to_hex(startup_from(peer)),
+                                "0000004f000300007573657200706f73746772657300636c69656e745f656e636f64696e670055544638"
+                                + "006461746162617365006170706462006170706c69636174696f6e5f6e616d65006e760000")
+                            net.close(peer)
+            net.close(server)
+
+@test
+fn test_every_authentication_request_this_client_will_not_answer() [io, net, time]
+    test.case("cleartext, which is refused unless the options said otherwise")
+    let refused = connect_said(opts_at(listener_port(), "", false, pgconn.PgSslDisable),
+                               recv_cleartext)
+    test.assert_true(str.contains(refused,
+                      "AuthenticationCleartextPassword, which this connection was not told to allow"),
+                     refused)
+
+    test.case("a method this client does not implement is named rather than skipped")
+    let kerberos = connect_said(opts_at(listener_port(), "", false, pgconn.PgSslDisable),
+                                recv_kerberos)
+    test.assert_true(str.contains(kerberos, "Kerberos V5"), kerberos)
+
+    test.case("a server offering only the channel-bound mechanism, to a caller with nothing to bind")
+    let plus = connect_said(opts_at(listener_port(), "", false, pgconn.PgSslDisable),
+                            recv_sasl_plus_only)
+    test.assert_true(str.contains(plus, "SCRAM-SHA-256-PLUS"), plus)
+
+    test.case("and a nonce the mechanism's own syntax cannot carry is refused before it is sent")
+    let comma = connect_said(opts_at(listener_port(), "half,nonce", false, pgconn.PgSslDisable),
+                             recv_sasl_only)
+    test.assert_true(str.contains(comma, "printable ASCII with no comma"), comma)
+
+    test.case("the cleartext answer, when it IS allowed, is a password the transport may refuse")
+    // The one scenario here with `allow_cleartext`: the answer is built
+    // and the write is what fails, which is a different arm from the
+    // refusal above and the one a transport that died mid-handshake
+    // reaches.
+    let port = listener_port()
+    let t = PgTransport { send: refuses_the_password, recv: recv_cleartext, close: shuts }
+    match pgconn.connect(opts_at(port, "", true, pgconn.PgSslDisable), t)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(is_write_fault(f))
+
+@test
+fn test_the_scram_states_a_server_can_leave_out() [io, net, time]
+    let o = opts_at(listener_port(), cover_nonce(), false, pgconn.PgSslDisable)
+
+    test.case("a continue with no offer before it")
+    test.assert(str.contains(connect_said(o, recv_sasl_continue_only),
+                             "continued a SASL exchange that never began"))
+
+    test.case("a final with no continue before it")
+    test.assert(str.contains(connect_said(o, recv_sasl_final_only),
+                             "finished a SASL exchange that never began"))
+
+    test.case("a server-first whose iteration count is below the floor")
+    test.assert(str.contains(connect_said(o, recv_sasl_low_iterations), "below the floor"))
+
+    test.case("an exchange that completes with a signature the password does not prove")
+    test.assert(str.contains(connect_said(o, recv_sasl_wrong_signature), "signature"))
+
+    test.case("and a caller who pinned no nonce gets the clock's, which is a nonce")
+    // `nonce_for` reads the option and falls back to `fresh_nonce`.  An
+    // empty nonce is refused by `begin` before anything is sent, so a
+    // fault that quotes the SERVER's refusal is a fault from an
+    // exchange that got that far — which is what says the clock's
+    // nonce was printable and got used.
+    test.assert(str.contains(
+        connect_said(opts_at(listener_port(), "", false, pgconn.PgSslDisable), recv_sasl_offer),
+        "the password did not match"))
+
+@test
+fn test_a_startup_message_that_belongs_to_no_exchange() [io, net, time]
+    test.case("a notice is absorbed and the handshake goes on")
+    test.assert_eq_str(connect_said(opts_at(listener_port(), "", false, pgconn.PgSslDisable),
+                                    recv_startup_notice),
+                       "connected")
+
+    test.case("a row that belongs to a statement is refused")
+    test.assert(str.contains(
+        connect_said(opts_at(listener_port(), "", false, pgconn.PgSslDisable),
+                     recv_startup_data_row),
+        "belongs to no exchange arrived during startup"))
+
+@test
+fn test_connect_does_not_leave_a_socket_behind_where_it_cannot_go_on() [io, net, time]
+    test.case("a read the transport refuses inside the handshake")
+    let port = listener_port()
+    let dying = PgTransport { send: drops, recv: failing_recv, close: shuts }
+    match pgconn.connect(opts_at(port, "", false, pgconn.PgSslDisable), dying)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(is_read_fault(f))
+
+    test.case("a startup packet the transport refuses")
+    let port2 = listener_port()
+    let refusing = PgTransport { send: failing_send, recv: recv_startup_ok, close: shuts }
+    match pgconn.connect(opts_at(port2, "", false, pgconn.PgSslDisable), refusing)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(is_write_fault(f))
+
+    test.case("and a TLS answer that is neither S nor N, under a mode that asked")
+    test.assert(str.contains(
+        connect_said(opts_at(listener_port(), "", false, pgconn.PgSslRequire), recv_ssl_neither),
+        "neither S nor N"))
+
+@test
+fn test_the_read_loop_absorbs_a_parameter_and_hands_the_statement_back() [io, net, time]
+    // A `ParameterStatus` is not an answer to anything, so the loop
+    // folds it into the connection and reads on; the statement behind
+    // it is what the caller was waiting for.  Without the fold the
+    // caller would be handed a parameter as its result and the
+    // statement would sit unread in the inbox.
+    let o = opts_at(5432, "", false, pgconn.PgSslDisable)
+    let t = scripting(recv_parameter_then_command)
+    let c = conn_with(0, t, o, bytes.zeros(0))
+    match pgconn.next_message(c)
+        Err(f)  => test.fail(pgerror.describe(f))
+        Ok(got) =>
+            test.assert_eq_str(pgconn.parameter(got.conn, "server_version"), "16.4")
+            let msg = got.message
+            match msg
+                PgCommandComplete(tag) => test.assert_eq_str(tag, "SELECT 1")
+                _                      => test.fail("a parameter and a statement answered something else")
+
+@test
+fn test_a_message_the_encoder_refuses_is_never_written() [io, net]
+    let o = opts_at(5432, "", false, pgconn.PgSslDisable)
+    let t = scripting(recv_startup_ok)
+    let c = conn_with(0, t, o, bytes.zeros(0))
+    // A `Str` cannot hold a NUL in a literal; `str.from_byte` builds
+    // the one byte that can.  A text field carrying it would end early
+    // on the wire, so the encoder refuses the message — and the
+    // refusal has to reach the caller rather than being written out
+    // truncated.
+    let held = str.from_byte(0)
+
+    test.case("one message")
+    match pgconn.send(c, pgmsg.PgQuery(held))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "NUL byte"))
+
+    test.case("a batch, refused before any of it is written")
+    match pgconn.send_batch(c, [pgmsg.PgQuery(held)])
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "NUL byte"))
+
+@test
+fn test_waiting_for_a_notification_takes_one_and_refuses_anything_else() [io, net, time]
+    let o = opts_at(5432, "", false, pgconn.PgSslDisable)
+
+    test.case("a notification is what the wait was for")
+    let t = scripting(recv_notification)
+    let n = conn_with(0, t, o, bytes.zeros(0))
+    match pgconn.wait_notification(n, 0)
+        Err(f)  => test.fail(pgerror.describe(f))
+        Ok(got) => test.assert_eq(list.len(got.notifications), 1)
+
+    test.case("a row that belongs to a statement is refused, not dropped")
+    let t2 = scripting(recv_a_data_row)
+    let row = conn_with(0, t2, o, bytes.zeros(0))
+    match pgconn.wait_notification(row, 0)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f),
+                                           "while waiting for a notification"))

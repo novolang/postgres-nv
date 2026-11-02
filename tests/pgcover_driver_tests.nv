@@ -1,0 +1,251 @@
+// THE `std.sql` DRIVER, DRIVEN WITH CONSTRUCTED BYTES.
+//
+// The driver is a thin thing over `pgquery` and `pgpool`, so what this
+// file has to pin is the part that is its own: the class-to-variant
+// table `to_db_error` decides by, and the two answers to `close` —
+// `Terminate` for a handle that owns its connection, `ROLLBACK` for
+// one borrowed from a pool.
+//
+// NO TEST HERE REACHES A SERVER.  `open` and `warm` go through a
+// loopback listener nothing accepts on, and the server's half of every
+// exchange is bytes this file wrote — see `pgcover_conn_tests.nv` for
+// why a queued socket is enough for a client and
+// the CHANGELOG's `### Known` for what that does not prove.
+
+use std.test
+use std.bytes
+use pgconn
+use pgdriver
+use pgauth
+use pgmsg
+use pgpool
+use pgerror
+use pgtype
+
+// ── the wire, as bytes ───────────────────────────────────────────────
+
+fn cstr(s: Str) -> Bytes
+    bytes.concat([bytes.from_str(s), bytes.zeros(1)])
+
+fn frame(kind: Int, body: Bytes) -> Bytes
+    bytes.concat([bytes.u8(kind), bytes.u32_be(bytes.len(body) + 4), body])
+
+fn bare(kind: Int) -> Bytes
+    frame(kind, bytes.zeros(0))
+
+fn auth(code: Int) -> Bytes
+    frame(82, bytes.u32_be(code))
+
+fn key_data(pid: Int, key: Int) -> Bytes
+    frame(75, bytes.concat([bytes.u32_be(pid), bytes.u32_be(key)]))
+
+fn parameter(name: Str, value: Str) -> Bytes
+    frame(83, bytes.concat([cstr(name), cstr(value)]))
+
+fn ready(status: Int) -> Bytes
+    frame(90, bytes.u8(status))
+
+fn command(tag: Str) -> Bytes
+    frame(67, cstr(tag))
+
+fn refusal(code: Str, text: Str) -> Bytes
+    frame(69, bytes.concat([bytes.from_str("S"), cstr("ERROR"),
+                            bytes.from_str("C"), cstr(code),
+                            bytes.from_str("M"), cstr(text), bytes.zeros(1)]))
+
+fn one_text_row(value: Str) -> Bytes
+    frame(68, bytes.concat([bytes.u16_be(1), bytes.u32_be(str.len(value)),
+                            bytes.from_str(value)]))
+
+// `RowDescription` of one `int4` column in text format.
+fn one_int4_column() -> Bytes
+    frame(84, bytes.concat([bytes.u16_be(1), cstr("n"), bytes.u32_be(0),
+                            bytes.u16_be(0), bytes.u32_be(23), bytes.u16_be(4),
+                            bytes.u32_be(-1), bytes.u16_be(0)]))
+
+// One result set: the description, a row, the tag and the boundary.
+fn int4_exchange(value: Str, tag: Str) -> Bytes
+    bytes.concat([one_int4_column(), one_text_row(value), command(tag), ready(73)])
+
+// ── transports and connections ───────────────────────────────────────
+
+fn drops(fd: Int, data: Bytes) -> ?pgerror.PgFault [io, net]
+    None
+
+fn drops_close(fd: Int) -> ?pgerror.PgFault [io, net]
+    None
+
+// A read that never happens: every connection below carries the
+// server's bytes in its inbox already.
+fn recv_no_peer(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Err(pgerror.PgConnectionLost(during: "read"))
+
+fn scripting(r: fn(Int, Int) -> Result<Bytes, pgerror.PgFault> [io, net]) -> PgTransport [io, net]
+    PgTransport { send: drops, recv: r, close: drops_close }
+
+// The whole startup exchange: the authentication, the backend's
+// identity, one parameter and the boundary.
+fn recv_startup(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.concat([auth(0), key_data(4711, 305419896), parameter("server_version", "16.4"),
+                     ready(73)]))
+
+fn opts_here(port: Int) -> PgConnectOptions
+    PgConnectOptions { host: "127.0.0.1", port: port, user: "postgres",
+                       password: "pencil", database: "", application_name: "",
+                       ssl_mode: pgconn.PgSslDisable, allow_cleartext: false,
+                       channel_binding: pgauth.PgBindingNone, nonce: "",
+                       max_message_bytes: 1048576, connect_timeout_ms: 0,
+                       read_timeout_ms: 0 }
+
+// A connection whose server's bytes are already in its inbox: the
+// exchange is the script, and nothing is ever read from a socket.
+fn conn_over(script: Bytes) -> PgConn [io, net]
+    PgConn { handle: 0, transport: scripting(recv_no_peer), options: opts_here(5432),
+             process_id: 4711, secret_key: 7, parameter_names: [], parameter_values: [],
+             settings: pgtype.default_settings(), inbox: script,
+             notifications: [], status: pgmsg.PgIdle, broken: false }
+
+// A handle around a connection built here.
+fn handle_over(script: Bytes) -> PgDatabase [io, net]
+    pgdriver.of_conn(conn_over(script))
+
+fn policy(max_connections: Int, min_connections: Int) -> PgPoolPolicy
+    PgPoolPolicy { max_connections: max_connections, min_connections: min_connections,
+                   wait_ms: 0, max_idle_ms: 0, max_uses: 0,
+                   reset_on_release: true, on_connect_sql: "" }
+
+fn listener_port() -> Int [net]
+    match net.listen_on("127.0.0.1", 0)
+        None         => 0
+        Some(server) => net.local_port(server)
+
+// ── the class-to-variant table ───────────────────────────────────────
+
+// A server error with one SQLSTATE and one message.
+fn server_error(code: Str, message: Str) -> pgerror.PgFault
+    pgerror.PgServerError(fields: pgerror.set_field(pgerror.set_field(
+        pgerror.fields_new(), "C", code),
+        "M", message))
+
+@test
+fn test_the_sqlstate_class_decides_the_db_error_variant() [io, net, time]
+    test.case("23 is the constraint violation and 42 the syntax error")
+    match pgdriver.to_db_error(server_error("23505", "duplicate key value"))
+        ConstraintViolation(m) => test.assert_true(str.contains(m, "duplicate key"), m)
+        _                      => test.fail("23505 mapped to something that is not a constraint violation")
+    match pgdriver.to_db_error(server_error("42601", "syntax error at or near"))
+        SyntaxError(m) => test.assert_true(str.contains(m, "syntax error"), m)
+        _              => test.fail("42601 mapped to something that is not a syntax error")
+    test.case("every connection class is a ConnectionError, and the rest is DbOther")
+    for code in ["08006", "53300", "57014", "58030"]
+        match pgdriver.to_db_error(server_error(code, "the session, not the statement"))
+            ConnectionError(_) => ()
+            _                  => test.fail("${code} did not map to a connection error")
+    match pgdriver.to_db_error(server_error("22012", "division by zero"))
+        DbOther(m) => test.assert_true(str.contains(m, "division"), m)
+        _          => test.fail("22012 mapped to a variant of its own")
+
+@test
+fn test_a_fault_that_is_not_a_server_error_maps_by_its_kind() [io, net, time]
+    test.case("the faults with no SQLSTATE")
+    match pgdriver.to_db_error(pgerror.PgConnectFailed(host: "127.0.0.1", port: 5432, detail: "refused"))
+        ConnectionError(_) => ()
+        _                  => test.fail("a connect failure did not map to a connection error")
+    match pgdriver.to_db_error(pgerror.PgConnectionLost(during: "read"))
+        ConnectionError(_) => ()
+        _                  => test.fail("a lost connection did not map to a connection error")
+    match pgdriver.to_db_error(pgerror.PgTimedOut(operation: "query", ms: 1000))
+        ConnectionError(_) => ()
+        _                  => test.fail("a timeout did not map to a connection error")
+    match pgdriver.to_db_error(pgerror.PgPoolExhausted(in_use: 4, limit: 4))
+        ConnectionError(_) => ()
+        _                  => test.fail("an exhausted pool did not map to a connection error")
+    match pgdriver.to_db_error(pgerror.PgBadMessage(kind: 68, length: 2, detail: "short"))
+        DbOther(_) => ()
+        _          => test.fail("a malformed message mapped to a connection error")
+
+// ── the contract's three methods ─────────────────────────────────────
+
+@test
+fn test_exec_answers_none_or_the_servers_refusal() [io, net, time]
+    test.case("a statement that worked is None")
+    let ok = handle_over(bytes.concat([command("CREATE TABLE"), ready(73)]))
+    match ok.exec("CREATE TABLE t (n INTEGER)")
+        None    => ()
+        Some(e) => test.fail("a statement the server ran was reported as a failure")
+    test.case("a statement the server refused is a DbError")
+    let no = handle_over(bytes.concat([refusal("42P01", "relation \"t\" does not exist"),
+                                       ready(73)]))
+    match no.exec("SELECT * FROM t")
+        None                 => test.fail("a refused statement was reported as a success")
+        Some(SyntaxError(m)) => test.assert_true(str.contains(m, "does not exist"), m)
+        Some(_)              => test.fail("42P01 did not map to a syntax error")
+
+@test
+fn test_query_count_answers_the_rows_or_the_rows_it_changed() [io, net, time]
+    test.case("a statement that describes columns answers the rows it produced")
+    let rows = handle_over(int4_exchange("7", "SELECT 1"))
+    match rows.query_count("SELECT 1")
+        Err(_) => test.fail("a counted query failed")
+        Ok(n)  => test.assert_eq(n, 1)
+    test.case("one that describes nothing answers the number the tag carried")
+    let changed = handle_over(bytes.concat([command("INSERT 0 3"), ready(73)]))
+    match changed.query_count("INSERT INTO t VALUES (1), (2), (3)")
+        Err(_) => test.fail("a counted statement failed")
+        Ok(n)  => test.assert_eq(n, 3)
+    test.case("a statement the server refused is the DbError, not a count")
+    let refused = handle_over(bytes.concat([refusal("23505", "duplicate key value violates unique constraint"),
+                                            ready(73)]))
+    match refused.query_count("INSERT INTO t VALUES (1)")
+        Ok(_)                       => test.fail("a refused statement answered a count")
+        Err(ConstraintViolation(m)) => test.assert_true(str.contains(m, "unique"), m)
+        Err(_)                      => test.fail("23505 did not map to a constraint violation")
+
+// ── ownership, which is the whole of `close` ─────────────────────────
+
+@test
+fn test_a_handle_from_open_closes_its_connection() [io, net, time]
+    test.case("open owns the connection, so close closes it")
+    let db = pgdriver.open(opts_here(listener_port()), scripting(recv_startup))!
+    test.assert(db.owned)
+    test.assert_eq(pgdriver.conn_of(db).process_id, 4711)
+    db.close()
+
+@test
+fn test_a_borrowed_handle_is_reset_rather_than_closed() [io, net, time]
+    test.case("of_conn does not own it, so close rolls back")
+    let db = handle_over(bytes.concat([command("ROLLBACK"), ready(73)]))
+    test.assert_false(db.owned, "a borrowed handle does not own its connection")
+    // A `ROLLBACK` outside a transaction is a warning and not an
+    // error, so this is safe on any session — and if it were closed
+    // instead, this connection would have nothing to read.
+    db.close()
+
+@test
+fn test_a_connection_can_be_taken_from_a_pool_and_given_back() [io, net, time]
+    test.case("borrow takes one, give_back returns it, and close on the way out rolls back")
+    let p = pgpool.new_pool(opts_here(listener_port()), scripting(recv_startup),
+                            policy(2, 1))
+    let pool = pgpool.warm(p)!
+    test.assert_eq(list.len(pool.idle), 1)
+    let borrowed = pgdriver.borrow(pool, 0)!
+    test.assert_eq(borrowed.pool.lent, 1)
+    test.assert_false(borrowed.db.owned, "a borrowed connection is the pool's")
+    let back = pgdriver.give_back(borrowed.pool, borrowed.db, 0)!
+    test.assert_eq(back.lent, 0)
+    test.assert_eq(list.len(back.idle), 1)
+
+// ── the rows the contract cannot carry ───────────────────────────────
+
+@test
+fn test_query_answers_every_row_and_the_connection_underneath() [io, net, time]
+    test.case("query, last_fault and conn_of")
+    let db = handle_over(int4_exchange("7", "SELECT 1"))
+    match pgdriver.last_fault(db)
+        Some(_) => test.fail("a handle that has not failed answered a fault")
+        None    => ()
+    match pgdriver.query(db, "SELECT 1", [])
+        Err(f)   => test.fail(pgerror.describe(f))
+        Ok(rows) =>
+            test.assert_eq(list.len(rows.rows), 1)
+            test.assert_eq(pgdriver.conn_of(rows.db).process_id, 4711)

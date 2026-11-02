@@ -1,0 +1,893 @@
+// pgcover_codec_tests.nv — the codec paths the other suites leave dark.
+//
+// WHY THIS FILE EXISTS.  The publish gate counts every instrumented
+// line under `src/`, and a codec whose refusal branches are never taken
+// is a codec whose refusals are unproven.  Each test below drives one
+// of those paths and asserts the ANSWER — the bytes, the value or the
+// sentence — so the line is covered by a checked expectation and not
+// by a call that happened to run it.
+//
+// NO SERVER IS REACHED AND NONE IS NEEDED: every case here is a value
+// in and a value out.  The bytes are what a server would send and the
+// settings are what a session would announce, and the assertions are
+// on this package's own renderings.
+//
+// ONE CASE IS LOAD-BEARING.  `float4[]` needs the widening undone
+// (`narrow_float4`), and the round trip below is the one that says
+// whether a value the decoder produced can be written back into the
+// same element type — a codec that could read a float4 subnormal and
+// not write it is a codec that fails on the next INSERT.
+
+use std.test
+use std.bytes
+use pgerror
+use pgmsg
+use pgtype
+use pgauth
+
+// A buffer from the hex a server would put on the wire.
+fn wire(hex: Str) -> Bytes
+    match bytes.from_hex(hex)
+        Some(b) => b
+        None    => bytes.zeros(0)
+
+// A framed backend message: the type byte, then a length counting
+// itself and the body and NOT the type byte.
+fn msg(kind: Int, body: Bytes) -> Bytes
+    bytes.concat([bytes.u8(kind), bytes.u32_be(bytes.len(body) + 4), body])
+
+// The settings a fresh connection assumes.
+fn settings() -> pgtype.PgTextSettings
+    pgtype.default_settings()
+
+// The hex of a one-element binary array, or "refused" — the shape the
+// float4 battery below is written in.
+fn array_hex(element: Int, v: pgtype.PgValue) -> Str
+    match pgtype.encode(pgtype.PgArray(element_oid: element, elements: [v]), pgmsg.PgBinary)
+        Ok(e)  => bytes.to_hex(e.raw)
+        Err(_) => "refused"
+
+// What an encoder said about that array instead of writing it.
+fn array_refusal(element: Int, v: pgtype.PgValue) -> Str
+    match pgtype.encode(pgtype.PgArray(element_oid: element, elements: [v]), pgmsg.PgBinary)
+        Ok(_)  => ""
+        Err(f) => pgerror.describe(f)
+
+// The text of a one-element array's first element, for the reader's
+// assertions.
+fn first_text(v: pgtype.PgValue) -> Str
+    match v
+        PgArray(_, xs) =>
+            match list.get(xs, 0, pgtype.PgNull)
+                PgStr(s) => s
+                _        => ""
+        _              => ""
+
+// ── pgerror: every field letter, every sentence ──────────────────────
+
+@test
+fn test_every_error_field_letter_lands_in_its_own_field() [io]
+    test.case("the letters the wire uses for the fields with a name")
+    var f = pgerror.fields_new()
+    f = pgerror.set_field(f, "D", "Key (email)=(a@b) already exists.")
+    f = pgerror.set_field(f, "H", "try another address")
+    f = pgerror.set_field(f, "P", "12")
+    f = pgerror.set_field(f, "p", "7")
+    f = pgerror.set_field(f, "q", "SELECT 1")
+    f = pgerror.set_field(f, "W", "PL/pgSQL function f() line 3")
+    f = pgerror.set_field(f, "s", "public")
+    f = pgerror.set_field(f, "t", "users")
+    f = pgerror.set_field(f, "c", "email")
+    f = pgerror.set_field(f, "d", "text")
+    f = pgerror.set_field(f, "n", "users_email_key")
+    f = pgerror.set_field(f, "F", "nbtinsert.c")
+    f = pgerror.set_field(f, "L", "1234")
+    f = pgerror.set_field(f, "R", "_bt_check_unique")
+    test.assert_eq_str(f.detail, "Key (email)=(a@b) already exists.")
+    test.assert_eq_str(f.hint, "try another address")
+    test.assert_eq(f.position, 12)
+    test.assert_eq(f.internal_position, 7)
+    test.assert_eq_str(f.internal_query, "SELECT 1")
+    test.assert_eq_str(f.context, "PL/pgSQL function f() line 3")
+    test.assert_eq_str(f.schema_name, "public")
+    test.assert_eq_str(f.table_name, "users")
+    test.assert_eq_str(f.column_name, "email")
+    test.assert_eq_str(f.datatype_name, "text")
+    test.assert_eq_str(f.constraint_name, "users_email_key")
+    test.assert_eq_str(f.source_file, "nbtinsert.c")
+    test.assert_eq(f.source_line, 1234)
+    test.assert_eq_str(f.source_routine, "_bt_check_unique")
+
+    test.case("a position the server spelled as something else is 0")
+    let zeroed = pgerror.set_field(pgerror.fields_new(), "P", "not-a-number")
+    test.assert_eq(zeroed.position, 0)
+
+    test.case("a code this decoder does not name is kept, not dropped")
+    let extra = pgerror.set_field(f, "Z", "opaque")
+    test.assert_eq(list.len(extra.extra_codes), 1)
+    test.assert_eq_str(list.get(extra.extra_codes, 0, ""), "Z")
+    test.assert_eq_str(list.get(extra.extra_values, 0, ""), "opaque")
+
+@test
+fn test_a_server_error_renders_the_severity_the_code_and_the_message() [io]
+    test.case("the never-localised severity is what a report carries")
+    var f = pgerror.set_field(pgerror.fields_new(), "V", "FATAL")
+    f = pgerror.set_field(f, "C", "57P01")
+    f = pgerror.set_field(f, "M", "terminating connection")
+    test.assert_eq_str(pgerror.describe(pgerror.PgServerError(fields: f)),
+                       "FATAL 57P01: terminating connection")
+
+    test.case("a server older than 9.6 sends no severity_code, so severity is used")
+    var old = pgerror.set_field(pgerror.fields_new(), "S", "ERROR")
+    old = pgerror.set_field(old, "M", "boom")
+    test.assert_eq_str(pgerror.describe(pgerror.PgServerError(fields: old)), "ERROR: boom")
+
+    test.case("and a field set with neither is an ERROR by construction")
+    let bare = pgerror.set_field(pgerror.fields_new(), "M", "who sent this")
+    test.assert_eq_str(pgerror.describe(pgerror.PgServerError(fields: bare)),
+                       "ERROR: who sent this")
+
+@test
+fn test_every_other_fault_has_its_own_sentence() [io]
+    test.assert_eq_str(pgerror.describe(pgerror.PgConnectFailed(host: "db", port: 5432,
+                                                                detail: "no route")),
+                       "could not connect to db:5432: no route")
+    test.assert_eq_str(pgerror.describe(pgerror.PgUnsupportedAuth(method: "GSSAPI")),
+                       "the server asked for GSSAPI authentication, which this client does not implement")
+    test.assert_eq_str(pgerror.describe(pgerror.PgTlsRefused(detail: "the server said N")),
+                       "TLS was refused: the server said N")
+    test.assert_eq_str(pgerror.describe(pgerror.PgTimedOut(operation: "query", ms: 5000)),
+                       "query did not finish within 5000 milliseconds")
+    test.assert_eq_str(pgerror.describe(pgerror.PgPoolExhausted(in_use: 4, limit: 4)),
+                       "the pool has 4 of its 4 connection(s) lent and none came back in time")
+    test.assert_eq_str(pgerror.describe(pgerror.PgCopyFailed(detail: "the server said no")),
+                       "the COPY failed: the server said no")
+
+@test
+fn test_retryable_and_fatal_are_answered_for_every_kind_of_fault() [io]
+    test.case("the faults a retry loop should take")
+    test.assert(pgerror.is_retryable(pgerror.PgConnectFailed(host: "db", port: 5432,
+                                                             detail: "no route")))
+    test.assert(pgerror.is_retryable(pgerror.PgTimedOut(operation: "query", ms: 1)))
+    test.assert(pgerror.is_retryable(pgerror.PgPoolExhausted(in_use: 1, limit: 1)))
+    test.assert(not pgerror.is_retryable(pgerror.PgBadMessage(kind: 0, length: 0,
+                                                              detail: "misframed")))
+
+    test.case("the faults after which the connection has to be discarded")
+    test.assert(pgerror.is_fatal(pgerror.PgConnectFailed(host: "db", port: 5432,
+                                                         detail: "no route")))
+    test.assert(pgerror.is_fatal(pgerror.PgBadMessage(kind: 0, length: 0, detail: "misframed")))
+    test.assert(pgerror.is_fatal(pgerror.PgUnknownMessage(kind: 122)))
+    test.assert(pgerror.is_fatal(pgerror.PgTlsRefused(detail: "the server said N")))
+    test.assert(pgerror.is_fatal(pgerror.PgUnsupportedAuth(method: "GSSAPI")))
+    test.assert(pgerror.is_fatal(pgerror.PgScramFailed(step: "final", detail: "bad signature")))
+    test.assert(not pgerror.is_fatal(pgerror.PgCopyFailed(detail: "the server said no")))
+
+    test.case("a SQLSTATE shorter than a class is answered as it stands")
+    test.assert_eq_str(pgerror.sqlstate_class("2"), "2")
+    test.assert_eq_str(pgerror.sqlstate_class("23505"), "23")
+
+// ── pgmsg: the requests this client cannot run, and the refusals ──────
+
+@test
+fn test_every_authentication_method_this_client_cannot_run_is_named() [io]
+    test.case("Kerberos V5, code 2")
+    match pgmsg.decode_backend(msg(82, bytes.u32_be(2)), 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(m)  =>
+            match m
+                PgAuthentication(request) =>
+                    match request
+                        PgAuthUnsupported(method, code) =>
+                            test.assert_eq_str(method, "Kerberos V5")
+                            test.assert_eq(code, 2)
+                        _                               => test.assert(false)
+                _                         => test.assert(false)
+
+    test.case("SCM credentials, code 6")
+    match pgmsg.decode_backend(msg(82, bytes.u32_be(6)), 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(m)  =>
+            match m
+                PgAuthentication(request) =>
+                    match request
+                        PgAuthUnsupported(method, code) =>
+                            test.assert_eq_str(method, "SCM credentials")
+                            test.assert_eq(code, 6)
+                        _                               => test.assert(false)
+                _                         => test.assert(false)
+
+    test.case("GSSAPI continue, code 8")
+    match pgmsg.decode_backend(msg(82, bytes.u32_be(8)), 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(m)  =>
+            match m
+                PgAuthentication(request) =>
+                    match request
+                        PgAuthUnsupported(method, code) =>
+                            test.assert_eq_str(method, "GSSAPI continue")
+                            test.assert_eq(code, 8)
+                        _                               => test.assert(false)
+                _                         => test.assert(false)
+
+    test.case("SSPI, code 9")
+    match pgmsg.decode_backend(msg(82, bytes.u32_be(9)), 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(m)  =>
+            match m
+                PgAuthentication(request) =>
+                    match request
+                        PgAuthUnsupported(method, code) =>
+                            test.assert_eq_str(method, "SSPI")
+                            test.assert_eq(code, 9)
+                        _                               => test.assert(false)
+                _                         => test.assert(false)
+
+@test
+fn test_a_request_too_short_or_too_empty_to_hold_what_it_should() [io]
+    test.case("an authentication request shorter than its own four-byte code")
+    match pgmsg.decode_backend(msg(82, bytes.zeros(2)), 0, 1048576)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "shorter than its four-byte code"))
+
+    test.case("a SASL continue with no payload carries no bytes")
+    match pgmsg.decode_backend(msg(82, bytes.u32_be(11)), 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(m)  =>
+            match m
+                PgAuthentication(request) =>
+                    match request
+                        PgAuthSaslContinue(data) => test.assert_eq(bytes.len(data), 0)
+                        _                        => test.assert(false)
+                _                         => test.assert(false)
+
+    test.case("a CommandComplete with no tag reads as the empty string")
+    match pgmsg.decode_backend(msg(67, bytes.zeros(0)), 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(m)  =>
+            match m
+                PgCommandComplete(tag) => test.assert_eq_str(tag, "")
+                _                      => test.assert(false)
+
+@test
+fn test_a_binary_format_code_is_encoded_as_the_byte_one() [io]
+    // One byte of portal, one of statement, an int16 format count, the
+    // format, an int16 value count, the value, an int16 result-format
+    // count and the result format — a seventeen-byte body, so the
+    // length field says twenty-one.
+    match pgmsg.encode_frontend(pgmsg.PgBind(portal: "", statement: "",
+                                             parameter_formats: [pgmsg.PgBinary],
+                                             parameters: [bytes.from_str("a")],
+                                             parameter_nulls: [false],
+                                             result_formats: [pgmsg.PgBinary]))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b),
+                                     "42000000150000000100010001000000016100010001")
+
+@test
+fn test_a_text_field_holding_a_nul_is_refused_rather_than_truncated() [io]
+    // A field that ends early is a DIFFERENT message rather than a
+    // shorter one: the server reads the rest of the reason as the next
+    // field.  `str.from_byte` builds the byte a literal cannot hold.
+    let held = str.from_byte(0)
+    test.case("a Parse")
+    match pgmsg.encode_frontend(pgmsg.PgParse(name: held, sql: "SELECT 1", parameter_oids: []))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "NUL byte"))
+
+    test.case("a Bind")
+    match pgmsg.encode_frontend(pgmsg.PgBind(portal: held, statement: "",
+                                             parameter_formats: [], parameters: [],
+                                             parameter_nulls: [], result_formats: []))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "NUL byte"))
+
+    test.case("an Execute")
+    match pgmsg.encode_frontend(pgmsg.PgExecute(portal: held, max_rows: 0))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "NUL byte"))
+
+    test.case("a Describe")
+    match pgmsg.encode_frontend(pgmsg.PgDescribeStatement(name: held))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "NUL byte"))
+
+    test.case("a Close")
+    match pgmsg.encode_frontend(pgmsg.PgCloseStatement(name: held))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "NUL byte"))
+
+    test.case("a SASL initial response's mechanism")
+    match pgmsg.encode_frontend(pgmsg.PgSaslInitialResponse(mechanism: held, data: bytes.zeros(0)))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "NUL byte"))
+
+    test.case("a COPY failure's reason")
+    match pgmsg.encode_frontend(pgmsg.PgCopyFail(reason: held))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "NUL byte"))
+
+// ── pgauth: the refusals ─────────────────────────────────────────────
+
+@test
+fn test_the_mechanism_choices_and_the_nonce_charset_are_enforced() [io]
+    test.case("a server that offered nothing cannot be satisfied")
+    match pgauth.choose_mechanism([], pgauth.PgBindingNone)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert_eq_str(pgerror.describe(f),
+            "the server asked for  authentication, which this client does not implement")
+
+    test.case("a mechanism this client does not implement")
+    match pgauth.begin("MD5", "abcdefgh", pgauth.PgBindingNone)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "MD5"))
+
+    test.case("a nonce with a space is outside SCRAM's nonce charset")
+    match pgauth.begin("SCRAM-SHA-256", "has a space", pgauth.PgBindingNone)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "printable ASCII"))
+
+    test.case("and the comma that separates SCRAM's fields is too")
+    match pgauth.begin("SCRAM-SHA-256", "has,comma", pgauth.PgBindingNone)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "printable ASCII"))
+
+@test
+fn test_the_server_first_refusals() [io]
+    let s = pgauth.begin("SCRAM-SHA-256", "abcdefgh", pgauth.PgBindingNone)!
+
+    test.case("a full nonce outside the charset is refused")
+    match pgauth.server_first(s, bytes.from_str("r=abcdefgh x,s=AAAA,i=4096"), "pw", 4096)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "nonce charset"))
+
+    test.case("an iteration count too large to be a number is refused")
+    match pgauth.server_first(s, bytes.from_str("r=abcdefghx,s=AAAA,i=99999999999999999999999999"),
+                              "pw", 4096)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "iteration count"))
+
+@test
+fn test_the_server_final_refusals() [io]
+    let s = pgauth.begin("SCRAM-SHA-256", "abcdefgh", pgauth.PgBindingNone)!
+
+    test.case("nothing has been taken yet, so there is no signature to check")
+    match pgauth.verify_server(s, bytes.from_str("v=AAAA"))
+        None    => test.assert(false)
+        Some(f) => test.assert(str.contains(pgerror.describe(f), "no server-first"))
+
+    let taken = pgauth.server_first(s, bytes.from_str("r=abcdefghx,s=AAAA,i=4096"), "pw", 4096)!
+
+    test.case("a final message that is not one field")
+    match pgauth.verify_server(taken, bytes.from_str("v=AAAA,v=BBBB"))
+        None    => test.assert(false)
+        Some(f) => test.assert(str.contains(pgerror.describe(f), "expected v="))
+
+    test.case("a field that is neither e= nor v=")
+    match pgauth.verify_server(taken, bytes.from_str("x=AAAA"))
+        None    => test.assert(false)
+        Some(f) => test.assert(str.contains(pgerror.describe(f), "expected v="))
+
+    test.case("a signature that is not base64")
+    match pgauth.verify_server(taken, bytes.from_str("v=!!!!"))
+        None    => test.assert(false)
+        Some(f) => test.assert(str.contains(pgerror.describe(f), "not base64"))
+
+@test
+fn test_saslprep_passes_a_non_ascii_password_through_unchanged() [io]
+    // The Unicode tables RFC 4013 needs are not in the standard
+    // library, so the bytes go out as typed — see the CHANGELOG's
+    // `### Known`.
+    test.assert_eq_str(pgauth.saslprep("péncil"), "péncil")
+    test.assert_eq_str(pgauth.saslprep("pencil"), "pencil")
+
+// ── pgtype: the settings, the uuid and the value renderings ──────────
+
+@test
+fn test_the_settings_track_every_parameter_the_server_announces() [io]
+    let s = settings()
+    test.case("integer_datetimes moves both ways")
+    let off = pgtype.apply_parameter(s, "integer_datetimes", "off")
+    test.assert(not off.integer_datetimes)
+    let on = pgtype.apply_parameter(off, "integer_datetimes", "on")
+    test.assert(on.integer_datetimes)
+
+    test.case("and the settings a text decode depends on are carried, not dropped")
+    test.assert_eq_str(pgtype.apply_parameter(s, "TimeZone", "Europe/Paris").time_zone,
+                       "Europe/Paris")
+    test.assert_eq_str(pgtype.apply_parameter(s, "DateStyle", "SQL, DMY").date_style,
+                       "SQL, DMY")
+    test.assert_eq_str(pgtype.apply_parameter(s, "IntervalStyle", "iso_8601").interval_style,
+                       "iso_8601")
+    test.assert_eq_str(pgtype.apply_parameter(s, "client_encoding", "LATIN1").client_encoding,
+                       "LATIN1")
+
+    test.case("a parameter this decoder does not track changes nothing")
+    test.assert_eq_str(pgtype.apply_parameter(s, "application_name", "psql").client_encoding,
+                       "UTF8")
+
+@test
+fn test_a_uuid_renders_from_any_number_of_bytes() [io]
+    test.case("the sixteen the wire sends")
+    test.assert_eq_str(pgtype.uuid_text(wire("00112233445566778899aabbccddeeff")),
+                       "00112233-4455-6677-8899-aabbccddeeff")
+
+    test.case("more than sixteen is cut to the first sixteen")
+    test.assert_eq_str(pgtype.uuid_text(wire("00112233445566778899aabbccddeeff0011")),
+                       "00112233-4455-6677-8899-aabbccddeeff")
+
+    test.case("fewer than sixteen is padded on the right with zeros")
+    test.assert_eq_str(pgtype.uuid_text(wire("00112233")),
+                       "00112233-0000-0000-0000-000000000000")
+
+@test
+fn test_a_bytea_is_rendered_as_its_byte_count() [io]
+    test.assert_eq_str(pgtype.show(pgtype.PgBytea(v: wire("ff"))), "1 byte")
+    test.assert_eq_str(pgtype.show(pgtype.PgBytea(v: wire("ffff"))), "2 bytes")
+    test.assert_eq_str(pgtype.show(pgtype.PgBytea(v: bytes.zeros(0))), "0 bytes")
+
+@test
+fn test_a_bool_and_a_numeric_encode_in_the_bytes_the_wire_uses() [io]
+    test.case("false is f and true is t")
+    match pgtype.encode(pgtype.PgBool(v: false), pgmsg.PgText)
+        Err(_) => test.assert(false)
+        Ok(e)  =>
+            test.assert(not e.is_null)
+            test.assert_eq_str(bytes.to_str(e.raw), "f")
+    match pgtype.encode(pgtype.PgBool(v: true), pgmsg.PgText)
+        Err(_) => test.assert(false)
+        Ok(e)  => test.assert_eq_str(bytes.to_str(e.raw), "t")
+
+    test.case("a negative numeric carries the sign word")
+    let n = pgtype.numeric([12, 3400], 0, true, 2)
+    match pgtype.encode(pgtype.PgNumericValue(v: n), pgmsg.PgBinary)
+        Err(_) => test.assert(false)
+        Ok(e)  => test.assert_eq_str(bytes.to_hex(e.raw), "0002000040000002000c0d48")
+
+    test.case("a numeric NaN carries the sign word that is not a number")
+    match pgtype.encode(pgtype.PgNumericValue(v: pgtype.numeric_nan()), pgmsg.PgBinary)
+        Err(_) => test.assert(false)
+        Ok(e)  => test.assert_eq_str(bytes.to_hex(e.raw), "00000000c0000000")
+
+@test
+fn test_a_uuid_parameter_is_its_sixteen_bytes_in_both_formats() [io]
+    let raw = wire("00112233445566778899aabbccddeeff")
+    test.case("text carries the canonical rendering")
+    match pgtype.encode(pgtype.PgUuid(v: raw), pgmsg.PgText)
+        Err(_) => test.assert(false)
+        Ok(e)  => test.assert_eq_str(bytes.to_str(e.raw), "00112233-4455-6677-8899-aabbccddeeff")
+
+    test.case("binary carries the bytes themselves")
+    match pgtype.encode(pgtype.PgUuid(v: raw), pgmsg.PgBinary)
+        Err(_) => test.assert(false)
+        Ok(e)  => test.assert_eq_str(bytes.to_hex(e.raw), "00112233445566778899aabbccddeeff")
+
+    test.case("a uuid that is not sixteen bytes is refused, not padded or cut")
+    match pgtype.encode(pgtype.PgUuid(v: wire("0011")), pgmsg.PgText)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "sixteen bytes"))
+
+@test
+fn test_a_binary_value_writes_the_bytes_its_own_variant_owes() [io]
+    test.case("a string is its own bytes")
+    match pgtype.encode(pgtype.PgStr(v: "ab"), pgmsg.PgBinary)
+        Err(_) => test.assert(false)
+        Ok(e)  => test.assert_eq_str(bytes.to_str(e.raw), "ab")
+
+    test.case("a json value is its own text, with no jsonb version byte")
+    match pgtype.encode(pgtype.PgJson(v: "{\"a\":1}"), pgmsg.PgBinary)
+        Err(_) => test.assert(false)
+        Ok(e)  => test.assert_eq_str(bytes.to_str(e.raw), "{\"a\":1}")
+
+    test.case("a timestamptz is eight bytes that read back as the same instant")
+    match pgtype.decode(pgtype.oid_timestamptz(), pgmsg.PgText,
+                        bytes.from_str("2026-03-15 09:30:00+00"), false, settings())
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match v
+                PgTimestampTz(t) =>
+                    match pgtype.encode(pgtype.PgTimestampTz(v: t), pgmsg.PgBinary)
+                        Err(_) => test.assert(false)
+                        Ok(e)  =>
+                            test.assert_eq(bytes.len(e.raw), 8)
+                            match pgtype.decode(pgtype.oid_timestamptz(), pgmsg.PgBinary,
+                                                e.raw, e.is_null, settings())
+                                Err(_)   => test.assert(false)
+                                Ok(back) => test.assert_eq_str(pgtype.show(back), pgtype.show(v))
+                _                => test.assert(false)
+
+// ── pgtype: the array encoder's element types ────────────────────────
+
+@test
+fn test_an_integer_array_element_is_written_in_the_arrays_own_width() [io]
+    test.case("int2[] carries two bytes an element, whatever an Int binds as alone")
+    test.assert_eq_str(array_hex(pgtype.oid_int2(), pgtype.PgInt(v: 7)),
+                       "0000000100000000000000150000000100000001000000020007")
+
+    test.case("int4[] carries four")
+    test.assert_eq_str(array_hex(pgtype.oid_int4(), pgtype.PgInt(v: 7)),
+                       "00000001000000000000001700000001000000010000000400000007")
+
+    test.case("int8[] carries eight")
+    test.assert_eq_str(array_hex(pgtype.oid_int8(), pgtype.PgInt(v: 7)),
+        "0000000100000000000000140000000100000001000000080000000000000007")
+
+@test
+fn test_a_binary_array_writes_its_null_flag_and_its_null_element() [io]
+    test.case("the header says a null is there and the element is a length of -1")
+    match pgtype.encode(pgtype.PgArray(element_oid: pgtype.oid_int4(),
+                                       elements: [pgtype.PgNull, pgtype.PgInt(v: 7)]),
+                        pgmsg.PgBinary)
+        Err(_) => test.assert(false)
+        Ok(e)  => test.assert_eq_str(bytes.to_hex(e.raw),
+            "0000000100000001000000170000000200000001ffffffff0000000400000007")
+
+    test.case("an array with no null keeps its flag clear")
+    match pgtype.encode(pgtype.PgArray(element_oid: pgtype.oid_int4(),
+                                       elements: [pgtype.PgInt(v: 7)]),
+                                       pgmsg.PgBinary)
+        Err(_) => test.assert(false)
+        Ok(e)  => test.assert_eq_str(bytes.to_hex(e.raw),
+                                     "00000001000000000000001700000001000000010000000400000007")
+
+@test
+fn test_a_text_array_quotes_a_null_and_an_empty_element() [io]
+    match pgtype.encode(pgtype.PgArray(element_oid: pgtype.oid_text(),
+                                       elements: [pgtype.PgNull, pgtype.PgStr(v: ""),
+                                                  pgtype.PgStr(v: "NULL"),
+                                                  pgtype.PgStr(v: "plain")]),
+                                                  pgmsg.PgText)
+        Err(_) => test.assert(false)
+        Ok(e)  => test.assert_eq_str(bytes.to_str(e.raw), "{NULL,\"\",\"NULL\",plain}")
+
+@test
+fn test_a_jsonb_or_uuid_element_gets_the_bytes_only_an_element_carries() [io]
+    test.case("a jsonb element carries the version byte a lone json does not")
+    test.assert_eq_str(array_hex(pgtype.oid_jsonb(), pgtype.PgJson(v: "{}")),
+                       "000000010000000000000eda000000010000000100000003017b7d")
+
+    test.case("a uuid element is the sixteen bytes, not a rendering")
+    test.assert_eq_str(array_hex(pgtype.oid_uuid(),
+                                 pgtype.PgUuid(v: wire("00112233445566778899aabbccddeeff"))),
+        "000000010000000000000b8600000001000000010000001000112233445566778899aabbccddeeff")
+
+    test.case("and a uuid element that is not sixteen bytes is padded to sixteen")
+    // An ELEMENT is total where a lone parameter is not: the element is
+    // length-prefixed, so a padded sixteen is a legal uuid on the wire,
+    // and `uuid_bytes` is the same padding `uuid_text` renders.
+    test.assert_eq_str(array_hex(pgtype.oid_uuid(), pgtype.PgUuid(v: wire("0011"))),
+        "000000010000000000000b8600000001000000010000001000110000000000000000000000000000")
+
+    test.case("while the same value as a lone parameter is refused")
+    test.assert(str.contains(pgerror.describe(match pgtype.encode(pgtype.PgUuid(v: wire("0011")), pgmsg.PgBinary)
+        Ok(_)  => pgerror.PgUnknownMessage(kind: 0)
+        Err(f) => f
+    ),
+    "sixteen bytes"))
+
+@test
+fn test_an_element_of_a_mismatched_variant_falls_back_to_its_own_bytes() [io]
+    let s = pgtype.PgStr(v: "x")
+    test.case("int2[], int4[] and int8[] given a string element")
+    test.assert_eq_str(array_hex(pgtype.oid_int2(), s),
+                       "00000001000000000000001500000001000000010000000178")
+    test.assert_eq_str(array_hex(pgtype.oid_int4(), s),
+                       "00000001000000000000001700000001000000010000000178")
+    test.assert_eq_str(array_hex(pgtype.oid_int8(), s),
+                       "00000001000000000000001400000001000000010000000178")
+
+    test.case("a float4[] given a string element")
+    test.assert_eq_str(array_hex(pgtype.oid_float4(), s),
+                       "0000000100000000000002bc00000001000000010000000178")
+
+    test.case("a jsonb[] given a string element")
+    test.assert_eq_str(array_hex(pgtype.oid_jsonb(), s),
+                       "000000010000000000000eda00000001000000010000000178")
+
+    test.case("and a uuid[] given a string element")
+    test.assert_eq_str(array_hex(pgtype.oid_uuid(), s),
+                       "000000010000000000000b8600000001000000010000000178")
+
+@test
+fn test_a_float4_array_widens_what_it_can_and_refuses_what_it_cannot() [io]
+    let f4 = pgtype.oid_float4()
+    test.case("a value a binary32 holds goes out as four bytes")
+    test.assert_eq_str(array_hex(f4, pgtype.PgFloat(v: 0.5)),
+                       "0000000100000000000002bc0000000100000001000000043f000000")
+
+    test.case("zero, which has no exponent at all")
+    test.assert_eq_str(array_hex(f4, pgtype.PgFloat(v: 0.0)),
+                       "0000000100000000000002bc00000001000000010000000400000000")
+
+    test.case("infinity keeps its all-ones exponent")
+    test.assert_eq_str(array_hex(f4, pgtype.PgFloat(v: float.from_bits(9218868437227405312))),
+                       "0000000100000000000002bc0000000100000001000000047f800000")
+
+    test.case("and a NaN goes out as the canonical quiet NaN")
+    test.assert_eq_str(array_hex(f4, pgtype.PgFloat(v: float.from_bits(9221120237041090560))),
+                       "0000000100000000000002bc0000000100000001000000047fc00000")
+
+    test.case("0.1 is between two binary32s and is refused, not rounded")
+    test.assert(str.contains(array_refusal(f4, pgtype.PgFloat(v: 0.1)),
+                             "is not a value a float4 widens to"))
+
+    test.case("a value past float4's range is refused")
+    test.assert(str.contains(array_refusal(f4, pgtype.PgFloat(v: 1.0e300)),
+                             "is not a value a float4 widens to"))
+
+    test.case("and a binary64 value below every binary32 is refused")
+    test.assert(str.contains(array_refusal(f4, pgtype.PgFloat(v: float.from_bits(1))),
+                             "is not a value a float4 widens to"))
+
+@test
+fn test_a_binary32_this_decoder_produced_goes_back_into_a_float4_array() [io]
+    // THE ROUND TRIP THAT MATTERS.  Whatever `decode` answers for a
+    // float4 is a value a binary32 widens to BY CONSTRUCTION, so
+    // `encode` has to write it back — a codec that can read a float4
+    // and not write it fails on the next INSERT, and the subnormal
+    // band (2^-149 through 2^-127) is where an exactness check that
+    // looked at the fraction rather than at the value would refuse
+    // values it should keep.
+    let f4 = pgtype.oid_float4()
+    let head = "0000000100000000000002bc000000010000000100000004"
+
+    test.case("the smallest subnormal binary32, which is 2^-149")
+    match pgtype.decode(f4, pgmsg.PgBinary, wire("00000001"), false, settings())
+        Err(_) => test.assert(false)
+        Ok(v)  => test.assert_eq_str(array_hex(f4, v), "${head}00000001")
+
+    test.case("the largest subnormal binary32, which is 0x007fffff")
+    match pgtype.decode(f4, pgmsg.PgBinary, wire("007fffff"), false, settings())
+        Err(_) => test.assert(false)
+        Ok(v)  => test.assert_eq_str(array_hex(f4, v), "${head}007fffff")
+
+    test.case("2^-127, an exact power of two inside the subnormal band")
+    match pgtype.decode(f4, pgmsg.PgBinary, wire("00400000"), false, settings())
+        Err(_) => test.assert(false)
+        Ok(v)  => test.assert_eq_str(array_hex(f4, v), "${head}00400000")
+
+    test.case("and the smallest normal binary32, which is 2^-126")
+    match pgtype.decode(f4, pgmsg.PgBinary, wire("00800000"), false, settings())
+        Err(_) => test.assert(false)
+        Ok(v)  => test.assert_eq_str(array_hex(f4, v), "${head}00800000")
+
+@test
+fn test_a_float4_of_zero_widens_to_zero() [io]
+    match pgtype.decode(pgtype.oid_float4(), pgmsg.PgBinary, wire("00000000"), false, settings())
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match v
+                PgFloat(f) => test.assert_eq(f, 0.0)
+                _          => test.assert(false)
+
+// ── pgtype: the text readers and their refusals ──────────────────────
+
+@test
+fn test_the_date_reader_reads_against_the_sessions_datestyle() [io]
+    test.case("a date whose fields are not numbers")
+    match pgtype.decode(pgtype.oid_date(), pgmsg.PgText, bytes.from_str("a-b-c"), false, settings())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "DateStyle"))
+
+    test.case("a DMY style reads the first number as the day")
+    let dmy = pgtype.apply_parameter(settings(), "DateStyle", "SQL, DMY")
+    match pgtype.decode(pgtype.oid_date(), pgmsg.PgText, bytes.from_str("01-02-2026"), false, dmy)
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match v
+                PgDate(d) => test.assert_eq(d.month, 2)
+                _         => test.assert(false)
+
+    test.case("a bare German style is a DMY order, and not a comma-separated one")
+    let german = pgtype.apply_parameter(settings(), "DateStyle", "German")
+    match pgtype.decode(pgtype.oid_date(), pgmsg.PgText, bytes.from_str("01-02-2026"), false,
+                        german)
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match v
+                PgDate(d) => test.assert_eq(d.month, 2)
+                _         => test.assert(false)
+
+    test.case("a YMD style reads the first number as the year, as written")
+    // The order is what decides only when NO field is longer than two
+    // digits, so a two-digit year is the case that tells YMD from MDY.
+    // This decoder reads the number it is given; it does not expand a
+    // two-digit year into a century — see the CHANGELOG's `### Known`.
+    let ymd = pgtype.apply_parameter(settings(), "DateStyle", "ISO, YMD")
+    match pgtype.decode(pgtype.oid_date(), pgmsg.PgText, bytes.from_str("26-02-01"), false, ymd)
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match v
+                PgDate(d) =>
+                    test.assert_eq(d.year, 26)
+                    test.assert_eq(d.month, 2)
+                    test.assert_eq(d.day, 1)
+                _         => test.assert(false)
+
+    test.case("and a four-digit first field is the year under every style")
+    match pgtype.decode(pgtype.oid_date(), pgmsg.PgText, bytes.from_str("2026-02-01"), false,
+                        settings())
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match v
+                PgDate(d) =>
+                    test.assert_eq(d.year, 2026)
+                    test.assert_eq(d.month, 2)
+                    test.assert_eq(d.day, 1)
+                _         => test.assert(false)
+
+@test
+fn test_the_timestamp_readers_and_their_refusals() [io]
+    test.case("a time of day without its two colons")
+    match pgtype.decode(pgtype.oid_timestamp(), pgmsg.PgText,
+                        bytes.from_str("2026-03-15 0930"), false, settings())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "time of day"))
+
+    test.case("a time of day whose fields are not numbers")
+    match pgtype.decode(pgtype.oid_timestamp(), pgmsg.PgText,
+                        bytes.from_str("2026-03-15 09:xx:00"), false, settings())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "time of day"))
+
+    test.case("a fraction longer than the wire's six digits is truncated, not refused")
+    match pgtype.decode(pgtype.oid_timestamp(), pgmsg.PgText,
+                        bytes.from_str("2026-03-15 09:30:00.1234567"), false, settings())
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match v
+                PgTimestamp(t) => test.assert_eq(t.time.nano / 1000, 123456)
+                _              => test.assert(false)
+
+    test.case("a timestamp whose date half is not a date")
+    match pgtype.decode(pgtype.oid_timestamp(), pgmsg.PgText,
+                        bytes.from_str("2026-13-45 09:30:00"), false, settings())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "DateStyle"))
+
+    test.case("a timestamptz whose offset is not one")
+    match pgtype.decode(pgtype.oid_timestamptz(), pgmsg.PgText,
+                        bytes.from_str("2026-03-15 09:30:00+xy"), false, settings())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "zone offset"))
+
+    test.case("a timestamptz whose offset sign stands alone")
+    match pgtype.decode(pgtype.oid_timestamptz(), pgmsg.PgText,
+                        bytes.from_str("2026-03-15 09:30:00+"), false, settings())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "zone offset"))
+
+    test.case("a timestamptz whose date half is not a date")
+    match pgtype.decode(pgtype.oid_timestamptz(), pgmsg.PgText,
+                        bytes.from_str("2026-13-45 09:30:00+00"), false, settings())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "DateStyle"))
+
+@test
+fn test_the_array_text_reader_of_every_broken_shape() [io]
+    let s = settings()
+
+    test.case("text with no braces at all keeps its bytes")
+    match pgtype.decode(1007, pgmsg.PgText, bytes.from_str("[1]"), false, s)
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match v
+                PgUnknown(_, _, _) => test.assert(true)
+                _                  => test.assert(false)
+
+    test.case("a quoted element whose delimiter is not a comma")
+    match pgtype.decode(1009, pgmsg.PgText, bytes.from_str("{\"a\"x}"), false, s)
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match v
+                PgUnknown(_, _, _) => test.assert(true)
+                _                  => test.assert(false)
+
+    test.case("a quoted element whose closing quote never comes")
+    match pgtype.decode(1009, pgmsg.PgText, bytes.from_str("{\"abc}"), false, s)
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match v
+                PgUnknown(_, _, _) => test.assert(true)
+                _                  => test.assert(false)
+
+    test.case("a quoted element carrying a backslash escape")
+    match pgtype.decode(1009, pgmsg.PgText, bytes.from_str("{\"a\\\\b\"}"), false, s)
+        Err(_) => test.assert(false)
+        Ok(v)  => test.assert_eq_str(first_text(v), "a\\b")
+
+@test
+fn test_a_bool_of_zero_in_binary_format_is_false() [io]
+    match pgtype.decode(pgtype.oid_bool(), pgmsg.PgBinary, wire("00"), false, settings())
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match v
+                PgBool(b) => test.assert(not b)
+                _         => test.assert(false)
+
+@test
+fn test_a_binary_array_shorter_than_its_headers_or_its_elements_is_refused() [io]
+    test.case("twelve bytes of header promise a dimension header that is not there")
+    match pgtype.decode(1007, pgmsg.PgBinary, wire("000000010000000000000017"), false, settings())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "20 byte(s)"))
+
+    test.case("an element the buffer cannot hold is refused before it is believed")
+    match pgtype.decode(1007, pgmsg.PgBinary,
+                        wire("0000000100000000000000170000000100000001000000026162"),
+                        false, settings())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "4 byte(s)"))
+
+@test
+fn test_text_and_json_decode_from_binary_format_too() [io]
+    test.case("a text column arriving in binary format")
+    match pgtype.decode(pgtype.oid_text(), pgmsg.PgBinary, bytes.from_str("hello"), false,
+                        settings())
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match v
+                PgStr(s) => test.assert_eq_str(s, "hello")
+                _        => test.assert(false)
+
+    test.case("a json column arriving in binary format")
+    match pgtype.decode(pgtype.oid_json(), pgmsg.PgBinary, bytes.from_str("{}"), false, settings())
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match v
+                PgJson(s) => test.assert_eq_str(s, "{}")
+                _         => test.assert(false)
+
+@test
+fn test_an_array_text_that_is_not_an_array_keeps_its_bytes() [io]
+    // The two braces are what make the text an array, so a single `{`
+    // is not one — and the value is kept whole rather than refused,
+    // because the bytes are what a caller can still write back.
+    test.case("a lone opening brace")
+    match pgtype.decode(1007, pgmsg.PgText, bytes.from_str("{"), false, settings())
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match v
+                PgUnknown(oid, format, raw) =>
+                    test.assert_eq(oid, 1007)
+                    test.assert_eq_str(bytes.to_str(raw), "{")
+                _                           => test.assert(false)
+
+    test.case("an empty text is not one either")
+    match pgtype.decode(1007, pgmsg.PgText, bytes.zeros(0), false, settings())
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match v
+                PgUnknown(_, _, raw) => test.assert_eq(bytes.len(raw), 0)
+                _                    => test.assert(false)
+
+@test
+fn test_a_binary64_between_two_binary32s_is_refused_by_a_float4_array() [io]
+    // `(1 + 2^-52) * 2^-149` is one binary64 step above the smallest
+    // subnormal binary32: the subnormal band's own inverse rounds it
+    // down to `0x00000001`, and the round trip is what says the answer
+    // is not the value that came in.
+    let f4 = pgtype.oid_float4()
+    let one_step_up = float.from_bits(3936146074321813505)
+    test.case("a value one step above a binary32 is not asked to be one")
+    test.assert(str.contains(array_refusal(f4, pgtype.PgFloat(v: one_step_up)),
+                             "is not a value a float4 widens to"))
+
+    test.case("while the binary32 it sits above does go out")
+    test.assert_eq_str(array_hex(f4, pgtype.PgFloat(v: float.from_bits(3936146074321813504))),
+                       "0000000100000000000002bc00000001000000010000000400000001")
+
+@test
+fn test_a_text_array_takes_the_element_paths_that_are_not_special_cased() [io]
+    // `text[]` is neither an integer width, nor float4, nor jsonb, nor
+    // uuid, so its elements are written the way the values are written
+    // on their own — including a `uuid` element, which is sixteen bytes
+    // there and the bytes it was given here.
+    let head = "0000000100000000000000190000000100000001000000"
+    test.case("a string element")
+    test.assert_eq_str(array_hex(pgtype.oid_text(), pgtype.PgStr(v: "x")),
+                       "${head}0178")
+
+    test.case("and a uuid element of two bytes, which only a uuid[] pads")
+    test.assert_eq_str(array_hex(pgtype.oid_text(), pgtype.PgUuid(v: wire("0011"))),
+                       "${head}020011")

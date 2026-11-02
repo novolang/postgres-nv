@@ -1,8 +1,6 @@
 // pgtype.nv — the bytes a column's value arrives as, in both formats,
 // for the types a program actually selects.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // TWO FORMATS, AND THE CHOICE IS PER COLUMN.  A `Query` always
 // answers text; an extended-protocol `Bind` names a format for each
 // result column.  Binary is smaller and unambiguous, and it is the
@@ -61,82 +59,383 @@ use pgmsg
 // `t` or `f` in text — NOT `true`/`false`, which is what a decoder
 // written from the SQL literal expects.
 pub fn oid_bool() -> Int
-    todo("postgres-nv.pgtype.oid_bool")
+    16
 
 // `bytea`, OID 17.  Raw bytes in binary format; in text it is
 // `\x` and then hex, which is a prefix a decoder has to strip.
 pub fn oid_bytea() -> Int
-    todo("postgres-nv.pgtype.oid_bytea")
+    17
 
 // `smallint`, OID 21.
 pub fn oid_int2() -> Int
-    todo("postgres-nv.pgtype.oid_int2")
+    21
 
 // `integer`, OID 23.
 pub fn oid_int4() -> Int
-    todo("postgres-nv.pgtype.oid_int4")
+    23
 
 // `bigint`, OID 20 — NUMERICALLY BELOW `int2` and `int4`,
 // because the OIDs were assigned in the order the types were added
 // and not in order of width.  A reader that assumed they ascend has
 // the three shuffled.
 pub fn oid_int8() -> Int
-    todo("postgres-nv.pgtype.oid_int8")
+    20
 
 // `real`, OID 700.
 pub fn oid_float4() -> Int
-    todo("postgres-nv.pgtype.oid_float4")
+    700
 
 // `double precision`, OID 701.
 pub fn oid_float8() -> Int
-    todo("postgres-nv.pgtype.oid_float8")
+    701
 
 // `text`, OID 25.
 pub fn oid_text() -> Int
-    todo("postgres-nv.pgtype.oid_text")
+    25
 
 // `character varying`, OID 1043.  The same values as `text` with
 // a length check the server applies; nothing about the wire format
 // differs.
 pub fn oid_varchar() -> Int
-    todo("postgres-nv.pgtype.oid_varchar")
+    1043
 
 // `numeric`, OID 1700.  Arbitrary precision, and what money is
 // stored in — see `PgNumeric`, which does not convert it to a float.
 pub fn oid_numeric() -> Int
-    todo("postgres-nv.pgtype.oid_numeric")
+    1700
 
 // `date`, OID 1082.  Days since 2000-01-01 in binary format.
 pub fn oid_date() -> Int
-    todo("postgres-nv.pgtype.oid_date")
+    1082
 
 // `timestamp without time zone`, OID 1114.  A wall-clock
 // reading and NOT an instant: two of them from different sessions
 // are not comparable without knowing whose clock.
 pub fn oid_timestamp() -> Int
-    todo("postgres-nv.pgtype.oid_timestamp")
+    1114
 
 // `timestamp with time zone`, OID 1184.  An instant, stored as
 // UTC.  A different type from `timestamp`, and collapsing the two is
 // how an application ends up an hour out twice a year.
 pub fn oid_timestamptz() -> Int
-    todo("postgres-nv.pgtype.oid_timestamptz")
+    1184
 
 // `uuid`, OID 2950.  Sixteen bytes — see `PgUuid`.
 pub fn oid_uuid() -> Int
-    todo("postgres-nv.pgtype.oid_uuid")
+    2950
 
 // `json`, OID 114.  Stored and sent as the text it was written
 // as, whitespace and key order included.
 pub fn oid_json() -> Int
-    todo("postgres-nv.pgtype.oid_json")
+    114
 
 // `jsonb`, OID 3802.  Parsed, normalised and re-rendered by the
 // server; on the wire in binary format it is a VERSION BYTE and then
 // the text, and a decoder that forgot the byte hands back a document
 // with a stray character on the front.
 pub fn oid_jsonb() -> Int
-    todo("postgres-nv.pgtype.oid_jsonb")
+    3802
+
+// ── the shared pieces ────────────────────────────────────────────────
+//
+// The readers and the renderings every other half of this module
+// shares: the signed integers the wire carries, the epoch arithmetic
+// both timestamp types use, the base-10000 algebra a `numeric` needs,
+// and the small text forms a report is assembled from.
+
+// A two's-complement field of `width` bits, read as signed: 65535 is
+// -1, and a `numeric`'s sign word is exactly that.
+fn signed(raw: Int, width: Int) -> Int
+    if raw >= width / 2
+        raw - width
+    else
+        raw
+
+// One int16, sign included.  A `numeric`'s digit count, its weight,
+// its sign and its scale all arrive as one.
+fn i16_at(buf: Bytes, off: Int) -> Int
+    signed(bytes.u16_be_at(buf, off) ?? 0, 65536)
+
+// One int32, sign included.  A `date`'s day count and an array's
+// dimension header arrive this way.
+fn i32_at(buf: Bytes, off: Int) -> Int
+    signed(bytes.u32_be_at(buf, off) ?? 0, 4294967296)
+
+// Division that rounds DOWN rather than toward zero, which is what a
+// microsecond count from before 2000 needs: a count one microsecond
+// below the epoch is the last microsecond of 1999-12-31 and not the
+// first of 2000, and `/` alone answers the second.
+fn floor_div(a: Int, b: Int) -> Int
+    let q = a / b
+    if a < 0 and q * b != a
+        return q - 1
+    q
+
+// Two decimal digits, zero-padded: a month, a day, an hour, a minute.
+fn pad2(n: Int) -> Str
+    str.pad_left(str.from_int(n), 2, "0")
+
+// Four: a year, and one base-10000 digit of a `numeric`.
+fn pad4(n: Int) -> Str
+    str.pad_left(str.from_int(n), 4, "0")
+
+// A value cut down to something that fits in an error message: a
+// server can be asked for a whole table and an error message cannot
+// carry one.
+fn short(s: Str) -> Str
+    str.slice(s, 0, 40)
+
+// A text value that is not the shape its type has — a `bool` that is
+// neither `t` nor `f`, a `uuid` that is not sixteen bytes.
+fn text_fault(oid: Int, text: Str) -> pgerror.PgFault
+    pgerror.PgBadMessage(kind: 0, length: str.len(text),
+        detail: "a value of type ${oid} arrived as \"${short(text)}\", which is not a form this decoder reads")
+
+// A text value that is not a `what` at all, named the way a reader who
+// has to go and look at the server would name it.
+fn value_fault(what: Str, text: Str) -> pgerror.PgFault
+    pgerror.PgBadMessage(kind: 0, length: str.len(text),
+        detail: "the text \"${short(text)}\" is not a ${what} this decoder reads")
+
+// A value whose byte count is not the one its type always has.  The
+// kind is 0 because this is a value and not a framed message; the
+// detail is what a reader needs to see.
+fn length_fault(oid: Int, raw: Bytes, want: Int) -> pgerror.PgFault
+    pgerror.PgBadMessage(kind: 0, length: bytes.len(raw),
+        detail: "a value of type ${oid} arrives in ${want} byte(s) and this one has ${bytes.len(raw)}")
+
+// Whether a fixed-width value's bytes are the width that type always
+// has.  Every binary reader below asks first: `bytes`'s own
+// out-of-range default would turn a truncated `int4` into a zero,
+// which is a number that looks fine.
+fn wrong_len(oid: Int, raw: Bytes, want: Int) -> Bool
+    bytes.len(raw) != want
+
+// The microseconds of a civil time.  The wire resolves to one
+// microsecond and a `CivilTime` carries nanoseconds, so the last three
+// digits are dropped — the truncation the server made when it stored
+// the value.
+fn micros_of_day(t: civil.CivilTime) -> Int
+    ((t.hour * 60 + t.minute) * 60 + t.second) * 1000000 + t.nano / 1000
+
+// The microseconds since PostgreSQL's epoch that a civil reading
+// stands for.  A `timestamp` and a `timestamptz` are the same count;
+// what differs is what the count means.
+fn microseconds(dt: civil.CivilDateTime) -> Int
+    (civil.epoch_day(dt.date) - postgres_epoch_day()) * 86400000000 + micros_of_day(dt.time)
+
+// The inverse: the civil reading a microsecond count stands for, in
+// UTC.
+fn datetime_from_micros(micros: Int) -> civil.CivilDateTime
+    let day = floor_div(micros, 86400000000)
+    let rest = micros - day * 86400000000
+    // `rest` is in [0, 86400000000) by construction, so every field is
+    // in range and the forced unwrap cannot fire.  There is no arm for
+    // an error here because there is no error to answer.
+    let t = civil.time_of(rest / 3600000000, rest % 3600000000 / 60000000,
+                          rest % 60000000 / 1000000, rest % 1000000 * 1000)!
+    civil.datetime(civil.date_from_epoch_day(day + postgres_epoch_day()), t)
+
+// A binary32's bits widened to binary64 EXACTLY — including the
+// subnormals, which shifting the exponent field alone gets wrong by
+// every power of two, and the infinities and NaNs, which the same
+// shift happens to get right.
+fn widen_float4(bits32: Int) -> Float
+    let sign = bits.shl(bits.band(bits32, -2147483648), 32)
+    let exponent = bits.band(bits.shr(bits32, 23), 255)
+    let fraction = bits.band(bits32, 8388607)
+    // An all-ones exponent is an infinity or a NaN whatever the width,
+    // and moves up with its payload intact.
+    if exponent == 255
+        return float.from_bits(bits.bor(bits.bor(sign, 9218868437227405312),
+                                        bits.shl(fraction, 29)))
+    if exponent == 0
+        if fraction == 0
+            return float.from_bits(sign)
+        // A subnormal binary32 has no implicit leading one, so it
+        // normalises on the way up: the fraction's highest set bit
+        // becomes the binary64 exponent's implicit one.
+        let top = 63 - bits.leading_zeros(fraction)
+        return float.from_bits(bits.bor(bits.bor(sign, bits.shl(top + 874, 52)),
+                                        bits.shl(fraction - bits.shl(1, top), 52 - top)))
+    float.from_bits(bits.bor(bits.bor(sign, bits.shl(exponent + 896, 52)),
+                             bits.shl(fraction, 29)))
+
+// A run of digits with its trailing zeros dropped — the fraction of a
+// timestamp, which the server trims the same way: `09:30:00.500000`
+// is written `09:30:00.5`.
+fn trim_zeros(s: Str) -> Str
+    var end = str.len(s)
+    while end > 0 and str.byte_at_or(s, end - 1, 0) == '0'
+        end = end - 1
+    str.slice(s, 0, end)
+
+// An ISO date, `2026-03-15`: what PostgreSQL's ISO output writes and
+// what this package renders from either format.
+fn iso_date(d: civil.CivilDate) -> Str
+    "${pad4(d.year)}-${pad2(d.month)}-${pad2(d.day)}"
+
+// A time to microsecond resolution, the fraction dropped when it is
+// zero.
+fn iso_time(t: civil.CivilTime) -> Str
+    let base = "${pad2(t.hour)}:${pad2(t.minute)}:${pad2(t.second)}"
+    let micros = t.nano / 1000
+    if micros == 0
+        return base
+    "${base}.${trim_zeros(str.pad_left(str.from_int(micros), 6, "0"))}"
+
+// A timestamp as PostgreSQL's ISO output writes it: the date, a space,
+// the time, and for a `timestamptz` the offset it is rendered at.
+// `+00`, because the value this package carries is UTC and has no zone
+// of its own.
+fn iso_timestamp(dt: civil.CivilDateTime, with_zone: Bool) -> Str
+    let body = "${iso_date(dt.date)} ${iso_time(dt.time)}"
+    if with_zone
+        return "${body}+00"
+    body
+
+// The built-in array types as pairs of numbers: the array's own OID
+// and its element's, from PostgreSQL's `pg_type.h`, for the types this
+// package names.  A text-format array needs it — the text carries
+// values and not types, so only the array's OID says which type came
+// out.
+fn array_oids() -> [Int]
+    [1000, 16, 1001, 17, 1005, 21, 1007, 23, 1016, 20, 1021, 700,
+     1022, 701, 1009, 25, 1015, 1043, 1231, 1700, 1182, 1082,
+     1115, 1114, 1185, 1184, 2951, 2950, 199, 114, 3807, 3802]
+
+// The element OID an array OID stands for, or 0 for an array type this
+// package does not name — whose elements arrive as `PgUnknown` with
+// their bytes intact.
+fn element_oid_of(array_oid: Int) -> Int
+    if array_oid == 0
+        return 0
+    let pairs = array_oids()
+    var i = 0
+    var found = 0
+    while i + 1 < list.len(pairs)
+        if found == 0 and list.get(pairs, i, -1) == array_oid
+            found = list.get(pairs, i + 1, 0)
+        i = i + 2
+    found
+
+// The array OID an element OID is the array OF, or 0 for an element
+// with no array type this package names.
+fn array_oid_of(element_oid: Int) -> Int
+    if element_oid == 0
+        return 0
+    let pairs = array_oids()
+    var i = 0
+    var found = 0
+    while i + 1 < list.len(pairs)
+        if found == 0 and list.get(pairs, i + 1, -1) == element_oid
+            found = list.get(pairs, i, 0)
+        i = i + 2
+    found
+
+// The sixteen bytes of a `uuid`, zero-padded or cut short, which is
+// what lets `uuid_text` be a rendering with no refusal in it: the wire
+// always sends sixteen, so the padding is for a caller holding
+// something else.
+fn uuid_bytes(raw: Bytes) -> Bytes
+    let n = bytes.len(raw)
+    if n == 16
+        return bytes.clone(raw)
+    if n > 16
+        return bytes.slice(raw, 0, 16)
+    bytes.concat([raw, bytes.zeros(16 - n)])
+
+// `true` or `false`, for a report.  The WIRE spells a bool `t` or `f`,
+// which is `bool_text`'s business and not this one's.
+fn bool_word(b: Bool) -> Str
+    if b
+        return "true"
+    "false"
+
+// How many bytes a `bytea` is, for `show`: a report reads better with
+// the size than with a megabyte of hex.
+fn bytea_count(raw: Bytes) -> Str
+    let n = bytes.len(raw)
+    if n == 1
+        return "1 byte"
+    "${n} bytes"
+
+// A report's rendering of an array: the elements between braces, each
+// one `show` of the element.
+fn show_array(xs: [PgValue]) -> Str
+    var out = ""
+    var first = true
+    for e in xs
+        if not first
+            out = "${out}, "
+        first = false
+        out = "${out}${show(e)}"
+    "{${out}}"
+
+// A value of a type this package does not name, for a report: the OID,
+// how many bytes the caller has, and which of the two formats they are
+// in.
+fn unknown_text(oid: Int, format: pgmsg.PgFormat, raw: Bytes) -> Str
+    match format
+        pgmsg.PgBinary => "type ${oid}, ${bytes.len(raw)} byte(s), binary"
+        pgmsg.PgText   => "type ${oid}, ${bytes.len(raw)} byte(s), text"
+
+// The rendering `numeric_text` is built from: the integer part, a
+// point, and the fraction the display scale asks for.
+//
+// A digit group the value does not have reads as zero, which is what
+// makes a `numeric` whose scale is longer than its digits — `1.5` with
+// a scale of 7 — render as `1.5000000` without storing the zeros.
+fn numeric_body(n: PgNumeric) -> Str
+    let groups = list.len(n.digits)
+    var head = ""
+    var p = 0
+    while p <= n.weight
+        head = "${head}${pad4(digit_at(n.digits, p, groups))}"
+        p = p + 1
+    var whole = "0"
+    if head != ""
+        whole = trim_leading_zeros(head)
+    if n.scale <= 0
+        return whole
+    "${whole}.${fraction_text(n.digits, n.weight, groups, n.scale)}"
+
+// One base-10000 digit, or zero for a position the value's digits do
+// not reach — above the first digit and below the last alike.
+fn digit_at(digits: [Int], p: Int, groups: Int) -> Int
+    if p >= 0 and p < groups
+        return list.get(digits, p, 0)
+    0
+
+// The fractional digits, `scale` of them, regrouped from the
+// base-10000 fields the value carries.
+fn fraction_text(digits: [Int], weight: Int, groups: Int, scale: Int) -> Str
+    var out = ""
+    var g = 0
+    let wanted = (scale + 3) / 4
+    while g < wanted
+        out = "${out}${pad4(digit_at(digits, weight + 1 + g, groups))}"
+        g = g + 1
+    str.slice(out, 0, scale)
+
+// A run of digits with its LEADING zeros dropped, down to one digit:
+// the integer part of a `numeric`, which is written without the zeros
+// the base-10000 fields are padded with.
+fn trim_leading_zeros(s: Str) -> Str
+    var i = 0
+    while i < str.len(s) - 1 and str.byte_at_or(s, i, 0) == '0'
+        i = i + 1
+    str.slice(s, i, str.len(s))
+
+// Whether every digit a `numeric` carries is zero, which is the one
+// value written without its sign.
+fn numeric_is_zero(n: PgNumeric) -> Bool
+    for d in n.digits
+        if d != 0
+            return false
+    true
+
+// ── the values ───────────────────────────────────────────────────────
 
 // The number of days from 1970-01-01 to PostgreSQL's epoch,
 // 2000-01-01 — 10957.
@@ -152,7 +451,7 @@ pub fn oid_jsonb() -> Int
 //     println("${pgtype.postgres_epoch_day()}")
 // ```
 pub fn postgres_epoch_day() -> Int
-    todo("postgres-nv.pgtype.postgres_epoch_day")
+    10957
 
 // A `numeric` from its parts.
 //
@@ -169,7 +468,8 @@ pub fn postgres_epoch_day() -> Int
 //     println("${pgtype.numeric([1], 0, false, 2).scale}")
 // ```
 pub fn numeric(digits: [Int], weight: Int, negative: Bool, scale: Int) -> PgNumeric
-    todo("postgres-nv.pgtype.numeric")
+    PgNumeric { digits: digits, weight: weight, negative: negative,
+                is_nan: false, scale: scale }
 
 // The `numeric` NaN, which compares EQUAL to itself and sorts above
 // every number — `Float`'s NaN does neither.
@@ -181,7 +481,7 @@ pub fn numeric(digits: [Int], weight: Int, negative: Bool, scale: Int) -> PgNume
 //     println("${pgtype.numeric_nan().is_nan}")
 // ```
 pub fn numeric_nan() -> PgNumeric
-    todo("postgres-nv.pgtype.numeric_nan")
+    PgNumeric { digits: [], weight: 0, negative: false, is_nan: true, scale: 0 }
 
 // An arbitrary-precision decimal, as the wire carries it.
 //
@@ -262,6 +562,26 @@ pub struct PgTextSettings
     // different and neither is self-describing.
     integer_datetimes: Bool
 
+// ── the settings ─────────────────────────────────────────────────────
+//
+// The state a text value depends on, and the two functions that move
+// it when the server says so.
+
+// The one field `name` names, from the value a `ParameterStatus`
+// carried; every other field answers what the settings already held.
+fn pick_str(name: Str, field: Str, given: Str, prior: Str) -> Str
+    if name == field
+        given
+    else
+        prior
+
+// The same, for the one setting that is a flag.
+fn pick_flag(name: Str, field: Str, on: Bool, prior: Bool) -> Bool
+    if name == field
+        on
+    else
+        prior
+
 // The settings a fresh connection assumes before the first
 // `ParameterStatus` arrives: UTF8, ISO dates, integer datetimes.
 //
@@ -272,7 +592,9 @@ pub struct PgTextSettings
 //     println(pgtype.default_settings().client_encoding)
 // ```
 pub fn default_settings() -> PgTextSettings
-    todo("postgres-nv.pgtype.default_settings")
+    PgTextSettings { client_encoding: "UTF8", date_style: "ISO, MDY",
+                     interval_style: "postgres", time_zone: "UTC",
+                     integer_datetimes: true }
 
 // Apply one `ParameterStatus` to the settings.
 //
@@ -286,9 +608,743 @@ pub fn default_settings() -> PgTextSettings
 //     println(s.date_style)
 // ```
 pub fn apply_parameter(s: PgTextSettings, name: Str, value: Str) -> PgTextSettings
-    todo("postgres-nv.pgtype.apply_parameter")
+    // The wire spells the one flag `on`, and a server that sent
+    // anything else changes nothing rather than being read as `off`.
+    PgTextSettings {
+        client_encoding: pick_str(name, "client_encoding", value, s.client_encoding),
+        date_style: pick_str(name, "DateStyle", value, s.date_style),
+        interval_style: pick_str(name, "IntervalStyle", value, s.interval_style),
+        time_zone: pick_str(name, "TimeZone", value, s.time_zone),
+        integer_datetimes: pick_flag(name, "integer_datetimes", value == "on",
+                                     s.integer_datetimes) }
 
 // ── decoding ─────────────────────────────────────────────────────────
+
+// Reading a value is two questions — which type, and which of the two
+// formats — and every reader below refuses what it cannot read.  None
+// of them guesses, because a guess here is a wrong value with no error
+// anywhere.
+
+// The date a text field spells, against the session's `DateStyle`.
+//
+// The three numbers are read in the order the setting's second half
+// names — `ISO, MDY` reads `01/02/2026` as the second of January and
+// `SQL, DMY` reads the same text as the first of February — with one
+// exemption: a first field longer than two digits can only be a year,
+// so `2000-01-01` is the year-first shape whatever the setting says.
+// That exemption is what keeps a server's own ISO output readable under
+// the default `DateStyle`.
+//
+// A style that spells the month as a NAME — `Postgres, MDY` writes
+// `Mar 15 2026` — is refused rather than guessed at.  The fix is one
+// `SET DateStyle`, or binary format, and a decoder that read the name
+// as a number would answer a wrong date quietly.
+fn parse_date(text: Str, style: Str) -> Result<civil.CivilDate, pgerror.PgFault>
+    // The separator the style uses is not worth branching on: a
+    // numeric date is three numbers, in whichever order the setting
+    // names them.
+    let flat = str.replace_all(str.replace_all(str.trim(text), "/", "-"), ".", "-")
+    let parts = str.split(flat, "-")
+    if list.len(parts) != 3
+        return Err(date_fault(text, style))
+    let p0 = str.to_int(list.get(parts, 0, ""))
+    let p1 = str.to_int(list.get(parts, 1, ""))
+    let p2 = str.to_int(list.get(parts, 2, ""))
+    if p0 == None or p1 == None or p2 == None
+        return Err(date_fault(text, style))
+    let a = p0 ?? 0
+    let b = p1 ?? 0
+    let c = p2 ?? 0
+    let order = date_order(style)
+    if order == "YMD" or str.len(list.get(parts, 0, "")) > 2
+        return civil_date(a, b, c, text, style)
+    if order == "DMY"
+        return civil_date(c, b, a, text, style)
+    civil_date(c, a, b, text, style)
+
+// The order a `DateStyle` reads its three numbers in: the second half
+// of the setting, which is the half that decides INPUT.  `ISO` and
+// `SQL` on their own name an output format and leave the order at
+// PostgreSQL's default of `MDY`; `German` implies `DMY`.
+fn date_order(style: Str) -> Str
+    let upper = str.upper(style)
+    let parts = str.split(upper, ",")
+    let field_order = str.trim(list.get(parts, list.len(parts) - 1, ""))
+    if list.len(parts) == 1 and str.starts_with(field_order, "GERMAN")
+        return "DMY"
+    if str.ends_with(field_order, "DMY")
+        return "DMY"
+    if str.ends_with(field_order, "YMD")
+        return "YMD"
+    "MDY"
+
+// The civil date a year, a month and a day are, or the refusal a
+// caller gets for a date that does not exist: `2026-02-30` is a shape
+// this decoder reads and a value it will not invent a date for.
+fn civil_date(y: Int, m: Int, d: Int, text: Str,
+              style: Str) -> Result<civil.CivilDate, pgerror.PgFault>
+    match civil.date(y, m, d)
+        Ok(date) => Ok(date)
+        Err(_)   => Err(date_fault(text, style))
+
+// A date this decoder does not read, with the setting that decided it:
+// what a caller needs in order to know whether to change the session
+// or to ask for binary format.
+fn date_fault(text: Str, style: Str) -> pgerror.PgFault
+    pgerror.PgBadMessage(kind: 0, length: str.len(text),
+        detail: "the text \"${short(text)}\" is not a date this decoder reads against DateStyle \"${style}\"; a style that spells the month as a name is not one of them — ask for binary format, or set DateStyle to ISO")
+
+// The time of day a text field spells, microseconds and all.  The
+// fraction is read to six digits and truncated past them, which is the
+// resolution the wire carries.
+fn parse_time(text: Str) -> Result<civil.CivilTime, pgerror.PgFault>
+    let parts = str.split(text, ":")
+    if list.len(parts) != 3
+        return Err(value_fault("time of day", text))
+    let hs = str.to_int(list.get(parts, 0, ""))
+    let ms = str.to_int(list.get(parts, 1, ""))
+    let tail = str.split(list.get(parts, 2, ""), ".")
+    let ss = str.to_int(list.get(tail, 0, ""))
+    let frac = fraction_micros(list.get(tail, 1, ""))
+    if hs == None or ms == None or ss == None or frac == None
+        return Err(value_fault("time of day", text))
+    match civil.time_of(hs ?? 0, ms ?? 0, ss ?? 0, (frac ?? 0) * 1000)
+        Ok(t)  => Ok(t)
+        Err(_) => Err(value_fault("time of day", text))
+
+// Six decimal digits of fraction as microseconds.  The digits stand
+// for the fraction and not for a count, so `5` is five hundred
+// thousand: a shorter run is padded on the right and a longer one is
+// truncated, which is the server's own resolution.
+fn fraction_micros(text: Str) -> ?Int
+    if text == ""
+        return Some(0)
+    if str.len(text) > 6
+        return str.to_int(str.slice(text, 0, 6))
+    str.to_int(str.pad_right(text, 6, "0"))
+
+// The date and the time of one text field, read together: the two
+// halves every timestamp rendering has.
+fn parse_pair(date_text: Str, time_text: Str,
+              style: Str) -> Result<civil.CivilDateTime, pgerror.PgFault>
+    let d = parse_date(date_text, style)!
+    let t = parse_time(time_text)!
+    Ok(civil.datetime(d, t))
+
+// A `timestamp`, which is the date, a space and the time and nothing
+// else: a third token is refused rather than dropped.
+fn parse_timestamp_text(text: Str, style: Str) -> Result<civil.CivilDateTime, pgerror.PgFault>
+    let parts = str.words(text)
+    if list.len(parts) != 2
+        return Err(value_fault("timestamp", text))
+    parse_pair(list.get(parts, 0, ""), list.get(parts, 1, ""), style)
+
+// The INSTANT a `timestamptz`'s text stands for: the reading, less the
+// offset it was rendered at.
+//
+// PostgreSQL writes the offset beside the time — `+01`, `-05:30`,
+// `+00` — in the ISO and SQL styles, so the text carries everything
+// the instant needs.  A rendering that names a ZONE instead (`CET`,
+// in the `Postgres` style) is refused: this package has no zone table,
+// and a guess there is an hour out twice a year.
+fn parse_timestamptz(text: Str, style: Str) -> Result<civil.CivilDateTime, pgerror.PgFault>
+    let parts = str.words(text)
+    if list.len(parts) != 2
+        return Err(value_fault("timestamp with a zone offset", text))
+    let clock = list.get(parts, 1, "")
+    let at = match zone_start(clock)
+        Some(found) => found
+        None        =>
+            return Err(value_fault("timestamp with a zone offset", text))
+    let zoned = offset_seconds(str.slice(clock, at, str.len(clock)))
+    var offset = 0
+    match zoned
+        Some(v) =>
+            offset = v
+        None    =>
+            return Err(value_fault("timestamp with a zone offset", text))
+    let dt = parse_pair(list.get(parts, 0, ""), str.slice(clock, 0, at), style)!
+    Ok(to_utc(dt, offset))
+
+// Where a time field's zone offset starts, or `None` when it has none.  The
+// first character is a digit, so the offset's sign is the only `+` or
+// `-` after it.
+fn zone_start(text: Str) -> ?Int
+    for i in 1..str.len(text)
+        let c = str.byte_at_or(text, i, '0')
+        if c == '+' or c == '-'
+            return Some(i)
+    None
+
+// The seconds an offset like `+01` or `-05:30` stands for, or `None`
+// when the text is not one.
+fn offset_seconds(text: Str) -> ?Int
+    if str.len(text) < 2
+        return None
+    let sign = str.byte_at_or(text, 0, 0)
+    // The guard is kept because this is also the whole of the parse, and
+    // a caller that handed it a bare `01:00` should get `None` rather
+    // than a silent +01:00.  The condition is evaluated on every call
+    // and is covered; only the arm below is not.
+    if sign != '+' and sign != '-'
+        // cov: skip — every caller slices the offset out of a timestamp
+        // with its sign in front, so the sign is always there by the
+        // time this runs and this arm is never taken.
+        return None
+    let parts = str.split(str.slice(text, 1, str.len(text)), ":")
+    let hs = str.to_int(list.get(parts, 0, ""))
+    var ms: ?Int = Some(0)
+    if list.len(parts) > 1
+        ms = str.to_int(list.get(parts, 1, ""))
+    if hs == None or ms == None
+        return None
+    let total = (hs ?? 0) * 3600 + (ms ?? 0) * 60
+    if sign == '-'
+        return Some(0 - total)
+    Some(total)
+
+// The UTC reading an instant had, given the local reading it was
+// rendered as and the offset it was rendered at.
+fn to_utc(dt: civil.CivilDateTime, offset: Int) -> civil.CivilDateTime
+    let seconds = civil.epoch_day(dt.date) * 86400 + dt.time.hour * 3600 + dt.time.minute * 60 + dt.time.second - offset
+    let day = floor_div(seconds, 86400)
+    let rest = seconds - day * 86400
+    // As in `datetime_from_micros`, `rest` is in [0, 86400) by
+    // construction and the forced unwrap cannot fire.
+    let t = civil.time_of(rest / 3600, rest % 3600 / 60, rest % 60, dt.time.nano)!
+    civil.datetime(civil.date_from_epoch_day(day), t)
+
+// Whether the session's text arrives in the UTF-8 this package's `Str`
+// is.  `Unicode` is what an old server calls it.
+fn utf8_session(settings: PgTextSettings) -> Bool
+    let encoding = str.upper(settings.client_encoding)
+    encoding == "UTF8" or encoding == "UTF-8" or encoding == "UNICODE"
+
+// A string value from a session whose text is in some other encoding:
+// refused with the setting named, because the bytes would otherwise
+// reach a caller as text this package cannot promise the meaning of.
+// Binary format or `client_encoding = UTF8` is the fix, and both are
+// one line at the call site.
+fn encoding_fault(settings: PgTextSettings) -> pgerror.PgFault
+    pgerror.PgBadMessage(kind: 0, length: 0,
+        detail: "the session's client_encoding is ${settings.client_encoding} and a text value in that encoding is not the UTF-8 this package's Str is — ask for binary format, or set client_encoding to UTF8")
+
+// A `bool` in text format: `t` or `f`, which is what a `bool` column
+// sends and NOT the `true`/`false` of a SQL literal.
+fn decode_bool_text(text: Str) -> Result<PgValue, pgerror.PgFault>
+    if text == "t"
+        return Ok(PgBool(v: true))
+    if text == "f"
+        return Ok(PgBool(v: false))
+    Err(text_fault(oid_bool(), text))
+
+// An `int2`, an `int4` or an `int8` in text format: a decimal, with
+// the column's own OID naming which of the three it was.
+fn decode_int_text(oid: Int, text: Str) -> Result<PgValue, pgerror.PgFault>
+    match str.to_int(text)
+        Some(n) => Ok(PgInt(v: n))
+        None    => Err(text_fault(oid, text))
+
+// A `float4` or a `float8` in text format.  `str.to_float` reads the
+// `NaN`, `Infinity` and `-Infinity` spellings PostgreSQL writes, which
+// are not the spellings a decimal parser expects.
+fn decode_float_text(oid: Int, text: Str) -> Result<PgValue, pgerror.PgFault>
+    match str.to_float(text)
+        Some(f) => Ok(PgFloat(v: f))
+        None    => Err(text_fault(oid, text))
+
+// A `numeric` in text format.  `NaN` is the one value that is not a
+// number and is taken before the digits are looked at.
+fn decode_numeric_text(text: Str) -> Result<PgValue, pgerror.PgFault>
+    if text == "NaN"
+        return Ok(PgNumericValue(v: numeric_nan()))
+    match parse_numeric(text)
+        Some(n) => Ok(PgNumericValue(v: n))
+        None    => Err(text_fault(oid_numeric(), text))
+
+// The digits of a `numeric`'s text form, regrouped in fours, which is
+// the base the wire carries.
+//
+// The integer part is padded on the LEFT and the fraction on the
+// RIGHT, so `1.5` is the groups 1 and 5000 with a weight of 0 and a
+// scale of 1.  Leading groups of zero are not carried at all — the
+// weight says where the first real digit sits — because a zero group
+// at the front would be the same digits standing for another number.
+fn parse_numeric(text: Str) -> ?PgNumeric
+    var body = text
+    var negative = false
+    if str.starts_with(text, "-")
+        negative = true
+        body = str.slice(text, 1, str.len(text))
+    let parts = str.split(body, ".")
+    if list.len(parts) > 2
+        return None
+    let whole = list.get(parts, 0, "")
+    let fraction = list.get(parts, 1, "")
+    if not digits_only(whole) or not digits_only(fraction)
+        return None
+    let whole_groups = (str.len(whole) + 3) / 4
+    let fraction_groups = (str.len(fraction) + 3) / 4
+    let whole_padded = str.pad_left(whole, whole_groups * 4, "0")
+    let fraction_padded = str.pad_right(fraction, fraction_groups * 4, "0")
+    var digits: [Int] = []
+    var weight = whole_groups - 1
+    var at = 0
+    // The integer groups and then the fraction's, as one run of
+    // four-digit fields: the first `whole_groups` of them carry the
+    // weight and the rest sit below it.  The end of the run is the sum
+    // of the two lengths — the fraction's fields start where the
+    // integer's stop, and `at` walks both.
+    while at < str.len(whole_padded) + str.len(fraction_padded)
+        let field = if at < str.len(whole_padded)
+            str.slice(whole_padded, at, at + 4)
+        else
+            str.slice(fraction_padded, at - str.len(whole_padded),
+                      at - str.len(whole_padded) + 4)
+        match str.to_int(field)
+            Some(n) =>
+                digits = list.concat(digits, [n])
+            None    =>
+                // cov: skip — `field` is four characters of a string
+                // `digits_only` has already proved numeric, so the parse
+                // cannot fail and this arm is never taken; the refusal is
+                // what keeps this a total parse rather than one that
+                // trusts its own caller.
+                return None
+        at = at + 4
+    while list.len(digits) > 0 and list.get(digits, 0, 1) == 0
+        digits = list.slice(digits, 1, list.len(digits))
+        weight = weight - 1
+    Some(numeric(digits, weight, negative, str.len(fraction)))
+
+// Whether every character of a field is a decimal digit.  `str.to_int`
+// would also read a sign and a space, and neither is part of the value
+// a `numeric` is spelled with.
+fn digits_only(s: Str) -> Bool
+    var i = 0
+    var ok = true
+    while i < str.len(s)
+        let c = str.byte_at_or(s, i, 0)
+        if c < '0' or c > '9'
+            ok = false
+        i = i + 1
+    ok
+
+// A `bytea` in text format: the two characters `\x` and then hex.  The
+// legacy `escape` format writes octal instead and is refused rather
+// than read as hex.
+fn decode_bytea_text(text: Str) -> Result<PgValue, pgerror.PgFault>
+    if not str.starts_with(text, "\\x")
+        return Err(value_fault("bytea in PostgreSQL's hex form", text))
+    match bytes.from_hex(str.slice(text, 2, str.len(text)))
+        Some(b) => Ok(PgBytea(v: b))
+        None    => Err(value_fault("bytea in PostgreSQL's hex form", text))
+
+// A `uuid` in text format: thirty-six characters of hex and dashes.
+// The dashes are dropped before the parse, and the length is checked
+// afterwards rather than trusted.
+fn decode_uuid_text(text: Str) -> Result<PgValue, pgerror.PgFault>
+    let parsed = bytes.from_hex(str.replace_all(text, "-", ""))
+    if parsed == None
+        return Err(value_fault("uuid", text))
+    let raw = parsed ?? bytes.zeros(0)
+    if bytes.len(raw) != 16
+        return Err(value_fault("uuid", text))
+    Ok(PgUuid(v: raw))
+
+// A string type in either format.  `client_encoding` is CHECKED rather
+// than assumed: a value read under an encoding this package does not
+// decode would reach a caller as mojibake, so the session is refused
+// with the setting named — see `encoding_fault`.
+fn decode_string(raw: Bytes, oid: Int, settings: PgTextSettings) -> Result<PgValue, pgerror.PgFault>
+    if not utf8_session(settings)
+        return Err(encoding_fault(settings))
+    let text = bytes.to_str(raw)
+    if oid == oid_json() or oid == oid_jsonb()
+        return Ok(PgJson(v: text))
+    Ok(PgStr(v: text))
+
+// Where the element that starts at `i` ends, or `None` when what follows
+// is not one element this reader reads.
+//
+// A quoted element runs to its closing quote and an unquoted one to
+// the next comma or to the array's closing brace; a nested brace or a
+// quote inside an unquoted element is another shape, and the caller
+// answers `PgUnknown` with the bytes intact rather than read them
+// wrong.  So is a backslash in an unquoted element, which PostgreSQL
+// does not treat as an escape there.
+fn element_end(text: Str, i: Int, n: Int, quoted: Bool) -> ?Int
+    var at = i
+    while at < n
+        let c = str.byte_at_or(text, at, 0)
+        match c
+            92 if quoted and at + 1 < n =>
+                at = at + 2
+            34 if quoted                =>
+                return Some(at)
+            44 | 125 if not quoted      =>
+                return Some(at)
+            123 | 34 | 92 if not quoted =>
+                return None
+            _                           =>
+                at = at + 1
+    None
+
+// A quoted element's body, with the two escapes PostgreSQL's array
+// output writes undone: a backslash-escaped quote first, so that the
+// `\` a `\\` stands for is not read as the start of one.
+fn unescape_element(s: Str) -> Str
+    str.replace_all(str.replace_all(s, "\\\"", "\""), "\\\\", "\\")
+
+// The elements of a one-dimensional array's text form, `{a,b,c}`, or
+// `None` when the text is not one.
+//
+// The text carries values and not types, so the caller reads them back
+// with the element OID the array's own OID names.  An empty unquoted
+// element is refused rather than read as an empty string: PostgreSQL
+// reads the position as a NULL and this reader does not, and keeping
+// the bytes whole as `PgUnknown` is the safer half of that pair.
+fn array_text_elements(text: Str) -> ?[?Str]
+    let n = str.len(text)
+    if n < 2
+        return None
+    if str.byte_at_or(text, 0, 0) != '{' or str.byte_at_or(text, n - 1, 0) != '}'
+        return None
+    if n == 2
+        return Some([])
+    var out: [?Str] = []
+    var i = 1
+    var more = true
+    while more
+        let quoted = str.byte_at_or(text, i, 0) == '"'
+        var start = i
+        if quoted
+            start = i + 1
+        let stop = match element_end(text, start, n, quoted)
+            Some(found) => found
+            None        =>
+                return None
+        let body = str.slice(text, start, stop)
+        if quoted
+            out = list.concat(out, [Some(unescape_element(body))])
+        else
+            let bare = str.trim(body)
+            if str.len(bare) == 0
+                return None
+            if str.upper(bare) == "NULL"
+                out = list.concat(out, [None])
+            else
+                // `str.trim(body)` and not `bare`, which is the same
+                // value: a list literal holding `Some(bare)` — an
+                // optional whose payload is a BOUND `Str` — reads back
+                // with a length of 1 and no bytes under novo 0.20.2.
+                // The call form keeps the bytes, and the trim is a
+                // no-op the second time.  Filed as
+                // `memory-perceus/a-bound-str-boxed-in-a-some-inside-a-list-literal-reads-back-empty`;
+                // the binding can come back when the filing is fixed.
+                // See also the CHANGELOG's `### Known`.
+                out = list.concat(out, [Some(str.trim(body))])
+        // A quoted element's delimiter sits one byte past its closing
+        // quote and an unquoted one's sits where its body stopped.
+        var after = stop
+        if quoted
+            after = stop + 1
+        if after < n - 1
+            if str.byte_at_or(text, after, 0) != ','
+                return None
+            i = after + 1
+        else
+            more = false
+    Some(out)
+
+// The values of a one-dimensional array's text form, read with the
+// element OID the array's OID names.
+fn decode_array_elements(oid: Int, elements: [?Str],
+                         settings: PgTextSettings) -> Result<PgValue, pgerror.PgFault>
+    let element = element_oid_of(oid)
+    var out: [PgValue] = []
+    var fault: ?pgerror.PgFault = None
+    for part in elements
+        if fault == None
+            match part
+                None    =>
+                    out = list.concat(out, [PgNull])
+                Some(t) =>
+                    match decode(element, pgmsg.PgText, bytes.from_str(t), false, settings)
+                        Ok(v)  =>
+                            out = list.concat(out, [v])
+                        Err(f) =>
+                            fault = Some(f)
+    match fault
+        Some(f) => Err(f)
+        None    => Ok(PgArray(element_oid: element, elements: out))
+
+// A `bool` in binary format: one byte, and 0 and 1 are the only values
+// it has.  A third byte is a misframed stream and not a true.
+fn decode_bool_binary(raw: Bytes) -> Result<PgValue, pgerror.PgFault>
+    if wrong_len(oid_bool(), raw, 1)
+        return Err(length_fault(oid_bool(), raw, 1))
+    let b = bytes.byte_at(raw, 0) ?? 0
+    if b == 0
+        return Ok(PgBool(v: false))
+    if b == 1
+        return Ok(PgBool(v: true))
+    Err(pgerror.PgBadMessage(kind: 0, length: 1,
+        detail: "a bool in binary format is one byte of 0 or 1 and this one is ${b}"))
+
+// An `int2` in binary format: two bytes.
+fn decode_int2_binary(raw: Bytes) -> Result<PgValue, pgerror.PgFault>
+    if wrong_len(oid_int2(), raw, 2)
+        return Err(length_fault(oid_int2(), raw, 2))
+    Ok(PgInt(v: i16_at(raw, 0)))
+
+// An `int4` in binary format: four.
+fn decode_int4_binary(raw: Bytes) -> Result<PgValue, pgerror.PgFault>
+    if wrong_len(oid_int4(), raw, 4)
+        return Err(length_fault(oid_int4(), raw, 4))
+    Ok(PgInt(v: i32_at(raw, 0)))
+
+// An `int8` in binary format: eight.  `bytes.u64_be_at` answers the
+// SIGNED word, so eight bytes of 0xFF come back as -1 and not as a
+// number they cannot be.
+fn decode_int8_binary(raw: Bytes) -> Result<PgValue, pgerror.PgFault>
+    if wrong_len(oid_int8(), raw, 8)
+        return Err(length_fault(oid_int8(), raw, 8))
+    Ok(PgInt(v: bytes.u64_be_at(raw, 0) ?? 0))
+
+// A `float4` in binary format: four bytes of IEEE 754 binary32, which
+// is a width this package's `Float` is not — see `widen_float4`.
+fn decode_float4_binary(raw: Bytes) -> Result<PgValue, pgerror.PgFault>
+    if wrong_len(oid_float4(), raw, 4)
+        return Err(length_fault(oid_float4(), raw, 4))
+    Ok(PgFloat(v: widen_float4(bytes.u32_be_at(raw, 0) ?? 0)))
+
+// A `float8` in binary format: eight bytes, which is a `Float`'s own
+// width, so the bits move across unchanged — subnormals, infinities
+// and NaN payloads included.
+fn decode_float8_binary(raw: Bytes) -> Result<PgValue, pgerror.PgFault>
+    if wrong_len(oid_float8(), raw, 8)
+        return Err(length_fault(oid_float8(), raw, 8))
+    Ok(PgFloat(v: float.from_bits(bytes.u64_be_at(raw, 0) ?? 0)))
+
+// A `numeric` in binary format: the digit count, the weight, the sign
+// and the display scale as four int16s, and then that many base-10000
+// digits.
+//
+// The sign word is the one value that is not a number: 0xC000 is
+// `NaN`, and it carries no digits at all.
+fn decode_numeric_binary(raw: Bytes) -> Result<PgValue, pgerror.PgFault>
+    if bytes.len(raw) < 8
+        return Err(length_fault(oid_numeric(), raw, 8))
+    let count = i16_at(raw, 0)
+    let weight = i16_at(raw, 2)
+    let sign = bytes.u16_be_at(raw, 4) ?? 0
+    let scale = i16_at(raw, 6)
+    if sign == 49152
+        return Ok(PgNumericValue(v: numeric_nan()))
+    // The digits have to be exactly as long as the count says, which
+    // also refuses a count large enough to read past the buffer.
+    if bytes.len(raw) != 8 + 2 * count
+        return Err(length_fault(oid_numeric(), raw, 8 + 2 * count))
+    var digits: [Int] = []
+    var i = 0
+    while i < count
+        digits = list.concat(digits, [bytes.u16_be_at(raw, 8 + 2 * i) ?? 0])
+        i = i + 1
+    Ok(PgNumericValue(v: PgNumeric { digits: digits, weight: weight,
+                                     negative: sign == 16384, is_nan: false,
+                                     scale: scale }))
+
+// A `date` in binary format: a signed count of DAYS from 2000-01-01,
+// which is the epoch this module exists to keep a caller out of — see
+// `postgres_epoch_day`.
+fn decode_date_binary(raw: Bytes) -> Result<PgValue, pgerror.PgFault>
+    if wrong_len(oid_date(), raw, 4)
+        return Err(length_fault(oid_date(), raw, 4))
+    Ok(PgDate(v: civil.date_from_epoch_day(i32_at(raw, 0) + postgres_epoch_day())))
+
+// A `timestamp` or a `timestamptz` in binary format: microseconds from
+// 2000-01-01, signed, as a 64-bit count.  Both are the same bytes;
+// which one it is is the column's OID and nothing in the value.
+fn decode_timestamp_binary(raw: Bytes, with_zone: Bool) -> Result<PgValue, pgerror.PgFault>
+    var oid = oid_timestamp()
+    if with_zone
+        oid = oid_timestamptz()
+    if wrong_len(oid, raw, 8)
+        return Err(length_fault(oid, raw, 8))
+    let dt = datetime_from_micros(bytes.u64_be_at(raw, 0) ?? 0)
+    if with_zone
+        return Ok(PgTimestampTz(v: dt))
+    Ok(PgTimestamp(v: dt))
+
+// A `uuid` in binary format: sixteen bytes in wire order, which is the
+// order `uuid_text` renders them in.
+fn decode_uuid_binary(raw: Bytes) -> Result<PgValue, pgerror.PgFault>
+    if wrong_len(oid_uuid(), raw, 16)
+        return Err(length_fault(oid_uuid(), raw, 16))
+    Ok(PgUuid(v: raw))
+
+// A `jsonb` in binary format: a VERSION BYTE and then the document as
+// text.  The version is checked, because a document with a stray
+// character on the front parses as nothing and looks like the server's
+// fault.
+fn decode_jsonb_binary(raw: Bytes) -> Result<PgValue, pgerror.PgFault>
+    if bytes.len(raw) < 1
+        return Err(length_fault(oid_jsonb(), raw, 1))
+    let version = bytes.byte_at(raw, 0) ?? 0
+    if version != 1
+        return Err(pgerror.PgBadMessage(kind: 0, length: 1,
+            detail: "a jsonb in binary format carries version 1 and this one carries ${version}"))
+    Ok(PgJson(v: bytes.to_str(bytes.slice(raw, 1, bytes.len(raw)))))
+
+// A one-dimensional array in binary format: the dimension count, a
+// flag for whether any element is NULL, the ELEMENT OID, one header
+// per dimension, and then the elements as length-prefixed values.
+//
+// The element OID is on the wire, so nothing here depends on the array
+// OID the caller knew.  A shape this package does not read — two
+// dimensions, a lower bound other than 1 — keeps its bytes as
+// `PgUnknown`, which is what the README promises a caller.
+fn decode_array_binary(oid: Int, raw: Bytes,
+                       settings: PgTextSettings) -> Result<PgValue, pgerror.PgFault>
+    if bytes.len(raw) < 12
+        return Err(length_fault(oid, raw, 12))
+    let dimensions = i32_at(raw, 0)
+    let element = i32_at(raw, 8)
+    // An empty array arrives with no dimensions at all: PostgreSQL
+    // normalises `{}` to that, so there are no headers and no elements
+    // behind the twelve bytes and the element OID is the only type
+    // information the value carries.
+    if dimensions == 0 and bytes.len(raw) == 12
+        return Ok(PgArray(element_oid: element, elements: []))
+    if bytes.len(raw) < 20
+        return Err(length_fault(oid, raw, 20))
+    let lower = i32_at(raw, 16)
+    if dimensions != 1 or lower != 1
+        return Ok(PgUnknown(oid: oid, format: pgmsg.PgBinary, raw: raw))
+    decode_array_items(oid, element, raw, i32_at(raw, 12), settings)
+
+// The elements of an array, from the first length prefix at byte
+// twenty.  A length the buffer cannot hold is refused before a byte of
+// it is believed, and a length of -1 is a NULL — the same spelling a
+// NULL parameter has, and the reason an empty value is not one.
+fn decode_array_items(oid: Int, element: Int, raw: Bytes, count: Int,
+                      settings: PgTextSettings) -> Result<PgValue, pgerror.PgFault>
+    var out: [PgValue] = []
+    var fault: ?pgerror.PgFault = None
+    var at = 20
+    var i = 0
+    while i < count and fault == None
+        if at + 4 > bytes.len(raw)
+            fault = Some(length_fault(oid, raw, at + 4))
+        else
+            let size = i32_at(raw, at)
+            at = at + 4
+            if size < 0
+                out = list.concat(out, [PgNull])
+            elif at + size > bytes.len(raw)
+                fault = Some(length_fault(oid, raw, at + size))
+            else
+                let chunk = bytes.slice(raw, at, at + size)
+                at = at + size
+                match decode_binary(element, chunk, settings)
+                    Ok(v)  =>
+                        out = list.concat(out, [v])
+                    Err(f) =>
+                        fault = Some(f)
+        i = i + 1
+    match fault
+        Some(f) => Err(f)
+        None    => Ok(PgArray(element_oid: element, elements: out))
+
+// The text half of `decode`.  A type this package does not name keeps
+// its OID, its format and its bytes as `PgUnknown` — which is what
+// makes an extension's type reachable rather than an error.
+fn decode_text(oid: Int, raw: Bytes, settings: PgTextSettings) -> Result<PgValue, pgerror.PgFault>
+    let text = bytes.to_str(raw)
+    if oid == oid_bool()
+        return decode_bool_text(text)
+    if oid == oid_int2() or oid == oid_int4() or oid == oid_int8()
+        return decode_int_text(oid, text)
+    if oid == oid_float4() or oid == oid_float8()
+        return decode_float_text(oid, text)
+    if oid == oid_numeric()
+        return decode_numeric_text(text)
+    if oid == oid_text() or oid == oid_varchar() or oid == oid_json() or oid == oid_jsonb()
+        return decode_string(raw, oid, settings)
+    if oid == oid_bytea()
+        return decode_bytea_text(text)
+    if element_oid_of(oid) != 0
+        return decode_array_text(oid, text, settings)
+    if oid == oid_date()
+        return decode_date_text(text, settings.date_style)
+    if oid == oid_timestamp()
+        return decode_timestamp_text(text, settings.date_style)
+    if oid == oid_timestamptz()
+        return decode_timestamptz_text(text, settings.date_style)
+    if oid == oid_uuid()
+        return decode_uuid_text(text)
+    Ok(PgUnknown(oid: oid, format: pgmsg.PgText, raw: raw))
+
+// The three one-line wrappers the calendar types need: a text reader
+// answers a calendar value and `decode` answers a `PgValue`.
+fn decode_date_text(text: Str, style: Str) -> Result<PgValue, pgerror.PgFault>
+    let d = parse_date(text, style)!
+    Ok(PgDate(v: d))
+
+fn decode_timestamp_text(text: Str, style: Str) -> Result<PgValue, pgerror.PgFault>
+    let dt = parse_timestamp_text(text, style)!
+    Ok(PgTimestamp(v: dt))
+
+fn decode_timestamptz_text(text: Str, style: Str) -> Result<PgValue, pgerror.PgFault>
+    let dt = parse_timestamptz(text, style)!
+    Ok(PgTimestampTz(v: dt))
+
+// An array in text format: read into `PgArray` when the text is a flat
+// one-dimensional one, and kept whole as `PgUnknown` when it is not.
+fn decode_array_text(oid: Int, text: Str,
+                     settings: PgTextSettings) -> Result<PgValue, pgerror.PgFault>
+    match array_text_elements(text)
+        None           => Ok(PgUnknown(oid: oid, format: pgmsg.PgText, raw: bytes.from_str(text)))
+        Some(elements) => decode_array_elements(oid, elements, settings)
+
+// The binary half of `decode`.  Every fixed-width type checks its
+// length first — see `wrong_len` for what reading past the end would
+// otherwise answer.
+fn decode_binary(oid: Int, raw: Bytes, settings: PgTextSettings) -> Result<PgValue, pgerror.PgFault>
+    if oid == oid_bool()
+        return decode_bool_binary(raw)
+    if oid == oid_int2()
+        return decode_int2_binary(raw)
+    if oid == oid_int4()
+        return decode_int4_binary(raw)
+    if oid == oid_int8()
+        return decode_int8_binary(raw)
+    if oid == oid_float4()
+        return decode_float4_binary(raw)
+    if oid == oid_float8()
+        return decode_float8_binary(raw)
+    if oid == oid_numeric()
+        return decode_numeric_binary(raw)
+    if oid == oid_text() or oid == oid_varchar()
+        return decode_string(raw, oid, settings)
+    if oid == oid_json()
+        return decode_string(raw, oid, settings)
+    if oid == oid_jsonb()
+        return decode_jsonb_binary(raw)
+    if oid == oid_bytea()
+        return Ok(PgBytea(v: raw))
+    if element_oid_of(oid) != 0
+        return decode_array_binary(oid, raw, settings)
+    if oid == oid_date()
+        return decode_date_binary(raw)
+    if oid == oid_timestamp()
+        return decode_timestamp_binary(raw, false)
+    if oid == oid_timestamptz()
+        return decode_timestamp_binary(raw, true)
+    if oid == oid_uuid()
+        return decode_uuid_binary(raw)
+    Ok(PgUnknown(oid: oid, format: pgmsg.PgBinary, raw: raw))
 
 // Decode one column's bytes, given its OID and the format it arrived
 // in.
@@ -309,7 +1365,14 @@ pub fn apply_parameter(s: PgTextSettings, name: Str, value: Str) -> PgTextSettin
 // ```
 pub fn decode(oid: Int, format: pgmsg.PgFormat, raw: Bytes, is_null: Bool,
               settings: PgTextSettings) -> Result<PgValue, pgerror.PgFault>
-    todo("postgres-nv.pgtype.decode")
+    // A NULL is a length of -1 whatever the type and whatever format
+    // was asked for, and it is answered before anything reads the
+    // bytes — there are none to read.
+    if is_null
+        return Ok(PgNull)
+    match format
+        pgmsg.PgText   => decode_text(oid, raw, settings)
+        pgmsg.PgBinary => decode_binary(oid, raw, settings)
 
 // Decode a whole `DataRow` against a `RowDescription`.
 //
@@ -318,9 +1381,352 @@ pub fn decode(oid: Int, format: pgmsg.PgFormat, raw: Bytes, is_null: Bool,
 // them alongside the row.
 pub fn decode_row(columns: [pgmsg.PgColumn], values: [Bytes], nulls: [Bool],
                   settings: PgTextSettings) -> Result<[PgValue], pgerror.PgFault>
-    todo("postgres-nv.pgtype.decode_row")
+    // A row whose value count disagrees with its description is not a
+    // row this decoder can read: answering the columns that happen to
+    // be there would hand back a row the server did not send.
+    if list.len(values) != list.len(columns) or list.len(nulls) != list.len(columns)
+        return Err(pgerror.PgBadParameters(want: list.len(columns), got: list.len(values)))
+    var out: [PgValue] = []
+    var fault: ?pgerror.PgFault = None
+    var i = 0
+    for column in columns
+        // The first refusal is the one reported, and the rest of the
+        // row is still walked: a decoder that stopped would leave the
+        // caller wondering which column it gave up on.
+        if fault == None
+            match decode(column.type_oid, column.format,
+                         list.get(values, i, bytes.zeros(0)),
+                         list.get(nulls, i, false), settings)
+                Ok(v)  =>
+                    out = list.concat(out, [v])
+                Err(f) =>
+                    fault = Some(f)
+        i = i + 1
+    match fault
+        Some(f) => Err(f)
+        None    => Ok(out)
 
 // ── encoding ─────────────────────────────────────────────────────────
+
+// Encoding is the same two questions read the other way, and what it
+// answers is bytes AND a NULL flag — the two things a `Bind` needs and
+// the two things a bare `Bytes` cannot carry.
+
+// A value with no bytes and the NULL flag set: what a `PgNull`
+// parameter is in either format.  It is a length of -1 in the message
+// that carries it and not an empty value.
+fn null_encoded() -> PgEncoded
+    PgEncoded { raw: bytes.zeros(0), is_null: true }
+
+// A value with bytes.
+fn plain(raw: Bytes) -> PgEncoded
+    PgEncoded { raw: raw, is_null: false }
+
+// How a `bool` is spelled on the wire: `t` or `f`.
+fn bool_text(b: Bool) -> Str
+    if b
+        return "t"
+    "f"
+
+// The byte a `bool` is in binary format.
+fn bool_byte(b: Bool) -> Int
+    if b
+        return 1
+    0
+
+// How a `bytea` is spelled in text: `\x` and then lowercase hex, which
+// is what this decoder reads back.
+fn bytea_text(raw: Bytes) -> Str
+    "\\x${bytes.to_hex(raw)}"
+
+// Whether a value is the NULL variant.
+fn is_null_value(v: PgValue) -> Bool
+    match v
+        PgNull => true
+        _      => false
+
+// The text a value has on the wire, as a `Str`: the one rendering, and
+// the one an array's elements are quoted from.
+fn render_text(v: PgValue) -> Str
+    match v
+        // cov: skip — a NULL never reaches this: `text_form` matches it
+        // first and answers bytes and not a rendering; the arm is here
+        // because the match has to be exhaustive over the value set.
+        PgNull               => ""
+        PgBool(b)            => bool_text(b)
+        PgInt(n)             => str.from_int(n)
+        PgFloat(f)           => str.from_float_shortest(f)
+        PgNumericValue(n)    => numeric_text(n)
+        PgStr(s)             => s
+        PgBytea(raw)         => bytea_text(raw)
+        PgDate(d)            => iso_date(d)
+        PgTimestamp(t)       => iso_timestamp(t, false)
+        PgTimestampTz(t)     => iso_timestamp(t, true)
+        PgUuid(raw)          => uuid_text(raw)
+        PgJson(s)            => s
+        PgArray(element, xs) => array_text(element, xs)
+        // A type this package does not name was read as bytes and is
+        // written back as the same bytes; a caller that has the format
+        // is the one that knows what they mean.
+        PgUnknown(_, _, raw) => bytes.to_str(raw)
+
+// A `uuid` parameter: sixteen bytes, and the same sixteen either way,
+// because the text rendering is the canonical form of exactly those
+// bytes.  A value that is not sixteen bytes is refused rather than
+// padded or cut into one.
+fn uuid_encoded(raw: Bytes, as_text: Bool) -> Result<PgEncoded, pgerror.PgFault>
+    if bytes.len(raw) != 16
+        return Err(pgerror.PgBadMessage(kind: 0, length: bytes.len(raw),
+            detail: "a uuid is sixteen bytes and this value is ${bytes.len(raw)}"))
+    if as_text
+        return Ok(plain(bytes.from_str(uuid_text(raw))))
+    Ok(plain(raw))
+
+// The text form of a value: the two cases that are not a rendering are
+// a NULL, which has no bytes, and a `uuid`, whose length is checked.
+fn text_form(v: PgValue) -> Result<PgEncoded, pgerror.PgFault>
+    match v
+        // cov: skip — `encode` answers a NULL before it comes here, so
+        // this arm is the exhaustive match's and not a reached path; a
+        // NULL rendered instead would be an empty string on the wire
+        // and a row the server reads as a value.
+        PgNull      => Ok(null_encoded())
+        PgUuid(raw) => uuid_encoded(raw, true)
+        _           => Ok(plain(bytes.from_str(render_text(v))))
+
+// A one-dimensional array in text format: the elements between braces,
+// separated by commas, with the ones that need it quoted.
+fn array_text(element: Int, elements: [PgValue]) -> Str
+    var out = ""
+    var first = true
+    for e in elements
+        if not first
+            out = "${out},"
+        first = false
+        out = "${out}${array_element(e)}"
+    "{${out}}"
+
+// One element, `NULL` for a null and quoted when it has to be.
+fn array_element(v: PgValue) -> Str
+    match v
+        PgNull => "NULL"
+        _      => quote_element(render_text(v))
+
+// One element with the quotes PostgreSQL would put around it: an empty
+// value, the word `NULL`, or anything holding a character that would
+// otherwise end the element early.
+fn quote_element(s: Str) -> Str
+    if needs_quotes(s)
+        return "\"${escape_element(s)}\""
+    s
+
+// Whether an element needs quoting.  One quirk worth naming: PostgreSQL
+// quotes a value holding whitespace ANYWHERE, which is more than the
+// text format strictly needs and is what this module's reader expects.
+fn needs_quotes(s: Str) -> Bool
+    if s == ""
+        return true
+    if str.upper(s) == "NULL"
+        return true
+    str.contains(s, "{") or str.contains(s, "}") or str.contains(s, ",")
+        or str.contains(s, "\"") or str.contains(s, "\\") or str.contains(s, " ")
+        or str.contains(s, "\t") or str.contains(s, "\n")
+
+// A quoted element's body: a quote or a backslash takes a backslash of
+// its own, which is what the reader undoes.
+fn escape_element(s: Str) -> Str
+    str.replace_all(str.replace_all(s, "\\", "\\\\"), "\"", "\\\"")
+
+// 0x4000 marks a negative `numeric` on the wire and 0 marks a positive
+// one.  `bytes.u16_be` writes the low sixteen bits, so a weight or a
+// scale a wire int16 cannot hold goes out as the bits it would be — a
+// message the server refuses, rather than one this end silently
+// renumbers.
+fn sign_word(n: PgNumeric) -> Int
+    if n.negative
+        return 16384
+    0
+
+// A `numeric` in binary format: four int16s and then the digits, the
+// inverse of the reader.  A NaN carries no digits and the sign word
+// that is not a number.
+fn numeric_binary(n: PgNumeric) -> Bytes
+    if n.is_nan
+        return bytes.concat([bytes.u16_be(0), bytes.u16_be(0),
+                             bytes.u16_be(49152), bytes.u16_be(0)])
+    var body = bytes.concat([bytes.u16_be(list.len(n.digits)), bytes.u16_be(n.weight),
+                             bytes.u16_be(sign_word(n)), bytes.u16_be(n.scale)])
+    for d in n.digits
+        body = bytes.concat([body, bytes.u16_be(d)])
+    body
+
+// A binary32's bits read back out of a binary64 that a binary32
+// widened to, or `None` for a value no binary32 widens to.
+//
+// The inverse of `widen_float4`, and it refuses more than it converts:
+// a value between two binary32s — 0.1, say — has no bits here, because
+// answering the nearest one is a rounding rule and a number the caller
+// did not write.  The subnormal band is checked by reconstructing the
+// binary32 and widening it again, so the answer is the one the forward
+// map agrees with rather than one this function hopes for.
+fn narrow_float4(f: Float) -> ?Int
+    let raw = float.to_bits(f)
+    let sign = bits.shl(bits.band(bits.shr(raw, 63), 1), 31)
+    let exponent = bits.band(bits.shr(raw, 52), 2047)
+    let fraction = bits.band(raw, 4503599627370495)
+    if exponent == 2047
+        if fraction == 0
+            return Some(bits.bor(sign, 2139095040))
+        // A NaN stays a NaN.  A payload that does not fit the narrower
+        // mantissa becomes the canonical quiet one, which is a NaN and
+        // not a different number.
+        return Some(bits.bor(sign, 2143289344))
+    if exponent == 0
+        if fraction == 0
+            return Some(sign)
+        return None
+    if exponent > 896
+        if exponent > 1150 or bits.band(fraction, 536870911) != 0
+            return None
+        return Some(bits.bor(bits.bor(sign, bits.shl(exponent - 896, 23)),
+                             bits.shr(fraction, 29)))
+    // The subnormal band: the widening normalised the fraction, so the
+    // inverse is the multiplication the forward map is.  `fraction32`
+    // is below 2^23 and the product is an integer, so the double
+    // multiplication is exact.
+    //
+    // An exact power of two in this band arrives with a ZERO binary64
+    // fraction — 2^-149 is the binary32 0x00000001 — so the check
+    // cannot ask the fraction to be non-zero: the round trip below it
+    // is what says whether the value is representable, and it answers
+    // `Some(1)` for 2^-149 while still refusing everything between two
+    // binary32s.
+    if exponent > 873
+        let smallest = float.from_bits(bits.shl(1172, 52))
+        let fraction32 = float.to_int(f * smallest)
+        if fraction32 > 0 and widen_float4(fraction32) == f
+            return Some(bits.bor(sign, fraction32))
+    None
+
+// The refusal a `float4[]` gets for an element no binary32 widens to:
+// the array's element is four bytes and this package carries every
+// float as a binary64, so the widening has to be undone and cannot be
+// undone for every value.
+fn float4_fault(f: Float) -> pgerror.PgFault
+    pgerror.PgBadMessage(kind: 0, length: 4,
+        detail: "a float4 array carries four-byte elements and ${str.from_float_shortest(f)} is not a value a float4 widens to — ask for float8[] or for text format")
+
+// An `Int`'s bytes at the width the array's element OID names, which is
+// not the width an `Int` binds as on its own.
+fn int_word(n: Int, element: Int) -> Bytes
+    if element == oid_int2()
+        return bytes.u16_be(n)
+    if element == oid_int4()
+        return bytes.u32_be(n)
+    bytes.u64_be(n)
+
+// The binary bytes of one array element, in the ARRAY's element type
+// rather than in the value's own.
+//
+// `int4[]` carries four bytes an element whatever an `Int` binds as on
+// its own, and a server reading eight would take the tail of one
+// element for the head of the next; a `jsonb[]` element carries the
+// version byte a lone `json` does not; a `uuid[]` element is the
+// sixteen bytes.  Every other element type is written the way its
+// value is written on its own, which is right for `text[]`, `bytea[]`
+// and the timestamps.
+fn element_bytes(element: Int, v: PgValue) -> Result<Bytes, pgerror.PgFault>
+    if element == oid_int2() or element == oid_int4() or element == oid_int8()
+        match v
+            PgInt(n) =>
+                return Ok(int_word(n, element))
+            _        =>
+                return binary_bytes(v)
+    if element == oid_float4()
+        match v
+            PgFloat(f) =>
+                match narrow_float4(f)
+                    Some(pattern) =>
+                        return Ok(bytes.u32_be(pattern))
+                    None          =>
+                        return Err(float4_fault(f))
+            _          =>
+                return binary_bytes(v)
+    if element == oid_jsonb()
+        match v
+            PgJson(s) =>
+                return Ok(bytes.concat([bytes.u8(1), bytes.from_str(s)]))
+            _         =>
+                return binary_bytes(v)
+    if element == oid_uuid()
+        match v
+            PgUuid(raw) =>
+                return Ok(uuid_bytes(raw))
+            _           =>
+                return binary_bytes(v)
+    binary_bytes(v)
+
+// The binary bytes of one value, with no NULL flag: an array's elements
+// are length-prefixed values whose NULLness is the length and not a
+// flag beside them.
+fn binary_bytes(v: PgValue) -> Result<Bytes, pgerror.PgFault>
+    match v
+        // cov: skip — reached only for an array element, and
+        // `array_binary` writes a NULL as a length of -1 before this is
+        // called; the arm keeps the match exhaustive.
+        PgNull               => Ok(bytes.zeros(0))
+        PgBool(b)            => Ok(bytes.u8(bool_byte(b)))
+        PgInt(n)             => Ok(bytes.u64_be(n))
+        PgFloat(f)           => Ok(bytes.u64_be(float.to_bits(f)))
+        PgNumericValue(n)    => Ok(numeric_binary(n))
+        PgStr(s)             => Ok(bytes.from_str(s))
+        PgBytea(raw)         => Ok(bytes.clone(raw))
+        PgDate(d)            => Ok(bytes.u32_be(civil.epoch_day(d) - postgres_epoch_day()))
+        PgTimestamp(t)       => Ok(bytes.u64_be(microseconds(t)))
+        PgTimestampTz(t)     => Ok(bytes.u64_be(microseconds(t)))
+        PgUuid(raw)          => Ok(bytes.clone(raw))
+        PgJson(s)            => Ok(bytes.from_str(s))
+        PgArray(element, xs) => array_binary(element, xs)
+        PgUnknown(_, _, raw) => Ok(bytes.clone(raw))
+
+// The binary form of a value: the two cases that are not a rendering are
+// a NULL, which has no bytes, and a `uuid`, whose length is checked.
+fn binary_form(v: PgValue) -> Result<PgEncoded, pgerror.PgFault>
+    match v
+        // cov: skip — `encode` answers a NULL before it comes here; see
+        // `text_form`'s arm, which is the same one on the other format.
+        PgNull      => Ok(null_encoded())
+        PgUuid(raw) => uuid_encoded(raw, false)
+        _           =>
+            let raw = binary_bytes(v)!
+            Ok(plain(raw))
+
+// 1 when any element of an array is NULL and 0 otherwise, which is the
+// flag the array's header carries — the wire says once whether the
+// reader has to look, rather than making it look.
+fn has_nulls(elements: [PgValue]) -> Int
+    for e in elements
+        if is_null_value(e)
+            return 1
+    0
+
+// A one-dimensional array in binary format, the inverse of the reader:
+// the dimension count, the NULL flag, the element OID, the one
+// dimension header, and then each element as a length and its bytes.
+fn array_binary(element: Int, elements: [PgValue]) -> Result<Bytes, pgerror.PgFault>
+    var body = bytes.concat([bytes.u32_be(1), bytes.u32_be(has_nulls(elements)),
+                             bytes.u32_be(element), bytes.u32_be(list.len(elements)),
+                             bytes.u32_be(1)])
+    for e in elements
+        if is_null_value(e)
+            body = bytes.concat([body, bytes.u32_be(-1)])
+        else
+            match element_bytes(element, e)
+                Ok(raw) =>
+                    body = bytes.concat([body, bytes.u32_be(bytes.len(raw)), raw])
+                Err(f)  =>
+                    return Err(f)
+    Ok(body)
 
 // Encode a value for a `Bind`, in the format asked for.
 //
@@ -342,7 +1748,12 @@ pub struct PgEncoded
 //         Err(_) => println("could not encode")
 // ```
 pub fn encode(v: PgValue, format: pgmsg.PgFormat) -> Result<PgEncoded, pgerror.PgFault>
-    todo("postgres-nv.pgtype.encode")
+    match v
+        PgNull => Ok(null_encoded())
+        _      =>
+            match format
+                pgmsg.PgText   => text_form(v)
+                pgmsg.PgBinary => binary_form(v)
 
 // The OID a value binds as when the caller names none.
 //
@@ -353,7 +1764,25 @@ pub fn encode(v: PgValue, format: pgmsg.PgFormat) -> Result<PgEncoded, pgerror.P
 // and in a `WHERE a = $1 OR b = $1` it infers once.  This function is
 // what a caller uses to be explicit instead.
 pub fn oid_for(v: PgValue) -> Int
-    todo("postgres-nv.pgtype.oid_for")
+    match v
+        PgNull               => 0
+        PgBool(_)            => oid_bool()
+        // An `Int` has no width of its own here, so it binds as the
+        // one that holds every value this package can carry.
+        PgInt(_)             => oid_int8()
+        PgFloat(_)           => oid_float8()
+        PgNumericValue(_)    => oid_numeric()
+        PgStr(_)             => oid_text()
+        PgBytea(_)           => oid_bytea()
+        PgDate(_)            => oid_date()
+        PgTimestamp(_)       => oid_timestamp()
+        PgTimestampTz(_)     => oid_timestamptz()
+        PgUuid(_)            => oid_uuid()
+        PgJson(_)            => oid_json()
+        PgArray(element, _)  => array_oid_of(element)
+        // A type this package does not name binds as itself, which is
+        // the whole point of carrying its OID.
+        PgUnknown(oid, _, _) => oid
 
 // ── the two conversions a caller reaches for ─────────────────────────
 
@@ -373,7 +1802,11 @@ pub fn oid_for(v: PgValue) -> Int
 //     println(pgtype.uuid_text(bytes.zeros(16)))
 // ```
 pub fn uuid_text(raw: Bytes) -> Str
-    todo("postgres-nv.pgtype.uuid_text")
+    // The hex of the sixteen bytes, cut 8-4-4-4-12: thirty-six
+    // characters, which is what every other renderer of a UUID writes
+    // and what a caller pastes into a `WHERE` clause.
+    let hex = bytes.to_hex(uuid_bytes(raw))
+    "${str.slice(hex, 0, 8)}-${str.slice(hex, 8, 12)}-${str.slice(hex, 12, 16)}-${str.slice(hex, 16, 20)}-${str.slice(hex, 20, 32)}"
 
 // A `numeric` as a `Float`, having decided to lose the precision.
 //
@@ -387,14 +1820,39 @@ pub fn uuid_text(raw: Bytes) -> Str
 //     println("${pgtype.numeric_to_float(pgtype.numeric([], 0, false, 0))}")
 // ```
 pub fn numeric_to_float(n: PgNumeric) -> Float
-    todo("postgres-nv.pgtype.numeric_to_float")
+    if n.is_nan
+        return math.nan()
+    // Horner over the base-10000 digits, which is exact in binary64
+    // until the digits outgrow its 53 bits — that is the loss this
+    // function exists to make a caller write down.
+    var acc = 0.0
+    for d in n.digits
+        acc = acc * 10000.0 + int.to_float(d)
+    let k = list.len(n.digits)
+    // The first digit stands for 10000^weight, so the accumulator is
+    // that many powers of 10000 too big — or too small, when the value
+    // has no integer part at all.
+    let shift = n.weight - k + 1
+    var scaled = acc
+    if shift != 0
+        scaled = acc * math.pow(10000.0, int.to_float(shift))
+    if n.negative
+        return 0.0 - scaled
+    scaled
 
 // A `numeric` rendered exactly, as PostgreSQL's own text output
 // writes it.
 //
 // The lossless reading, and the one to use for money.
 pub fn numeric_text(n: PgNumeric) -> Str
-    todo("postgres-nv.pgtype.numeric_text")
+    if n.is_nan
+        return "NaN"
+    let body = numeric_body(n)
+    // A negative zero is written without its sign, which is what the
+    // server's own `numeric_out` does.
+    if n.negative and not numeric_is_zero(n)
+        return "-${body}"
+    body
 
 // One line rendering a value, for a report a person reads.
 //
@@ -402,4 +1860,10 @@ pub fn numeric_text(n: PgNumeric) -> Str
 // count, because a function that produced SQL would be one a caller
 // pastes into a query.
 pub fn show(v: PgValue) -> Str
-    todo("postgres-nv.pgtype.show")
+    match v
+        PgNull                      => "NULL"
+        PgBool(b)                   => bool_word(b)
+        PgBytea(raw)                => bytea_count(raw)
+        PgArray(_, xs)              => show_array(xs)
+        PgUnknown(oid, format, raw) => unknown_text(oid, format, raw)
+        _                           => render_text(v)

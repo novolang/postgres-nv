@@ -1,0 +1,282 @@
+// pgauth_vectors_tests.nv — the published values, not just the shapes.
+//
+// The shipped suite asserts that the salted password is thirty-two
+// bytes and that the proof differs from the signature.  Both are true
+// of every wrong implementation too.  These tests assert the VALUES:
+// RFC 7677 § 3's own SaltedPassword, ClientProof and ServerSignature,
+// reproduced byte for byte, and the PostgreSQL-form exchange beside
+// them with values computed independently.
+//
+// THE TWO THINGS THIS EXISTS TO CATCH.  A SCRAM implementation that is
+// wrong fails to log in, and every wrong one fails to log in
+// identically — so nothing short of the published vector says which
+// step is wrong.  And the auth message is assembled from what the
+// server SENT, not from the fields a parser read back out: a client
+// that re-renders `i=04096` as `i=4096` agrees with itself and with no
+// one else.
+
+use std.test
+use std.bytes
+use pgauth
+
+// RFC 7677 § 3's client nonce.
+fn rfc_nonce() -> Str
+    "rOprNGfwEbeRWgbNEkqO"
+
+// RFC 7677 § 3's server-first message, verbatim.
+fn rfc_server_first() -> Str
+    "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF\$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+
+// The nonce the server answered with, which is the client's plus twelve
+// bytes the client has never seen.
+fn rfc_full_nonce() -> Str
+    "rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF\$k0"
+
+// The salt the RFC names, base64-decoded, in hex.
+fn rfc_salt_hex() -> Str
+    "5b6d99689d12358eeca04b141236fa81"
+
+// RFC 7677 § 3's SaltedPassword — Hi("pencil", salt, 4096).
+fn rfc_salted_hex() -> Str
+    "c4a49510323ab4f952cac1fa99441939e78ea74d6be81ddf7096e87513dc615d"
+
+// The RFC's own password.
+fn rfc_password() -> Str
+    "pencil"
+
+// The RFC's auth message, rebuilt from its parts.  Its client-first-bare
+// carries `n=user`; PostgreSQL's carries `n=`, which is why the exchange
+// below produces a different proof over the same salt.
+fn rfc_auth_message() -> Str
+    "n=user,r=${rfc_nonce()},${rfc_server_first()},c=biws,r=${rfc_full_nonce()}"
+
+// A server-first message naming `n` as the full nonce, so a test can
+// control the nonce and nothing else.
+fn server_first_with_nonce(n: Str) -> Str
+    "r=${n},s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+
+// The client-final message the PostgreSQL-form exchange produces, as
+// text, or `None` where a step refused.  The `match` is bound and then
+// answered rather than left as the tail expression: see the CHANGELOG's
+// `### Known` and the tracker's memory-perceus filing.
+fn client_final_text(mechanism: Str, binding: pgauth.PgChannelBinding) -> ?Str
+    let started = pgauth.begin(mechanism, rfc_nonce(), binding)
+    match started
+        Err(_) => None
+        Ok(s)  =>
+            match pgauth.server_first(s, bytes.from_str(rfc_server_first()),
+                                      rfc_password(), pgauth.min_iterations())
+                Err(_) => None
+                Ok(s2) =>
+                    match pgauth.client_final(s2)
+                        Err(_) => None
+                        Ok(b)  => Some(bytes.to_str(b))
+
+// The server signature the PostgreSQL-form exchange expects, in base64.
+fn pg_server_signature() -> Str
+    "3HO6Qt1M4MKJrmlKaoOqLAI0/0TV0HZe7J9H3MBtSOg="
+
+// Whether a server-first message is refused, and nothing more: an arm
+// answering `Some(call)` beside an arm answering `None` inside a
+// `let`-bound match is an internal compiler error when the error type
+// is declared in another file — see
+// `typecheck/a-let-bound-match-answering-some-method-and-none-ices-across-a-file`
+// in the tracker, and the `### Known` bullet in the CHANGELOG.  A
+// `Bool` is both the smaller answer and the one that does not need the
+// workaround.
+fn refused(text: Str) -> Bool
+    let started = pgauth.begin("SCRAM-SHA-256", rfc_nonce(), pgauth.PgBindingNone)
+    match started
+        Err(_) => true
+        Ok(s)  =>
+            match pgauth.server_first(s, bytes.from_str(text), rfc_password(),
+                                      pgauth.min_iterations())
+                Ok(_)  => false
+                Err(_) => true
+
+// Whether the RFC's server-first message is refused when the caller
+// asks for `floor` iterations.
+fn refused_below_floor(floor: Int) -> Bool
+    let started = pgauth.begin("SCRAM-SHA-256", rfc_nonce(), pgauth.PgBindingNone)
+    match started
+        Err(_) => true
+        Ok(s)  =>
+            match pgauth.server_first(s, bytes.from_str(rfc_server_first()),
+                                      rfc_password(), floor)
+                Ok(_)  => false
+                Err(_) => true
+
+@test
+fn test_the_published_salted_password_client_proof_and_server_signature() [io]
+    // THE VECTOR.  Every value here is printed in RFC 7677 § 3, and a
+    // test that could only check the handshake as a whole would answer
+    // "it failed" when this, the expensive step, is what is wrong.
+    let salt = bytes.from_hex(rfc_salt_hex()) ?? bytes.zeros(16)
+    let salted = pgauth.salted_password(rfc_password(), salt, 4096)
+
+    test.case("Hi(password, salt, 4096) is the RFC's SaltedPassword")
+    test.assert_eq_str(bytes.to_hex(salted), rfc_salted_hex())
+
+    test.case("the client proof is the RFC's, over the RFC's auth message")
+    test.assert_eq_str(bytes.to_base64(pgauth.client_proof(salted, rfc_auth_message())),
+                       "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=")
+
+    test.case("and so is the server signature")
+    test.assert_eq_str(bytes.to_base64(pgauth.server_signature(salted, rfc_auth_message())),
+                       "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
+
+    test.case("the iteration count is the RFC's, so the loop really runs")
+    let once = pgauth.salted_password(rfc_password(), salt, 1)
+    test.assert_ne(bytes.to_hex(once), rfc_salted_hex())
+
+@test
+fn test_the_postgresql_form_exchange_is_right_byte_for_byte() [io]
+    // PostgreSQL's client-first-bare is `n=,r=<nonce>` — no user, which
+    // the server already has from the startup packet.  Same salt, same
+    // count, different auth message, therefore a different proof.
+    test.case("the client-first message is `n,,n=,r=<nonce>`")
+    let text = client_final_text("SCRAM-SHA-256", pgauth.PgBindingNone) ?? ""
+    test.assert(str.starts_with(text, "c=biws,r=${rfc_full_nonce()},p="))
+
+    test.case("and the proof is the one the PostgreSQL form computes")
+    test.assert_eq_str(text,
+                       "c=biws,r=${rfc_full_nonce()},p=qvT2SWdEH5Q06albL+hjSYuUhCG7VndFyzIb7CK4n9k=")
+
+    test.case("so the RFC's v= does NOT verify against it — the proof is over the bare message")
+    let started = pgauth.begin("SCRAM-SHA-256", rfc_nonce(), pgauth.PgBindingNone)
+    match started
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            match pgauth.server_first(s, bytes.from_str(rfc_server_first()),
+                                      rfc_password(), pgauth.min_iterations())
+                Err(_) => test.assert(false)
+                Ok(s2) =>
+                    test.assert_none(pgauth.verify_server(s2, bytes.from_str("v=${pg_server_signature()}")))
+                    test.assert_some(pgauth.verify_server(s2, bytes.from_str("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")))
+
+@test
+fn test_the_auth_message_is_the_received_text_not_a_rendering() [io]
+    // `i=04096` is the same count as `i=4096` and a different auth
+    // message.  A client that parses the count and re-renders it signs
+    // over bytes the server never sent, and the server's check fails —
+    // so this is not pedantry, it is the difference between logging in
+    // and not.
+    let text = "r=${rfc_full_nonce()},s=W22ZaJ0SNY7soEsUEjb6gQ==,i=04096"
+    let started = pgauth.begin("SCRAM-SHA-256", rfc_nonce(), pgauth.PgBindingNone)
+    match started
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            match pgauth.server_first(s, bytes.from_str(text), rfc_password(),
+                                      pgauth.min_iterations())
+                Err(_) => test.assert(false)
+                Ok(s2) =>
+                    test.case("the count is read")
+                    test.assert_eq(s2.iterations, 4096)
+                    test.case("and the message it signs over keeps the leading zero")
+                    let final = match pgauth.client_final(s2)
+                        Ok(b)  => b
+                        Err(_) => bytes.zeros(0)
+                    test.assert_eq_str(bytes.to_str(final),
+                                       "c=biws,r=${rfc_full_nonce()},p=x/WIEBvP4Xy99SDypCRnwslJErL3MXkwY1riPwGQFBE=")
+
+@test
+fn test_the_channel_binding_is_inside_the_auth_message() [io]
+    // The point of channel binding is that a relay on another TLS
+    // connection cannot verify.  That only works if the binding is in
+    // the bytes signed over — a c= field that is sent but not signed is
+    // decoration.
+    let cert_hash = bytes.from_hex("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20") ?? bytes.zeros(32)
+    let plus = client_final_text("SCRAM-SHA-256-PLUS", pgauth.PgBindingEndPoint(hash: cert_hash)) ?? ""
+
+    test.case("the c= field is base64 of the gs2 header and the certificate hash")
+    test.assert(str.starts_with(plus,
+        "c=cD10bHMtc2VydmVyLWVuZC1wb2ludCwsAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=,r=${rfc_full_nonce()},p="))
+
+    test.case("and the proof is over it, so it is not the unbound proof")
+    test.assert_ne(plus,
+                   client_final_text("SCRAM-SHA-256", pgauth.PgBindingNone) ?? "")
+
+    test.case("with no binding the c= field is the empty gs2 header")
+    test.assert(str.starts_with(client_final_text("SCRAM-SHA-256", pgauth.PgBindingNone) ?? "",
+                                "c=biws,"))
+
+    test.case("and PLUS without something to bind to is refused rather than downgraded")
+    match pgauth.choose_mechanism(["SCRAM-SHA-256-PLUS"], pgauth.PgBindingNone)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+    match pgauth.begin("SCRAM-SHA-256-PLUS", rfc_nonce(), pgauth.PgBindingNone)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_server_nonce_must_extend_the_client_s() [io]
+    // The extension is the replay defence: a server that answers the
+    // client's nonce unchanged could have answered a recorded exchange.
+    test.case("a nonce that is not the client's is refused")
+    test.assert(refused(server_first_with_nonce("somethingElse")))
+
+    test.case("and the client's own nonce, unextended, is refused")
+    test.assert(refused(server_first_with_nonce(rfc_nonce())))
+
+    test.case("while a real extension is taken")
+    test.assert_false(refused(rfc_server_first()), "the RFC's message must be taken")
+
+    test.case("the fields must be in RFC 5802's order")
+    test.assert(refused("s=W22ZaJ0SNY7soEsUEjb6gQ==,r=${rfc_full_nonce()},i=4096"))
+
+    test.case("a count that is not a number is refused")
+    test.assert(refused("r=${rfc_full_nonce()},s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096x"))
+
+    test.case("and a salt that is not base64 is refused")
+    test.assert(refused("r=${rfc_full_nonce()},s=@@@,i=4096"))
+
+@test
+fn test_the_iteration_floor_is_a_floor_and_the_caller_may_raise_it() [io]
+    // PostgreSQL's default is the floor; a caller with a stricter
+    // policy passes a higher one, and a server below THAT is refused.
+    test.case("the RFC's 4096 is accepted at the floor")
+    test.assert_false(refused_below_floor(4096), "4096 is the floor")
+
+    test.case("and refused when the caller asks for more")
+    test.assert_true(refused_below_floor(8192), "8192 is above the server's count")
+
+@test
+fn test_the_server_s_own_error_is_carried_rather_than_swallowed() [io]
+    // `e=` is the server saying why it gave up, and the text is the
+    // only thing that says which of "wrong password", "unknown user"
+    // and "bad nonce" happened.
+    let started = pgauth.begin("SCRAM-SHA-256", rfc_nonce(), pgauth.PgBindingNone)
+    match started
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            match pgauth.server_first(s, bytes.from_str(rfc_server_first()),
+                                      rfc_password(), pgauth.min_iterations())
+                Err(_) => test.assert(false)
+                Ok(s2) =>
+                    match pgauth.verify_server(s2, bytes.from_str("e=invalid-proof"))
+                        None    => test.assert(false)
+                        Some(f) =>
+                            test.assert(str.contains(f.message(), "invalid-proof"))
+
+@test
+fn test_the_older_exchanges_are_exact_and_not_merely_non_empty() [io]
+    // `md5` + hex(MD5(hex(MD5(password + user)) + salt)), computed
+    // independently.  The inner digest covers the user as well as the
+    // password, which is the part an implementation gets wrong.
+    test.case("the md5 answer for an all-zero salt")
+    test.assert_eq_str(pgauth.md5_password("secret", "postgres", bytes.zeros(4)),
+                       "md5eea2fad304dfff79889309d8f06aaaa2")
+
+    test.case("and for a real one")
+    test.assert_eq_str(pgauth.md5_password("secret", "postgres",
+                                           bytes.from_hex("01020304") ?? bytes.zeros(4)),
+                       "md5bb41a296aab6baccb36ff243a562abff")
+
+    test.case("the user is inside the digest, so a different one is a different answer")
+    test.assert_ne(pgauth.md5_password("secret", "postgres", bytes.zeros(4)),
+                   pgauth.md5_password("secret", "other", bytes.zeros(4)))
+
+    test.case("cleartext is the password and a NUL, and the NUL is the protocol's")
+    let clear = pgauth.cleartext_password("secret")
+    test.assert_eq(bytes.len(clear), 7)
+    test.assert_eq(bytes.byte_at(clear, 6) ?? 1, 0)

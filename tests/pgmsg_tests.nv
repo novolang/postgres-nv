@@ -1,10 +1,6 @@
 // pgmsg_tests.nv — the framing, and the one rule a pipelining client
 // gets wrong.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: postgres-nv.<module>.<fn>`.
-// That is the expected result until the bodies land.
-//
 // THE VECTORS ARE THE PROTOCOL'S OWN CONSTANTS.  196608 is protocol
 // 3.0 as the startup packet spells it; 80877103 and 80877102 are the
 // SSLRequest and CancelRequest codes; they are in PostgreSQL's own
@@ -71,10 +67,10 @@ fn test_only_ready_for_query_ends_an_exchange() [io]
     test.assert(pgmsg.ends_exchange(pgmsg.PgReadyForQuery(status: pgmsg.PgIdle)))
 
     test.case("CommandComplete does not")
-    test.assert(pgmsg.ends_exchange(pgmsg.PgCommandComplete(tag: "SELECT 1")) == false)
+    test.assert(not pgmsg.ends_exchange(pgmsg.PgCommandComplete(tag: "SELECT 1")))
 
     test.case("and neither does an error")
-    test.assert(pgmsg.ends_exchange(pgmsg.PgErrorResponse(fields: pgerror.fields_new())) == false)
+    test.assert(not pgmsg.ends_exchange(pgmsg.PgErrorResponse(fields: pgerror.fields_new())))
 
     test.case("the status travels with it and nowhere else")
     test.assert_some(pgmsg.tx_status(pgmsg.PgReadyForQuery(status: pgmsg.PgInFailedTransaction)))
@@ -90,11 +86,11 @@ fn test_an_error_makes_the_server_discard_until_sync() [io]
     test.assert(pgmsg.discards_until_sync(pgmsg.PgErrorResponse(fields: pgerror.fields_new())))
 
     test.case("a notice does not — it is not an error")
-    test.assert(pgmsg.discards_until_sync(pgmsg.PgNoticeResponse(fields: pgerror.fields_new())) == false)
+    test.assert(not pgmsg.discards_until_sync(pgmsg.PgNoticeResponse(fields: pgerror.fields_new())))
 
     test.case("and nothing else does either")
-    test.assert(pgmsg.discards_until_sync(pgmsg.PgBindComplete) == false)
-    test.assert(pgmsg.discards_until_sync(pgmsg.PgPortalSuspended) == false)
+    test.assert(not pgmsg.discards_until_sync(pgmsg.PgBindComplete))
+    test.assert(not pgmsg.discards_until_sync(pgmsg.PgPortalSuspended))
 
 @test
 fn test_three_messages_belong_to_no_exchange_at_all() [io]
@@ -112,7 +108,7 @@ fn test_three_messages_belong_to_no_exchange_at_all() [io]
     test.assert(pgmsg.is_asynchronous(pgmsg.PgNotification(process_id: 7, channel: "c", payload: "")))
 
     test.case("a DataRow is not")
-    test.assert(pgmsg.is_asynchronous(pgmsg.PgDataRow(values: [], nulls: [])) == false)
+    test.assert(not pgmsg.is_asynchronous(pgmsg.PgDataRow(values: [], nulls: [])))
 
 @test
 fn test_the_command_tag_is_not_uniform_and_insert_is_the_exception() [io]

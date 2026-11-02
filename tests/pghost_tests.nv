@@ -2,16 +2,10 @@
 // them a test can assert without a server: the policies and the
 // refusals.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: postgres-nv.<module>.<fn>`.
-// That is the expected result until the bodies land.
-//
-// WHAT IS ASSERTABLE HERE, AND WHAT IS NOT.  `pgconn`, `pgquery`,
-// `pgcopy`, `pgpool` and `pgdriver` need a PostgreSQL server, and the
-// implementation lane's own gate is a real one — `initdb`, a socket, a
-// corpus of statements, and the same queries through `psql` for
-// comparison.  What can be asserted with no server is everything the
-// design put into a VALUE rather than into an exchange:
+// WHAT IS ASSERTED HERE, AND WHAT IS NOT.  This file is the halves of
+// `pgconn`, `pgquery`, `pgcopy`, `pgpool` and `pgdriver` that are
+// VALUES rather than exchanges, so that they can be checked with no
+// server on the machine:
 //
 //   * the pool's policy — a limit, a wait, an idle age — because
 //     `acquire` and `release` take the clock reading as an ARGUMENT,
@@ -20,6 +14,14 @@
 //     bytes and the trailer is the part a writer forgets;
 //   * every `[net]` entry point against a port nothing is listening
 //     on, which asserts the refusal rather than the success.
+//
+// THE EXCHANGES ARE IN `pgwire_server_tests.nv`, which serves the
+// protocol from a loopback socket this repository scripts itself.
+// What neither file can say is anything about a REAL PostgreSQL — the
+// server's own behaviour, its error text, its type output — and no
+// server was reachable where this was written: no `pg_isready`, no
+// `/var/run/postgresql`, port 5432 refused, and no `postgres`,
+// `psql` or `initdb` on the machine.  The README says the same.
 
 use std.test
 use std.bytes
@@ -55,7 +57,7 @@ fn test_the_defaults_are_readable_in_one_place() [io]
     test.case("cleartext over an unencrypted socket is NOT allowed by default")
     // The alternative is sending the password in the clear because a
     // server asked for it.
-    test.assert(o.allow_cleartext == false)
+    test.assert(not o.allow_cleartext)
 
     test.case("and the message ceiling is the caller's, not the wire's")
     test.assert(o.max_message_bytes > 0)
@@ -68,8 +70,8 @@ fn test_a_unix_socket_is_recognised_by_its_path() [io]
     test.assert(pgconn.is_unix_socket("/var/run/postgresql"))
 
     test.case("a host name is not")
-    test.assert(pgconn.is_unix_socket("db.internal") == false)
-    test.assert(pgconn.is_unix_socket("127.0.0.1") == false)
+    test.assert(not pgconn.is_unix_socket("db.internal"))
+    test.assert(not pgconn.is_unix_socket("127.0.0.1"))
 
 @test
 fn test_the_five_ssl_modes_are_five_different_promises() [io]
@@ -83,7 +85,7 @@ fn test_the_five_ssl_modes_are_five_different_promises() [io]
 
     test.case("and the negotiation is a separate step, for TLS to fit between")
     match pgconn.negotiate_tls(0, t, pgconn.PgSslDisable)
-        Ok(b)  => test.assert(b == false)
+        Ok(b)  => test.assert(not b)
         Err(_) => test.assert(true)
 
 @test
@@ -143,7 +145,7 @@ fn test_a_pool_is_a_value_and_its_clock_is_the_caller_s() [io, net, time]
     test.assert(s.timeouts_total == 0)
 
     test.case("and an empty pool has nothing to lend without opening")
-    test.assert(pgpool.has_idle(pool, 0) == false)
+    test.assert(not pgpool.has_idle(pool, 0))
 
     test.case("acquiring from a pool with nothing to connect to refuses")
     match pgpool.acquire(pool, 0)
@@ -260,7 +262,7 @@ fn test_the_query_surface_is_named_where_a_caller_would_reach_it() [io, net, tim
             match pgquery.begin(c, pgquery.PgSerializable, false)
                 Err(_) => test.assert(true)
                 Ok(c2) =>
-                    test.assert(pgquery.in_failed_transaction(c2) == false)
+                    test.assert(not pgquery.in_failed_transaction(c2))
                     match pgquery.commit(c2)
                         Ok(c3) => test.assert(true)
                         Err(_) => test.assert(true)

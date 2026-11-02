@@ -1,8 +1,6 @@
 // pgmsg.nv — the version 3 wire protocol as bytes in and messages
 // out, and messages in and bytes out.  No socket anywhere in it.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THIS MODULE IS THE PACKAGE'S LOAD-BEARING INTERFACE, and it is one
 // enum: `PgBackend`.  Every byte a PostgreSQL server ever sends
 // becomes one of its variants, and `PgReadyForQuery` is the only one
@@ -249,20 +247,88 @@ pub enum PgFrontend
     PgCopyDoneOut
     PgCopyFail(reason: Str)
 
+// ── reading a buffer ─────────────────────────────────────────────────
+
+// Every field on the wire is big-endian and signed, and every reader
+// in `std.bytes` answers an UNSIGNED `?Int` because the buffer does
+// not say what its fields mean.  These four are where the sign comes
+// back.
+
+// A two's-complement field of `width` bits read as signed: 65535 is
+// -1, 4294967295 is -1, and a `type_size` or a column length is
+// exactly that.
+fn signed(raw: Int, width: Int) -> Int
+    if raw >= width / 2
+        raw - width
+    else
+        raw
+
+// One int16, sign included.  PostgreSQL sends column counts, type
+// sizes and column positions this way.
+fn i16_at(buf: Bytes, off: Int) -> Int
+    signed(bytes.u16_be_at(buf, off) ?? 0, 65536)
+
+// One int32, sign included.  This is the one that carries -1 for a
+// NULL column and for a NULL fast-path result.
+fn i32_at(buf: Bytes, off: Int) -> Int
+    signed(bytes.u32_be_at(buf, off) ?? 0, 4294967296)
+
+// Where the NUL that ends a text field is, or the buffer's end when
+// there is none.  A field that runs to the end of a message is read as
+// far as it goes rather than refused: whether the message is whole is
+// `frame_length`'s question and is answered before this is asked.
+fn cstr_end(buf: Bytes, from: Int) -> Int
+    bytes.find_byte(buf, 0, from) ?? bytes.len(buf)
+
+// The text of one NUL-terminated field, without its terminator.
+fn text_field(buf: Bytes, from: Int) -> Str
+    if from < 0 or from >= bytes.len(buf)
+        ""
+    else
+        bytes.to_str(bytes.slice(buf, from, cstr_end(buf, from)))
+
+// Everything after a message's four-byte leading code — the salt, the
+// SASL payload, the negotiated options.
+fn payload_of(body: Bytes) -> Bytes
+    if bytes.len(body) <= 4
+        bytes.zeros(0)
+    else
+        bytes.slice(body, 4, bytes.len(body))
+
+// 0 is text and 1 is binary, and the code is sent per column and per
+// parameter.  A byte that is neither is not guessed at — the caller
+// refuses it.
+fn format_of_code(raw: Int) -> PgFormat
+    if raw == 1
+        PgBinary
+    else
+        PgText
+
+// The wire code for a format: the inverse of `format_of_code`.
+fn format_code(f: PgFormat) -> Int
+    match f
+        PgText   => 0
+        PgBinary => 1
+
+// A malformed body, carrying the message's own type byte and the
+// length it actually had, so a reader can find it in a capture.
+fn body_fault(kind: Int, body: Bytes, detail: Str) -> pgerror.PgFault
+    pgerror.PgBadMessage(kind: kind, length: bytes.len(body), detail: detail)
+
 // ── framing ──────────────────────────────────────────────────────────
 
 // 196608 — protocol version 3.0, as the startup packet spells it.
 pub fn protocol_version() -> Int
-    todo("postgres-nv.pgmsg.protocol_version")
+    196608
 
 // 80877103 — the `SSLRequest` code, in the four bytes where a version
 // would be.
 pub fn ssl_request_code() -> Int
-    todo("postgres-nv.pgmsg.ssl_request_code")
+    80877103
 
 // 80877102 — the `CancelRequest` code.
 pub fn cancel_request_code() -> Int
-    todo("postgres-nv.pgmsg.cancel_request_code")
+    80877102
 
 // How many bytes of `buf` a complete message occupies, or `None` when
 // the buffer does not hold a whole one yet.
@@ -286,12 +352,33 @@ pub fn cancel_request_code() -> Int
 //         Err(_) => println("not yet, or refused")
 // ```
 pub fn frame_length(buf: Bytes, offset: Int, max_bytes: Int) -> Result<?Int, pgerror.PgFault>
-    todo("postgres-nv.pgmsg.frame_length")
+    let have = bytes.len(buf)
+    if offset < 0 or offset >= have
+        return Ok(None)
+    if have - offset < 5
+        return Ok(None)
+    let kind = bytes.byte_at(buf, offset) ?? 0
+    let declared = bytes.u32_be_at(buf, offset + 1) ?? 0
+    // Four is the length of the length field itself, so anything less
+    // is a message that cannot hold its own header.
+    if declared < 4
+        return Err(pgerror.PgBadMessage(kind: kind, length: declared,
+            detail: "the declared length is shorter than its own four-byte header"))
+    if declared > max_bytes
+        return Err(pgerror.PgBadMessage(kind: kind, length: declared,
+            detail: "the declared length is past the ceiling this caller set of ${max_bytes} bytes"))
+    // THE ONE BYTE.  The length counts itself and not the type byte,
+    // so the whole message is one byte longer than the length says.
+    if have - offset < declared + 1
+        return Ok(None)
+    Ok(Some(declared + 1))
 
 // The type byte of the message at `offset`, or `None` when there is
 // not one yet.
 pub fn frame_kind(buf: Bytes, offset: Int) -> ?Int
-    todo("postgres-nv.pgmsg.frame_kind")
+    if offset < 0 or offset >= bytes.len(buf)
+        return None
+    bytes.byte_at(buf, offset)
 
 // Decode one backend message.
 //
@@ -307,7 +394,429 @@ pub fn frame_kind(buf: Bytes, offset: Int) -> ?Int
 //         Err(_) => println("not a message")
 // ```
 pub fn decode_backend(buf: Bytes, offset: Int, max_bytes: Int) -> Result<PgBackend, pgerror.PgFault>
-    todo("postgres-nv.pgmsg.decode_backend")
+    match frame_length(buf, offset, max_bytes)!
+        None        =>
+            Err(pgerror.PgBadMessage(kind: 0, length: 0,
+                detail: "the buffer does not hold a whole message"))
+        Some(total) =>
+            // In range: `frame_length` answered a whole message, so
+            // the kind byte is there and the body ends inside `buf`.
+            decode_body(bytes.byte_at(buf, offset) ?? 0,
+                        bytes.slice(buf, offset + 5, offset + total))
+
+// ── decoding ─────────────────────────────────────────────────────────
+
+// One message, by its type byte.  The body is everything between the
+// five-byte header and the end of the frame.
+//
+// A type byte this codec does not know is `PgUnknownMessage` and not a
+// skip: the stream has no other framing, so a byte that is not a
+// message type means the reader has lost its place and every later
+// message would be read from the wrong offset.
+fn decode_body(kind: Int, body: Bytes) -> Result<PgBackend, pgerror.PgFault>
+    match kind
+        82  => decode_auth(body)
+        75  => Ok(PgBackendKeyData(process_id: i32_at(body, 0), secret_key: i32_at(body, 4)))
+        83  => decode_parameter_status(body)
+        90  => decode_ready(body)
+        84  => decode_row_description(body)
+        68  => decode_data_row(body)
+        67  => Ok(PgCommandComplete(tag: text_field(body, 0)))
+        73  => Ok(PgEmptyQueryResponse)
+        69  => Ok(PgErrorResponse(fields: decode_fields(body)))
+        78  => Ok(PgNoticeResponse(fields: decode_fields(body)))
+        65  => decode_notification(body)
+        49  => Ok(PgParseComplete)
+        50  => Ok(PgBindComplete)
+        51  => Ok(PgCloseComplete)
+        116 => decode_parameter_description(body)
+        110 => Ok(PgNoData)
+        115 => Ok(PgPortalSuspended)
+        71  => decode_copy_response(kind, body)
+        72  => decode_copy_response(kind, body)
+        87  => decode_copy_response(kind, body)
+        100 => Ok(PgCopyData(data: body))
+        99  => Ok(PgCopyDone)
+        86  => decode_function_call(body)
+        118 => decode_negotiate(body)
+        _   => Err(pgerror.PgUnknownMessage(kind: kind))
+
+// `R` — the request code, then whatever that request carries.
+//
+// The four unsupported methods are named rather than collapsed into
+// one failure, because the fix for each is a different server setting
+// and the message should say which.
+fn decode_auth(body: Bytes) -> Result<PgBackend, pgerror.PgFault>
+    if bytes.len(body) < 4
+        return Err(body_fault('R', body,
+            "an authentication request is shorter than its four-byte code"))
+    let code = i32_at(body, 0)
+    match code
+        0  => Ok(PgAuthentication(request: PgAuthOk))
+        2  => Ok(PgAuthentication(request: PgAuthUnsupported(method: "Kerberos V5", code: code)))
+        3  => Ok(PgAuthentication(request: PgAuthCleartext))
+        5  => decode_auth_md5(body)
+        6  => Ok(PgAuthentication(request: PgAuthUnsupported(method: "SCM credentials", code: code)))
+        7  => Ok(PgAuthentication(request: PgAuthUnsupported(method: "GSSAPI", code: code)))
+        8  => Ok(PgAuthentication(request: PgAuthUnsupported(method: "GSSAPI continue", code: code)))
+        9  => Ok(PgAuthentication(request: PgAuthUnsupported(method: "SSPI", code: code)))
+        10 => Ok(PgAuthentication(request: PgAuthSasl(mechanisms: sasl_mechanisms(body))))
+        11 => Ok(PgAuthentication(request: PgAuthSaslContinue(data: payload_of(body))))
+        12 => Ok(PgAuthentication(request: PgAuthSaslFinal(data: payload_of(body))))
+        _  => Err(body_fault('R', body,
+                "the authentication request code is not one the protocol defines"))
+
+// `AuthenticationMD5Password`, and the salt is what the double hash is
+// salted with — a request that carries fewer than four bytes cannot be
+// answered at all, so it is refused rather than hashed anyway.
+fn decode_auth_md5(body: Bytes) -> Result<PgBackend, pgerror.PgFault>
+    if bytes.len(body) < 8
+        Err(body_fault('R', body, "an md5 request carries a four-byte salt"))
+    else
+        Ok(PgAuthentication(request: PgAuthMd5(salt: bytes.slice(body, 4, 8))))
+
+// The mechanism names of an `AuthenticationSASL`, which the server
+// sends as a list of NUL-terminated strings closed by an empty one.
+fn sasl_mechanisms(body: Bytes) -> [Str]
+    var names: [Str] = []
+    var at = 4
+    var done = false
+    while not done and at < bytes.len(body)
+        let e = cstr_end(body, at)
+        if e > at
+            list.push(names, bytes.to_str(bytes.slice(body, at, e)))
+        else
+            done = true
+        at = e + 1
+    names
+
+// `S` — a parameter's name and its current value.
+fn decode_parameter_status(body: Bytes) -> Result<PgBackend, pgerror.PgFault>
+    let name = text_field(body, 0)
+    Ok(PgParameterStatus(name: name, value: text_field(body, cstr_end(body, 0) + 1)))
+
+// `Z` — one byte of transaction status, and the only three values the
+// protocol defines.  A fourth is refused rather than guessed at: a
+// client that read an unknown status as idle would send work into a
+// transaction the server had already aborted.
+fn decode_ready(body: Bytes) -> Result<PgBackend, pgerror.PgFault>
+    match bytes.byte_at(body, 0)
+        Some(73) => Ok(PgReadyForQuery(status: PgIdle))
+        Some(84) => Ok(PgReadyForQuery(status: PgInTransaction))
+        Some(69) => Ok(PgReadyForQuery(status: PgInFailedTransaction))
+        _        => Err(body_fault('Z', body, "a ReadyForQuery carries I, T or E"))
+
+// `T` — a column count and, per column, a name, the table it came
+// from, its type, and how its values are formatted.
+//
+// TWO PASSES, and the first is why.  A format code that is neither
+// text nor binary makes every value after it unreadable, so it is
+// checked for the whole row before a single `PgColumn` is built; one
+// pass that built as it went would have a half-built list of names to
+// abandon on the way out.
+fn decode_row_description(body: Bytes) -> Result<PgBackend, pgerror.PgFault>
+    let count = i16_at(body, 0)
+    if count < 0
+        return Err(body_fault('T', body, "the column count is negative"))
+    var scan = 2
+    var i = 0
+    while i < count
+        let e = cstr_end(body, scan)
+        // The name's NUL and the 18 fixed bytes after it must all lie
+        // inside the message.
+        if e >= bytes.len(body) or 18 > bytes.len(body) - e - 1
+            return Err(body_fault('T', body,
+                "the column count runs past the end of the message"))
+        let raw = bytes.u16_be_at(body, e + 17) ?? 0
+        if raw != 0 and raw != 1
+            return Err(body_fault('T', body,
+                "a column's format code is neither 0 (text) nor 1 (binary)"))
+        // 18 fixed bytes of table, type and format, and the NUL the
+        // name ended at.
+        scan = e + 19
+        i = i + 1
+    var columns: [PgColumn] = []
+    var at = 2
+    var j = 0
+    while j < count
+        let e = cstr_end(body, at)
+        let column = PgColumn {
+            name: bytes.to_str(bytes.slice(body, at, e)),
+            table_oid: i32_at(body, e + 1),
+            table_column: i16_at(body, e + 5),
+            type_oid: i32_at(body, e + 7),
+            type_size: i16_at(body, e + 11),
+            type_modifier: i32_at(body, e + 13),
+            format: format_of_code(bytes.u16_be_at(body, e + 17) ?? 0) }
+        list.push(columns, column)
+        at = e + 19
+        j = j + 1
+    Ok(PgRowDescription(columns: columns))
+
+// `D` — a column count and, per column, a length and that many bytes.
+// A length of -1 is SQL NULL and carries no bytes at all, which is why
+// a null is recorded beside the values rather than in them: a
+// zero-length `Bytes` is a legitimate empty string.
+fn decode_data_row(body: Bytes) -> Result<PgBackend, pgerror.PgFault>
+    let count = i16_at(body, 0)
+    var values: [Bytes] = []
+    var nulls: [Bool] = []
+    var at = 2
+    var i = 0
+    while i < count
+        if at > bytes.len(body) - 4
+            return Err(body_fault('D', body,
+                "the column count runs past the end of the message"))
+        let len = i32_at(body, at)
+        if len < 0
+            list.push(values, bytes.zeros(0))
+            list.push(nulls, true)
+            at = at + 4
+        elif len > bytes.len(body) - at - 4
+            return Err(body_fault('D', body,
+                "a column's length runs past the end of the message"))
+        else
+            list.push(values, bytes.slice(body, at + 4, at + 4 + len))
+            list.push(nulls, false)
+            at = at + 4 + len
+        i = i + 1
+    Ok(PgDataRow(values: values, nulls: nulls))
+
+// `E` and `N` — the same field set, which is a byte code, a
+// NUL-terminated value, and a final zero byte that ends the set.  A
+// code this package does not name goes into `extra_codes` rather than
+// being dropped: PostgreSQL adds fields, and a diagnostic that is
+// absent from every report is a diagnostic nobody can act on.
+fn decode_fields(body: Bytes) -> pgerror.PgFields
+    var fields = pgerror.fields_new()
+    var at = 0
+    var done = false
+    while not done and at < bytes.len(body)
+        let code = bytes.byte_at(body, at) ?? 0
+        if code == 0
+            done = true
+        else
+            let e = cstr_end(body, at + 1)
+            fields = pgerror.set_field(fields, str.from_byte(code),
+                                       bytes.to_str(bytes.slice(body, at + 1, e)))
+            at = e + 1
+    fields
+
+// `A` — the notifying process, the channel and the payload.
+fn decode_notification(body: Bytes) -> Result<PgBackend, pgerror.PgFault>
+    let channel = text_field(body, 4)
+    Ok(PgNotification(process_id: i32_at(body, 0), channel: channel,
+                      payload: text_field(body, cstr_end(body, 4) + 1)))
+
+// `t` — one OID per parameter, in the order the statement declares
+// them.  0 is a parameter whose type the server inferred.
+fn decode_parameter_description(body: Bytes) -> Result<PgBackend, pgerror.PgFault>
+    let count = i16_at(body, 0)
+    if count < 0 or count > (bytes.len(body) - 2) / 4
+        return Err(body_fault('t', body,
+            "the parameter count runs past the end of the message"))
+    var oids: [Int] = []
+    var i = 0
+    while i < count
+        list.push(oids, i32_at(body, 2 + i * 4))
+        i = i + 1
+    Ok(PgParameterDescription(type_oids: oids))
+
+// `G`, `H` and `W` — one overall format byte, a column count, and one
+// format per column.  The three differ only in which way the COPY
+// runs, so they share this and differ in the variant that comes out.
+fn decode_copy_response(kind: Int, body: Bytes) -> Result<PgBackend, pgerror.PgFault>
+    let raw = bytes.byte_at(body, 0) ?? 0
+    if raw != 0 and raw != 1
+        return Err(body_fault(kind, body,
+            "the overall format code is neither 0 (text) nor 1 (binary)"))
+    let overall = format_of_code(raw)
+    let formats = format_list(body, i16_at(body, 1), 3, kind)!
+    if kind == 'G'
+        Ok(PgCopyInResponse(format: overall, column_formats: formats))
+    elif kind == 'H'
+        Ok(PgCopyOutResponse(format: overall, column_formats: formats))
+    else
+        Ok(PgCopyBothResponse(format: overall, column_formats: formats))
+
+// One format per COPY column, refused before any of them is built.
+fn format_list(body: Bytes, count: Int, at: Int, kind: Int) -> Result<[PgFormat], pgerror.PgFault>
+    if count < 0 or count > (bytes.len(body) - at) / 2
+        return Err(body_fault(kind, body,
+            "the column count runs past the end of the message"))
+    var i = 0
+    while i < count
+        let raw = bytes.u16_be_at(body, at + i * 2) ?? 0
+        if raw != 0 and raw != 1
+            return Err(body_fault(kind, body,
+                "a column's format code is neither 0 (text) nor 1 (binary)"))
+        i = i + 1
+    var formats: [PgFormat] = []
+    var j = 0
+    while j < count
+        list.push(formats, format_of_code(bytes.u16_be_at(body, at + j * 2) ?? 0))
+        j = j + 1
+    Ok(formats)
+
+// `V` — a fast-path call's result.  A length of -1 is a NULL, and it
+// is the only thing that distinguishes a NULL from an empty value, so
+// the flag travels beside the bytes as it does in a DataRow.
+fn decode_function_call(body: Bytes) -> Result<PgBackend, pgerror.PgFault>
+    let len = i32_at(body, 0)
+    if len < 0
+        Ok(PgFunctionCallResponse(value: bytes.zeros(0), is_null: true))
+    elif len > bytes.len(body) - 4
+        Err(body_fault('V', body, "the value's length runs past the end of the message"))
+    else
+        Ok(PgFunctionCallResponse(value: bytes.slice(body, 4, 4 + len), is_null: false))
+
+// `v` — the minor protocol version the server settled on, and the
+// startup options it did not recognise.
+fn decode_negotiate(body: Bytes) -> Result<PgBackend, pgerror.PgFault>
+    let minor = i32_at(body, 0)
+    let count = i32_at(body, 4)
+    // Each name takes at least its NUL, so a count above the bytes
+    // left cannot be honest.
+    if count < 0 or count > bytes.len(body) - 8
+        return Err(body_fault('v', body,
+            "the option count runs past the end of the message"))
+    var names: [Str] = []
+    var at = 8
+    var i = 0
+    while i < count
+        let e = cstr_end(body, at)
+        list.push(names, bytes.to_str(bytes.slice(body, at, e)))
+        at = e + 1
+        i = i + 1
+    Ok(PgNegotiateProtocolVersion(minor: minor, unrecognised: names))
+
+// ── encoding ─────────────────────────────────────────────────────────
+
+// A `Str` is NUL-terminated by the runtime and cannot hold a NUL
+// itself, so one can only reach a text field by way of `str.from_byte`
+// or a slice of a buffer.  A field that holds one would end early on
+// the wire and the server would read the rest as the next field, which
+// is a silently different message — so it is refused.
+fn nul_at(s: Str) -> ?Int
+    for i in 0..str.len(s)
+        if str.byte_at_or(s, i, -1) == 0
+            return Some(i)
+    None
+
+// The NUL byte a field's own text cannot carry.
+fn nul_fault(kind: Int) -> pgerror.PgFault
+    pgerror.PgBadMessage(kind: kind, length: 0,
+        detail: "a text field holds a NUL byte, which would end the field early on the wire")
+
+// Every text field of one message, checked before any of it is built.
+fn check_text(kind: Int, fields: [Str]) -> ?pgerror.PgFault
+    var bad = false
+    for field in fields
+        if nul_at(field) != None
+            bad = true
+    if bad
+        Some(nul_fault(kind))
+    else
+        None
+
+// One NUL-terminated field, terminator included.
+fn cstr(s: Str) -> Bytes
+    bytes.concat([bytes.from_str(s), bytes.zeros(1)])
+
+// A framed message: the type byte, then a length that counts itself and
+// the body and not the type byte.
+fn frame(kind: Int, body: Bytes) -> Bytes
+    bytes.concat([bytes.u8(kind), bytes.u32_be(bytes.len(body) + 4), body])
+
+// A framed message with no body at all — five bytes.
+fn empty_frame(kind: Int) -> Bytes
+    bytes.concat([bytes.u8(kind), bytes.u32_be(4)])
+
+// A count and one format code per entry: the shape both a Bind's
+// parameter formats and its result formats have.
+fn format_section(formats: [PgFormat]) -> Bytes
+    var parts: [Bytes] = [bytes.u16_be(list.len(formats))]
+    for f in formats
+        list.push(parts, bytes.u16_be(format_code(f)))
+    bytes.concat(parts)
+
+// A count and, per parameter, a length and that many bytes.  A NULL
+// writes the wire's -1 — four bytes of FF — and no bytes after it,
+// which is why the value itself is not sent.
+fn parameter_section(parameters: [Bytes], nulls: [Bool]) -> Bytes
+    var parts: [Bytes] = [bytes.u16_be(list.len(parameters))]
+    for i in 0..list.len(parameters)
+        if list.get(nulls, i, false)
+            list.push(parts, bytes.u32_be(-1))
+        else
+            list.push(parts, parameter_field(parameters, i))
+    bytes.concat(parts)
+
+// One parameter: its length, then its value.
+fn parameter_field(parameters: [Bytes], i: Int) -> Bytes
+    let value = list.get(parameters, i, bytes.zeros(0))
+    bytes.concat([bytes.u32_be(bytes.len(value)), value])
+
+// A list of OIDs, two bytes of count first.
+fn oid_section(oids: [Int]) -> Bytes
+    var parts: [Bytes] = [bytes.u16_be(list.len(oids))]
+    for oid in oids
+        list.push(parts, bytes.u32_be(oid))
+    bytes.concat(parts)
+
+// The startup packet's shape: a length, a version or request code, and
+// the rest — with NO type byte in front, which is what the eight bytes
+// of a `SslRequest` are.
+fn startup_frame(code: Int, body: Bytes) -> Bytes
+    bytes.concat([bytes.u32_be(bytes.len(body) + 8), bytes.u32_be(code), body])
+
+// The parameter pairs of a startup packet: `name\0value\0` for each,
+// and one last zero byte to end the list.
+fn startup_body(parameters: [Str], values: [Str]) -> Bytes
+    var parts: [Bytes] = []
+    for i in 0..list.len(parameters)
+        list.push(parts, cstr(parameters[i]))
+        list.push(parts, cstr(list.get(values, i, "")))
+    list.push(parts, bytes.zeros(1))
+    bytes.concat(parts)
+
+// `Q`, `P` and the rest: the two text fields a statement carries.
+fn encode_parse(name: Str, sql: Str, parameter_oids: [Int]) -> Result<Bytes, pgerror.PgFault>
+    match check_text('P', [name, sql])
+        Some(f) => Err(f)
+        None    => Ok(frame('P', bytes.concat([cstr(name), cstr(sql), oid_section(parameter_oids)])))
+
+// `B`, whose body is the only one with two independent format lists
+// and a null map beside its values.
+fn encode_bind(portal: Str, statement: Str, parameter_formats: [PgFormat], parameters: [Bytes],
+               parameter_nulls: [Bool],
+               result_formats: [PgFormat]) -> Result<Bytes, pgerror.PgFault>
+    match check_text('B', [portal, statement])
+        Some(f) => Err(f)
+        None    => encode_bind_body(portal, statement, parameter_formats, parameters,
+                                    parameter_nulls, result_formats)
+
+// A null map whose length disagrees with the values is the mistake
+// worth refusing: the server would read the map positionally against
+// the values and bind the wrong ones, with no error anywhere.
+fn encode_bind_body(portal: Str, statement: Str, parameter_formats: [PgFormat], parameters: [Bytes],
+                    parameter_nulls: [Bool],
+                    result_formats: [PgFormat]) -> Result<Bytes, pgerror.PgFault>
+    if list.len(parameter_nulls) != list.len(parameters)
+        Err(pgerror.PgBadParameters(want: list.len(parameters), got: list.len(parameter_nulls)))
+    else
+        Ok(frame('B', bytes.concat([cstr(portal), cstr(statement),
+            format_section(parameter_formats), parameter_section(parameters, parameter_nulls),
+            format_section(result_formats)])))
+
+// The eight-byte `SSLRequest`.
+fn ssl_request_bytes() -> Bytes
+    bytes.concat([bytes.u32_be(8), bytes.u32_be(ssl_request_code())])
+
+// The sixteen-byte `CancelRequest`.
+fn cancel_request_bytes(process_id: Int, secret_key: Int) -> Bytes
+    bytes.concat([bytes.u32_be(16), bytes.u32_be(cancel_request_code()),
+                  bytes.u32_be(process_id), bytes.u32_be(secret_key)])
 
 // Encode a frontend message into the bytes that go on the wire.
 //
@@ -325,7 +834,92 @@ pub fn decode_backend(buf: Bytes, offset: Int, max_bytes: Int) -> Result<PgBacke
 //         Err(_) => println("could not encode")
 // ```
 pub fn encode_frontend(m: PgFrontend) -> Result<Bytes, pgerror.PgFault>
-    todo("postgres-nv.pgmsg.encode_frontend")
+    match m
+        PgStartup(parameters, values)           =>
+            match check_text(0, start_names(parameters, values))
+                Some(f) => Err(f)
+                None    => Ok(startup_frame(protocol_version(), startup_body(parameters, values)))
+        PgSslRequest                            =>
+            Ok(ssl_request_bytes())
+        PgCancelRequest(process_id, secret_key) =>
+            Ok(cancel_request_bytes(process_id, secret_key))
+        PgQuery(sql)                            =>
+            encode_query(sql)
+        PgParse(name, sql, parameter_oids)      =>
+            encode_parse(name, sql, parameter_oids)
+        PgBind(portal, statement, parameter_formats, parameters, parameter_nulls, result_formats) =>
+            encode_bind(portal, statement, parameter_formats, parameters, parameter_nulls,
+                        result_formats)
+        PgExecute(portal, max_rows)             =>
+            encode_execute(portal, max_rows)
+        PgDescribeStatement(name)               =>
+            encode_describe('S', name)
+        PgDescribePortal(name)                  =>
+            encode_describe('P', name)
+        PgCloseStatement(name)                  =>
+            encode_close('S', name)
+        PgClosePortal(name)                     =>
+            encode_close('P', name)
+        PgFlush                                 =>
+            Ok(empty_frame('H'))
+        PgSync                                  =>
+            Ok(empty_frame('S'))
+        PgTerminate                             =>
+            Ok(empty_frame('X'))
+        PgPasswordMessage(data)                 =>
+            Ok(frame('p', data))
+        PgSaslInitialResponse(mechanism, data)  =>
+            encode_sasl_initial(mechanism, data)
+        PgSaslResponse(data)                    =>
+            Ok(frame('p', data))
+        PgCopyDataOut(data)                     =>
+            Ok(frame('d', data))
+        PgCopyDoneOut                           =>
+            Ok(empty_frame('c'))
+        PgCopyFail(reason)                      =>
+            encode_copy_fail(reason)
+
+// The parameter names and values of a startup packet as one list, so
+// the NUL check covers both halves.
+fn start_names(parameters: [Str], values: [Str]) -> [Str]
+    list.concat(parameters, values)
+
+// `Q`.
+fn encode_query(sql: Str) -> Result<Bytes, pgerror.PgFault>
+    match check_text('Q', [sql])
+        Some(f) => Err(f)
+        None    => Ok(frame('Q', cstr(sql)))
+
+// `E`, whose portal might be the unnamed one.
+fn encode_execute(portal: Str, max_rows: Int) -> Result<Bytes, pgerror.PgFault>
+    match check_text('E', [portal])
+        Some(f) => Err(f)
+        None    => Ok(frame('E', bytes.concat([cstr(portal), bytes.u32_be(max_rows)])))
+
+// `D` for a statement or a portal — one body byte says which.
+fn encode_describe(which: Int, name: Str) -> Result<Bytes, pgerror.PgFault>
+    match check_text('D', [name])
+        Some(f) => Err(f)
+        None    => Ok(frame('D', bytes.concat([bytes.u8(which), cstr(name)])))
+
+// `C`, the same body byte.
+fn encode_close(which: Int, name: Str) -> Result<Bytes, pgerror.PgFault>
+    match check_text('C', [name])
+        Some(f) => Err(f)
+        None    => Ok(frame('C', bytes.concat([bytes.u8(which), cstr(name)])))
+
+// `p` with a mechanism in front — the SASL initial response, whose
+// length is a fourth field the other two `p` shapes do not have.
+fn encode_sasl_initial(mechanism: Str, data: Bytes) -> Result<Bytes, pgerror.PgFault>
+    match check_text('p', [mechanism])
+        Some(f) => Err(f)
+        None    => Ok(frame('p', bytes.concat([cstr(mechanism), bytes.u32_be(bytes.len(data)), data])))
+
+// `f`, the client aborting a COPY with a reason the server logs.
+fn encode_copy_fail(reason: Str) -> Result<Bytes, pgerror.PgFault>
+    match check_text('f', [reason])
+        Some(f) => Err(f)
+        None    => Ok(frame('f', cstr(reason)))
 
 // Encode several frontend messages into one buffer.
 //
@@ -334,7 +928,21 @@ pub fn encode_frontend(m: PgFrontend) -> Result<Bytes, pgerror.PgFault>
 // function exists so that a caller does not concatenate by hand and
 // so that `discards_until_sync`'s warning has somewhere to live.
 pub fn encode_batch(ms: [PgFrontend]) -> Result<Bytes, pgerror.PgFault>
-    todo("postgres-nv.pgmsg.encode_batch")
+    // ONE BUFFER, built as it goes: the frames are a handful and each
+    // is appended to a fresh buffer rather than to a list of frames
+    // that would have to be concatenated twice.
+    var out = bytes.zeros(0)
+    var fault: ?pgerror.PgFault = None
+    for m in ms
+        if fault == None
+            match encode_frontend(m)
+                Ok(b)  =>
+                    out = bytes.concat([out, b])
+                Err(f) =>
+                    fault = Some(f)
+    match fault
+        Some(f) => Err(f)
+        None    => Ok(out)
 
 // ── the rule ─────────────────────────────────────────────────────────
 
@@ -354,7 +962,9 @@ pub fn encode_batch(ms: [PgFrontend]) -> Result<Bytes, pgerror.PgFault>
 //     println("${pgmsg.discards_until_sync(pgmsg.PgParseComplete)}")
 // ```
 pub fn discards_until_sync(m: PgBackend) -> Bool
-    todo("postgres-nv.pgmsg.discards_until_sync")
+    match m
+        PgErrorResponse(_) => true
+        _                  => false
 
 // True when this message ENDS an exchange — `ReadyForQuery` and
 // nothing else.
@@ -366,7 +976,9 @@ pub fn discards_until_sync(m: PgBackend) -> Bool
 //     println("${pgmsg.ends_exchange(pgmsg.PgReadyForQuery(status: pgmsg.PgIdle))}")
 // ```
 pub fn ends_exchange(m: PgBackend) -> Bool
-    todo("postgres-nv.pgmsg.ends_exchange")
+    match m
+        PgReadyForQuery(_) => true
+        _                  => false
 
 // True when this message can arrive at ANY moment and belongs to no
 // exchange: `ParameterStatus`, `NoticeResponse`, `NotificationResponse`.
@@ -382,12 +994,18 @@ pub fn ends_exchange(m: PgBackend) -> Bool
 //     println("${pgmsg.is_asynchronous(pgmsg.PgNoData)}")
 // ```
 pub fn is_asynchronous(m: PgBackend) -> Bool
-    todo("postgres-nv.pgmsg.is_asynchronous")
+    match m
+        PgParameterStatus(_, _) => true
+        PgNoticeResponse(_)     => true
+        PgNotification(_, _, _) => true
+        _                       => false
 
 // The transaction status a `ReadyForQuery` carries, or `None` for
 // every other message.
 pub fn tx_status(m: PgBackend) -> ?PgTxStatus
-    todo("postgres-nv.pgmsg.tx_status")
+    match m
+        PgReadyForQuery(status) => Some(status)
+        _                       => None
 
 // The rows a `CommandComplete` tag reports: 12 from "SELECT 12", 3
 // from "INSERT 0 3", 0 from "CREATE TABLE".
@@ -404,9 +1022,35 @@ pub fn tx_status(m: PgBackend) -> ?PgTxStatus
 //     println("${pgmsg.tag_rows("INSERT 0 3")}")
 // ```
 pub fn tag_rows(tag: Str) -> Int
-    todo("postgres-nv.pgmsg.tag_rows")
+    let parts = str.split(tag, " ")
+    if list.len(parts) < 2
+        0
+    else
+        // THE LAST WORD, which is the count for every command that
+        // has one — INSERT's OID sits between the verb and the count
+        // and is not it — and is not a number at all for a DDL tag.
+        match str.to_int(parts[list.len(parts) - 1])
+            Some(n) => n
+            None    => 0
 
 // The command a `CommandComplete` tag names: "SELECT", "INSERT",
 // "UPDATE", "CREATE TABLE".
 pub fn tag_command(tag: Str) -> Str
-    todo("postgres-nv.pgmsg.tag_command")
+    let parts = str.split(tag, " ")
+    // Everything before the first word that is a number, which is the
+    // count for a DML tag and nothing at all for a DDL one.
+    match first_number_at(parts)
+        Some(cut) if cut > 0 => str.join(list.slice(parts, 0, cut), " ")
+        _                    => tag
+
+// The index of the first part that parses as a number, or `None`.
+fn first_number_at(parts: [Str]) -> ?Int
+    for i in 0..list.len(parts)
+        if is_number(parts[i])
+            return Some(i)
+    None
+
+fn is_number(s: Str) -> Bool
+    match str.to_int(s)
+        Some(_) => true
+        None    => false

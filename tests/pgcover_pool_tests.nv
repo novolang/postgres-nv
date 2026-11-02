@@ -1,0 +1,456 @@
+// THE POOL, DRIVEN WITH CONSTRUCTED BYTES.
+//
+// A pool's three decisions are all about a clock and about what a
+// server said on the way in, and a value pool takes the caller's clock
+// reading — which is what makes every one of them testable without
+// sleeping and without a server.  The idle connections here are
+// `PgConn`s built from their own public fields, the transport behind
+// them answers bytes this file wrote, and `open_one`'s connect goes
+// through a loopback listener nothing ever accepts on: a connection
+// queued in a backlog is a socket that reads and writes, which is all
+// `pgconn.connect` needs, and the server's half of the handshake is
+// the scripted transport.
+//
+// NO TEST HERE REACHES A SERVER, and none of them proves that a real
+// server's bytes mean what this package thinks they mean — the
+// CHANGELOG's `### Known` says what was looked for and what was found
+// when that was checked.  What is proved here is the pool's own
+// arithmetic: which connection is lent, which is closed, which is
+// rolled back, and what the counters say afterwards.
+//
+// THE CLOCK IS THE CALLER'S.  `acquire`, `release` and `reap` take
+// `now_ms`, so a pool is aged by passing a larger number rather than
+// by waiting, which is the property `pgpool` was shaped around.
+
+use std.test
+use std.bytes
+use pgconn
+use pgmsg
+use pgtype
+use pgerror
+use pgauth
+use pgpool
+
+// ── the wire, as bytes ───────────────────────────────────────────────
+
+// One NUL-terminated field, terminator included.
+fn cstr(s: Str) -> Bytes
+    bytes.concat([bytes.from_str(s), bytes.zeros(1)])
+
+// A typed frame: 82 is `R`, 83 is `S`, 90 is `Z`, 75 is `K`, 67 is
+// `C`, 69 is `E`, 78 is `N`, 68 is `D`.
+fn frame(kind: Int, body: Bytes) -> Bytes
+    bytes.concat([bytes.u8(kind), bytes.u32_be(bytes.len(body) + 4), body])
+
+fn auth(code: Int) -> Bytes
+    frame(82, bytes.u32_be(code))
+
+fn key_data(pid: Int, key: Int) -> Bytes
+    frame(75, bytes.concat([bytes.u32_be(pid), bytes.u32_be(key)]))
+
+fn parameter(name: Str, value: Str) -> Bytes
+    frame(83, bytes.concat([cstr(name), cstr(value)]))
+
+fn ready(status: Int) -> Bytes
+    frame(90, bytes.u8(status))
+
+fn command(tag: Str) -> Bytes
+    frame(67, cstr(tag))
+
+fn refusal(code: Str, text: Str) -> Bytes
+    frame(69, bytes.concat([bytes.from_str("S"), cstr("ERROR"),
+                            bytes.from_str("C"), cstr(code),
+                            bytes.from_str("M"), cstr(text), bytes.zeros(1)]))
+
+// One `DataRow` of one text value: what `pgquery` decodes and what a
+// `release` that rolled back does not need.
+fn one_text_row(value: Str) -> Bytes
+    frame(68, bytes.concat([bytes.u16_be(1), bytes.u32_be(str.len(value)),
+                            bytes.from_str(value)]))
+
+// ── transports ───────────────────────────────────────────────────────
+
+// Writes are thrown away and close touches nothing: what a pool of
+// hand-built connections needs behind it.
+fn drops(fd: Int, data: Bytes) -> ?pgerror.PgFault [io, net]
+    None
+
+fn drops_close(fd: Int) -> ?pgerror.PgFault [io, net]
+    None
+
+// A close that fails, which is the one thing `close_pool` answers.
+fn refuses_close(fd: Int) -> ?pgerror.PgFault [io, net]
+    Some(pgerror.PgConnectionLost(during: "close"))
+
+// A write that fails: what makes `pgconn.close` answer a fault, and so
+// what makes `close_pool` answer one.
+fn failing_send(fd: Int, data: Bytes) -> ?pgerror.PgFault [io, net]
+    Some(pgerror.PgConnectionLost(during: "write"))
+
+// A transport whose `recv` answers `script` and whose writes are
+// thrown away.
+fn scripting(r: fn(Int, Int) -> Result<Bytes, pgerror.PgFault> [io, net]) -> PgTransport [io, net]
+    PgTransport { send: drops, recv: r, close: drops_close }
+
+// The whole startup exchange: the authentication, the backend's
+// identity, one parameter and the boundary.
+fn recv_startup(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.concat([auth(0), key_data(4711, 305419896), parameter("server_version", "16.4"),
+                     ready(73)]))
+
+// The server refusing the login, which is `open_one` failing inside
+// `connect`.
+fn recv_refused(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.concat([auth(0), refusal("28P01", "password authentication failed")]))
+
+// The startup exchange and then a statement the policy's
+// `on_connect_sql` asks for, which the client reads to the boundary.
+fn recv_startup_then_command(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.concat([auth(0), key_data(4711, 305419896), parameter("server_version", "16.4"),
+                     ready(73), command("SET"), ready(73)]))
+
+// The startup exchange and then a `SET` the server refuses.
+fn recv_startup_then_refusal(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.concat([auth(0), key_data(4711, 305419896), parameter("server_version", "16.4"),
+                     ready(73), refusal("42601", "syntax error at or near \"st\""), ready(73)]))
+
+// A `ROLLBACK` that worked, and one that did not.
+fn recv_rollback_ok(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.concat([command("ROLLBACK"), ready(73)]))
+
+fn recv_rollback_refused(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Ok(bytes.concat([refusal("25P01", "no transaction in progress"),
+                     command("ROLLBACK"), ready(73)]))
+
+// ── connections and pools, built by hand ─────────────────────────────
+
+fn opts_here(port: Int) -> PgConnectOptions
+    PgConnectOptions { host: "127.0.0.1", port: port, user: "postgres",
+                       password: "pencil", database: "", application_name: "",
+                       ssl_mode: pgconn.PgSslDisable, allow_cleartext: false,
+                       channel_binding: pgauth.PgBindingNone, nonce: "",
+                       max_message_bytes: 1048576, connect_timeout_ms: 0,
+                       read_timeout_ms: 0 }
+
+// A connection with the given identity and transaction status, over a
+// transport that answers `t` and closes nothing.
+fn conn_as(pid: Int, status: PgTxStatus, broken: Bool, t: PgTransport) -> PgConn
+    PgConn { handle: -1, transport: t, options: opts_here(5432), process_id: pid,
+             secret_key: 0, parameter_names: [], parameter_values: [],
+             settings: pgtype.default_settings(), inbox: bytes.zeros(0),
+             notifications: [], status: status, broken: broken }
+
+// A connection whose answers come from `r` and that is in no
+// transaction and is not broken.
+fn idle_conn(pid: Int,
+             r: fn(Int, Int) -> Result<Bytes, pgerror.PgFault> [io, net]) -> PgConn [io, net]
+    conn_as(pid, pgmsg.PgIdle, false, scripting(r))
+
+// A policy with everything off and the numbers a test cares about.
+fn policy(max_connections: Int, min_connections: Int, max_idle_ms: Int, max_uses: Int,
+          on_connect_sql: Str) -> PgPoolPolicy
+    PgPoolPolicy { max_connections: max_connections, min_connections: min_connections,
+                   wait_ms: 0, max_idle_ms: max_idle_ms, max_uses: max_uses,
+                   reset_on_release: true, on_connect_sql: on_connect_sql }
+
+// A pool holding exactly what a test hands it.  The transport is what
+// `open_one` will connect over, so a test that never expects an open
+// can leave it throwing bytes away.
+fn pool_at(port: Int, idle: [PgConn], since: [Int], uses: [Int], lent: Int, pids: [Int],
+           lent_uses: [Int], pol: PgPoolPolicy, t: PgTransport) -> PgPool
+    PgPool { options: opts_here(port), transport: t, policy: pol,
+             idle: idle, idle_since_ms: since, uses: uses, lent: lent,
+             lent_pids: pids, lent_uses: lent_uses,
+             opened_total: 0, closed_total: 0, waits_total: 0, timeouts_total: 0 }
+
+// The port of a loopback listener nothing ever accepts on, so that
+// `pgconn.connect` has a socket to open and write its startup packet
+// into.
+fn listener_port() -> Int [net]
+    match net.listen_on("127.0.0.1", 0)
+        None         => 0
+        Some(server) => net.local_port(server)
+
+// ── tests ────────────────────────────────────────────────────────────
+
+@test
+fn test_an_idle_connection_is_lent_and_the_lend_is_recorded() [io, net, time]
+    test.case("an idle connection is lent, not opened")
+    let c = idle_conn(4711, recv_startup)
+    let p = pool_at(5432, [c], [0], [3], 0, [], [], policy(4, 0, 0, 0, ""), scripting(recv_startup))
+    let got = pgpool.acquire(p, 10)!
+    test.assert_eq(got.conn.process_id, 4711)
+    test.assert_eq(got.pool.lent, 1)
+    test.assert_eq(list.len(got.pool.idle), 0)
+    test.assert_eq(list.len(got.pool.lent_pids), 1)
+    test.assert_eq(got.pool.lent_uses[0], 4)
+    test.assert_eq(got.pool.opened_total, 0)
+
+@test
+fn test_the_limit_refuses_with_the_number_in_use_and_the_limit() [io, net, time]
+    test.case("the limit is a refusal, and it carries both numbers")
+    let p = pool_at(5432, [], [], [], 3, [11, 12, 13], [1, 1, 1],
+                    policy(3, 0, 0, 0, ""), scripting(recv_startup))
+    match pgpool.acquire(p, 0)
+        Ok(_)  => test.fail("a pool at its limit lent a connection")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "3"),
+                                   pgerror.describe(f))
+
+@test
+fn test_has_idle_counts_only_the_connections_it_would_lend() [io, net, time]
+    test.case("has_idle is a question, so it closes nothing")
+    let fresh = idle_conn(4711, recv_startup)
+    let live = pool_at(5432, [fresh], [100], [0], 0, [], [], policy(4, 0, 50, 0, ""),
+                       scripting(recv_startup))
+    test.assert(pgpool.has_idle(live, 120))
+    // The same connection, twenty milliseconds past its ceiling: not
+    // lent, and — because `has_idle` is a predicate — not closed
+    // either.
+    test.assert_false(pgpool.has_idle(live, 200),
+                      "an aged connection is not one has_idle counts")
+    test.assert_eq(list.len(live.idle), 1)
+
+@test
+fn test_an_idle_connection_past_its_ceiling_is_closed_rather_than_lent() [io, net, time]
+    test.case("past max_idle_ms it is closed, not lent")
+    let old = idle_conn(4711, recv_startup)
+    let p = pool_at(listener_port(), [old], [0], [0], 0, [], [], policy(4, 0, 50, 0, ""),
+                    scripting(recv_startup))
+    let got = pgpool.acquire(p, 1000)!
+    // It was closed and a new one opened: the counted close and the
+    // counted open are both here, and the identity is the new
+    // connection the scripted handshake answers.
+    test.assert_eq(got.pool.closed_total, 1)
+    test.assert_eq(got.pool.opened_total, 1)
+    test.assert_eq(got.pool.lent, 1)
+
+@test
+fn test_a_connection_past_its_use_count_is_closed_rather_than_lent() [io, net, time]
+    test.case("past max_uses it is closed, not lent")
+    let used = idle_conn(4711, recv_startup)
+    let p = pool_at(listener_port(), [used], [0], [5], 0, [], [], policy(4, 0, 0, 5, ""),
+                    scripting(recv_startup))
+    let got = pgpool.acquire(p, 1000)!
+    test.assert_eq(got.pool.closed_total, 1)
+    test.assert_eq(got.pool.opened_total, 1)
+
+// ── giving a connection back ─────────────────────────────────────────
+
+// A policy that trusts the borrower: `reset_on_release` off.
+fn policy_not_resetting(max_connections: Int) -> PgPoolPolicy
+    PgPoolPolicy { max_connections: max_connections, min_connections: 0, wait_ms: 0,
+                   max_idle_ms: 0, max_uses: 0, reset_on_release: false, on_connect_sql: "" }
+
+@test
+fn test_release_returns_a_clean_connection_to_the_idle_list() [io, net, time]
+    test.case("a clean connection goes back with the count it went out with")
+    let c = idle_conn(4711, recv_startup)
+    let p = pool_at(5432, [], [], [], 2, [4711, 4712], [7, 1], policy(4, 0, 0, 0, ""),
+                    scripting(recv_startup))
+    let back = pgpool.release(p, c, 100)!
+    test.assert_eq(back.lent, 1)
+    test.assert_eq(list.len(back.idle), 1)
+    test.assert_eq(list.len(back.lent_pids), 1)
+    test.assert_eq(back.uses[0], 7)
+    test.assert_eq(back.idle_since_ms[0], 100)
+    test.assert_eq(back.idle[0].process_id, 4711)
+
+@test
+fn test_release_rolls_back_a_connection_left_in_a_transaction() [io, net, time]
+    test.case("in a transaction: rolled back before it is kept")
+    let c = conn_as(4711, pgmsg.PgInTransaction, false, scripting(recv_rollback_ok))
+    let p = pool_at(5432, [], [], [], 1, [4711], [2], policy(4, 0, 0, 0, ""),
+                    scripting(recv_rollback_ok))
+    let back = pgpool.release(p, c, 100)!
+    test.assert_eq(back.lent, 0)
+    test.assert_eq(list.len(back.idle), 1)
+    // The connection KEPT is the one the rollback answered, whose
+    // status says the transaction is over.
+    test.assert_eq(back.idle[0].status, pgmsg.PgIdle)
+
+@test
+fn test_release_rolls_back_a_connection_whose_transaction_failed() [io, net, time]
+    test.case("in a failed transaction: the same rollback")
+    let c = conn_as(4711, pgmsg.PgInFailedTransaction, false, scripting(recv_rollback_ok))
+    let p = pool_at(5432, [], [], [], 1, [4711], [2], policy(4, 0, 0, 0, ""),
+                    scripting(recv_rollback_ok))
+    let back = pgpool.release(p, c, 100)!
+    test.assert_eq(back.idle[0].status, pgmsg.PgIdle)
+
+@test
+fn test_release_reports_a_rollback_that_failed_and_closes_the_connection() [io, net, time]
+    test.case("a rollback the server refused is the one Err, and the connection is closed")
+    let c = conn_as(4711, pgmsg.PgInTransaction, false, scripting(recv_rollback_refused))
+    let p = pool_at(5432, [], [], [], 1, [4711], [2], policy(4, 0, 0, 0, ""),
+                    scripting(recv_rollback_refused))
+    match pgpool.release(p, c, 100)
+        Ok(_)  => test.fail("a rollback the server refused was reported as a release")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "no transaction"),
+                                   pgerror.describe(f))
+
+@test
+fn test_release_closes_a_connection_that_is_broken() [io, net, time]
+    test.case("a broken connection is closed and counted, and the release succeeds")
+    let c = conn_as(4711, pgmsg.PgIdle, true, scripting(recv_startup))
+    let p = pool_at(5432, [], [], [], 1, [4711], [1], policy(4, 0, 0, 0, ""),
+                    scripting(recv_startup))
+    let back = pgpool.release(p, c, 100)!
+    test.assert_eq(back.lent, 0)
+    test.assert_eq(back.closed_total, 1)
+    test.assert_eq(list.len(back.idle), 0)
+
+@test
+fn test_a_connection_in_a_transaction_is_kept_when_reset_is_off() [io, net, time]
+    test.case("reset_on_release false: the rollback is not sent")
+    let c = conn_as(4711, pgmsg.PgInTransaction, false, scripting(recv_rollback_ok))
+    let p = pool_at(5432, [], [], [], 1, [4711], [1], policy_not_resetting(4),
+                    scripting(recv_rollback_ok))
+    let back = pgpool.release(p, c, 100)!
+    test.assert_eq(list.len(back.idle), 1)
+    test.assert_eq(back.idle[0].status, pgmsg.PgInTransaction)
+
+@test
+fn test_a_release_forgets_a_connection_the_ledger_does_not_know() [io, net, time]
+    test.case("a connection the ledger does not know is taken as having served once")
+    let c = idle_conn(9999, recv_startup)
+    let p = pool_at(5432, [], [], [], 1, [4711], [4], policy(4, 0, 0, 0, ""),
+                    scripting(recv_startup))
+    let back = pgpool.release(p, c, 100)!
+    test.assert_eq(back.uses[0], 1)
+    test.assert_eq(back.lent, 0)
+
+@test
+fn test_discard_closes_the_connection_and_takes_the_lend_out() [io, net, time]
+    test.case("discard is what a caller does when it knows the connection is no good")
+    let c = idle_conn(4711, recv_startup)
+    let p = pool_at(5432, [], [], [], 1, [4711], [1], policy(4, 0, 0, 0, ""),
+                    scripting(recv_startup))
+    let back = pgpool.discard(p, c)
+    test.assert_eq(back.lent, 0)
+    test.assert_eq(back.closed_total, 1)
+    test.assert_eq(list.len(back.lent_pids), 0)
+
+// ── opening, warming and reaping ─────────────────────────────────────
+
+@test
+fn test_open_one_runs_the_policy_sql_and_keeps_the_connection() [io, net, time]
+    test.case("on_connect_sql: sent, read to the boundary, connection kept")
+    let p = pool_at(listener_port(), [], [], [], 0, [], [],
+                    policy(4, 0, 0, 0, "SET search_path TO app"),
+                    scripting(recv_startup_then_command))
+    let got = pgpool.acquire(p, 0)!
+    test.assert_eq(got.pool.opened_total, 1)
+    test.assert_eq(got.conn.process_id, 4711)
+
+@test
+fn test_open_one_closes_the_connection_when_the_policy_sql_fails() [io, net, time]
+    test.case("on_connect_sql that failed: the connection is closed and the fault is the call's")
+    let p = pool_at(listener_port(), [], [], [], 0, [], [],
+                    policy(4, 0, 0, 0, "st search_path"),
+                    scripting(recv_startup_then_refusal))
+    match pgpool.acquire(p, 0)
+        Ok(_)  => test.fail("a connection whose on_connect_sql failed was lent")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "syntax error"),
+                                   pgerror.describe(f))
+
+@test
+fn test_a_warm_that_cannot_open_closes_what_the_pool_already_held() [io, net, time]
+    test.case("a failed open closes the idle connections before it answers")
+    let held = idle_conn(4711, recv_startup)
+    let p = pool_at(listener_port(), [held], [0], [0], 0, [], [], policy(3, 2, 0, 0, ""),
+                    scripting(recv_refused))
+    match pgpool.warm(p)
+        Ok(_)  => test.fail("a pool that could not open its second connection warmed")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "password"),
+                                   pgerror.describe(f))
+
+@test
+fn test_reap_tops_the_pool_back_up_to_the_minimum() [io, net, time]
+    test.case("reap opens to min_connections")
+    let p = pool_at(listener_port(), [], [], [], 0, [], [], policy(3, 1, 0, 0, ""),
+                    scripting(recv_startup))
+    let after = pgpool.reap(p, 50)!
+    test.assert_eq(list.len(after.idle), 1)
+    test.assert_eq(after.opened_total, 1)
+
+@test
+fn test_a_reap_that_cannot_open_closes_the_idle_connections() [io, net, time]
+    test.case("a reap that could not top up answers the fault, having closed what it held")
+    let held = idle_conn(4711, recv_startup)
+    let q = pool_at(listener_port(), [held], [0], [0], 0, [], [], policy(3, 2, 0, 0, ""),
+                    scripting(recv_refused))
+    match pgpool.reap(q, 50)
+        Ok(_)  => test.fail("a reap that could not top up reported success")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "password"),
+                                   pgerror.describe(f))
+
+@test
+fn test_close_pool_answers_the_first_close_that_failed() [io, net, time]
+    test.case("close_pool closes every idle connection and answers the first fault")
+    let good = conn_as(4711, pgmsg.PgIdle, false,
+                       PgTransport { send: drops, recv: recv_startup, close: drops_close })
+    let bad = conn_as(4712, pgmsg.PgIdle, false,
+                      PgTransport { send: failing_send, recv: recv_startup, close: drops_close })
+    let p = pool_at(5432, [good, bad], [0, 0], [0, 0], 0, [], [], policy(4, 0, 0, 0, ""),
+                    scripting(recv_startup))
+    match pgpool.close_pool(p)
+        None    => test.fail("a close that failed was answered with None")
+        Some(f) => test.assert_true(str.contains(pgerror.describe(f), "write"),
+                                    pgerror.describe(f))
+
+// A write that fails for a `Query` and nothing else: 81 is `Q`, which
+// is what `pgconn.send` writes for a statement, and the startup packet
+// begins with the length's first byte instead.  What makes
+// `open_one`'s send fail rather than its read.
+fn refuses_the_query(fd: Int, data: Bytes) -> ?pgerror.PgFault [io, net]
+    if bytes.len(data) > 0 and (bytes.byte_at(data, 0) ?? 0) == 81
+        Some(pgerror.PgConnectionLost(during: "write"))
+    else
+        None
+
+@test
+fn test_open_one_closes_the_connection_when_the_policy_sql_cannot_be_sent() [io, net, time]
+    test.case("a policy statement that could not be written closes the connection")
+    let p = pool_at(listener_port(), [], [], [], 0, [], [], policy(4, 0, 0, 0, "SET x"),
+                    PgTransport { send: refuses_the_query, recv: recv_startup, close: drops_close })
+    match pgpool.acquire(p, 0)
+        Ok(_)  => test.fail("a query that could not be written was reported as a connection")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "write"),
+                                   pgerror.describe(f))
+
+@test
+fn test_warm_opens_to_the_minimum_and_a_minimum_above_the_limit_is_capped() [io, net, time]
+    test.case("warm opens to min_connections and proves the pool can open one")
+    let p = pool_at(listener_port(), [], [], [], 0, [], [], policy(3, 2, 0, 0, ""),
+                    scripting(recv_startup))
+    let warmed = pgpool.warm(p)!
+    test.assert_eq(list.len(warmed.idle), 2)
+    test.assert_eq(warmed.opened_total, 2)
+    test.case("a min_connections above the limit is capped rather than refused")
+    let q = pool_at(listener_port(), [], [], [], 0, [], [], policy(2, 5, 0, 0, ""),
+                    scripting(recv_startup))
+    let capped = pgpool.warm(q)!
+    test.assert_eq(list.len(capped.idle), 2)
+
+@test
+fn test_the_default_policy_a_new_pool_and_the_counters() [io, net, time]
+    test.case("the default policy, a new pool and what stats says about it")
+    let d = pgpool.default_policy()
+    test.assert_eq(d.max_connections, 10)
+    test.assert_eq(d.min_connections, 0)
+    test.assert_eq(d.wait_ms, 5000)
+    test.assert_eq(d.max_idle_ms, 300000)
+    test.assert_eq(d.max_uses, 0)
+    test.assert(d.reset_on_release)
+    test.assert_eq_str(d.on_connect_sql, "")
+    let p = pgpool.new_pool(opts_here(5432), scripting(recv_startup), d)
+    test.assert_eq(p.lent, 0)
+    test.assert_eq(list.len(p.idle), 0)
+    let s = pgpool.stats(p)
+    test.assert_eq(s.idle, 0)
+    test.assert_eq(s.lent, 0)
+    test.assert_eq(s.limit, 10)
+    test.assert_eq(s.opened_total, 0)
+    test.assert_eq(s.closed_total, 0)
+    test.assert_eq(s.waits_total, 0)
+    test.assert_eq(s.timeouts_total, 0)

@@ -1,0 +1,705 @@
+// pgwire_edge_tests.nv — the wire bytes themselves, and every refusal
+// the codec owes a caller.
+//
+// WHERE THE VECTORS COME FROM.  Every hex string below was written out
+// from PostgreSQL's own protocol documentation — the message layouts
+// in `docs/protocol-message-formats.html` — and NOT from
+// `pgmsg.encode_frontend`.  A decoder checked against the package's
+// own encoder proves that the two agree with each other and nothing
+// about the server, so the two halves are pinned to the specification
+// separately: the encoders by the hex a server would send, the
+// decoders by the hex a server does send.
+//
+// THE LENGTH FIELDS ARE THE POINT.  A frame's four-byte length counts
+// itself and the body and NOT the type byte, and a startup packet's
+// four-byte length counts itself, the version and the pairs and there
+// is no type byte at all.  Getting either wrong is off by one for the
+// rest of the connection and is invisible until a server is on the
+// other end of it, which is why every message here is asserted
+// byte for byte rather than by size.
+//
+// AND THE OTHER POINT: a body this codec cannot read is REFUSED.  A
+// format code that is neither text nor binary, a transaction status
+// that is not I, T or E, an unknown type byte, a length that runs past
+// the end of the message.  Each of those silently decoded produces a
+// wrong answer rather than an error, so each has a case below.
+
+use std.test
+use std.bytes
+use pgerror
+use pgmsg
+
+// A buffer from the hex a server would put on the wire.
+fn wire(hex: Str) -> Bytes
+    match bytes.from_hex(hex)
+        Some(b) => b
+        None    => bytes.zeros(0)
+
+// One NUL-terminated field, as a server writes one.
+fn cstr(s: Str) -> Bytes
+    bytes.concat([bytes.from_str(s), bytes.zeros(1)])
+
+// The framed shape: type byte, then a length counting itself and the
+// body — 4 + len(body) — and not the type byte.
+fn msg(kind: Int, body: Bytes) -> Bytes
+    bytes.concat([bytes.u8(kind), bytes.u32_be(bytes.len(body) + 4), body])
+
+// The startup shape: length, then a code, and no type byte at all.
+fn startup(code: Int, body: Bytes) -> Bytes
+    bytes.concat([bytes.u32_be(bytes.len(body) + 8), bytes.u32_be(code), body])
+
+@test
+fn test_a_length_field_counts_itself_and_not_the_type_byte() [io]
+    // Forty bytes: a five-byte header, a body, and a second message
+    // behind it.  A framing that forgot that the length excludes the
+    // type byte answers 34 where the wire says 35.
+    test.case("a whole message is one byte more than the length says")
+    let one = msg('Z', bytes.u8('I'))
+    test.assert_eq_str(bytes.to_hex(one), "5a0000000549")
+    match pgmsg.frame_length(one, 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == Some(6))
+
+    test.case("and a message with a body is still one byte more")
+    let query = wire("510000000d53454c454354203100")
+    match pgmsg.frame_length(query, 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == Some(14))
+
+    test.case("the type byte is readable while the body is still in flight")
+    test.assert(pgmsg.frame_kind(query, 0) == Some('Q'))
+    test.assert_none(pgmsg.frame_kind(bytes.zeros(0), 0))
+
+    test.case("a message and a half answers the one and waits for the rest")
+    let stream = bytes.concat([query, msg('C', cstr("SELECT 1"))])
+    let whole = bytes.slice(stream, 0, 14)
+    match pgmsg.frame_length(whole, 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == Some(14))
+    match pgmsg.frame_length(stream, 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == Some(14))
+
+    test.case("and the second message is read from where the first ended")
+    match pgmsg.frame_length(stream, 14, 1048576)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == Some(14))
+
+@test
+fn test_a_length_the_wire_cannot_have_is_refused_and_not_allocated() [io]
+    // Four bytes of an attacker's choosing, in front of a body the
+    // caller sets the budget for.
+    test.case("a length shorter than its own four bytes is refused")
+    match pgmsg.frame_length(wire("5a00000000"), 0, 1048576)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and the same read from an offset into a longer buffer")
+    match pgmsg.frame_length(bytes.concat([wire("5a0000000549"), wire("5a00000000")]), 6, 1048576)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("the same, through the decoder, carrying the two numbers")
+    match pgmsg.decode_backend(wire("5a00000000"), 0, 1048576)
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert(pgerror.sqlstate(f) == "")
+            test.assert(str.contains(pgerror.describe(f), "shorter than its own four-byte header"))
+
+    test.case("a length past the caller's ceiling is refused, not honoured")
+    match pgmsg.frame_length(wire("4400001000"), 0, 1024)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "ceiling"))
+
+    test.case("and one that fits the ceiling but has not arrived is not")
+    match pgmsg.frame_length(wire("4400001000"), 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert_none(n)
+
+    test.case("a buffer that holds no header at all is not a message")
+    match pgmsg.decode_backend(bytes.zeros(4), 0, 1048576)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_every_frontend_message_encodes_to_the_bytes_a_server_reads() [io]
+    test.case("Sync, Flush and Terminate are five bytes of header and nothing else")
+    match pgmsg.encode_frontend(pgmsg.PgSync)
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "5300000004")
+    match pgmsg.encode_frontend(pgmsg.PgFlush)
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "4800000004")
+    match pgmsg.encode_frontend(pgmsg.PgTerminate)
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "5800000004")
+
+    test.case("a Query's length counts the terminating zero of its text")
+    match pgmsg.encode_frontend(pgmsg.PgQuery(sql: "SELECT 1"))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "510000000d53454c454354203100")
+
+    test.case("a Parse is a name, a statement and a parameter type list")
+    match pgmsg.encode_frontend(pgmsg.PgParse(name: "", sql: "SELECT 1", parameter_oids: []))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "50000000100053454c4543542031000000")
+
+    test.case("a Bind carries a format count, a value count and the values")
+    match pgmsg.encode_frontend(pgmsg.PgBind(portal: "", statement: "",
+                                             parameter_formats: [],
+                                             parameters: [bytes.from_str("x")],
+                                             parameter_nulls: [false],
+                                             result_formats: []))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "420000001100000000000100000001780000")
+
+    test.case("a NULL parameter is a length of minus one and no bytes")
+    match pgmsg.encode_frontend(pgmsg.PgBind(portal: "", statement: "",
+                                             parameter_formats: [],
+                                             parameters: [bytes.zeros(0)],
+                                             parameter_nulls: [true],
+                                             result_formats: []))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "4200000010000000000001ffffffff0000")
+
+    test.case("Execute names a portal and a row limit")
+    match pgmsg.encode_frontend(pgmsg.PgExecute(portal: "", max_rows: 0))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "45000000090000000000")
+
+    test.case("Describe and Close differ by one body byte and no length")
+    match pgmsg.encode_frontend(pgmsg.PgDescribeStatement(name: ""))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "44000000065300")
+    match pgmsg.encode_frontend(pgmsg.PgDescribePortal(name: ""))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "44000000065000")
+    match pgmsg.encode_frontend(pgmsg.PgCloseStatement(name: "s1"))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "430000000853733100")
+    match pgmsg.encode_frontend(pgmsg.PgClosePortal(name: "p"))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "4300000007507000")
+
+    test.case("a COPY failure is its reason, terminated")
+    match pgmsg.encode_frontend(pgmsg.PgCopyFail(reason: "bad"))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "660000000862616400")
+
+    test.case("a SASL initial response carries the mechanism and a length")
+    match pgmsg.encode_frontend(pgmsg.PgSaslInitialResponse(mechanism: "SCRAM-SHA-256",
+                                                            data: bytes.from_str("n,,n=,r=abc")))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b),
+            "7000000021534352414d2d5348412d323536000000000b6e2c2c6e3d2c723d616263")
+
+    test.case("a password message is the payload and nothing else")
+    match pgmsg.encode_frontend(pgmsg.PgPasswordMessage(data: bytes.from_str("secret")))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "700000000a736563726574")
+
+    test.case("a COPY chunk is the client's own bytes, untouched")
+    match pgmsg.encode_frontend(pgmsg.PgCopyDataOut(data: wire("010203")))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "6400000007010203")
+    match pgmsg.encode_frontend(pgmsg.PgCopyDoneOut)
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "6300000004")
+
+@test
+fn test_a_startup_packet_has_no_type_byte_at_all() [io]
+    // THE SHAPE A SERVER READS FIRST, and the reason it can tell a
+    // client from a TLS handshake on byte one: the first four bytes are
+    // a length and the next four are a version, where every other
+    // message begins with a type byte.
+    test.case("an SSLRequest is eight bytes: a length and a code")
+    match pgmsg.encode_frontend(pgmsg.PgSslRequest)
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "0000000804d2162f")
+
+    test.case("a CancelRequest is sixteen: a length, a code and two numbers")
+    match pgmsg.encode_frontend(pgmsg.PgCancelRequest(process_id: 1, secret_key: 2))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "0000001004d2162e0000000100000002")
+
+    test.case("and the cancel code is the SSL code one below it")
+    test.assert(pgmsg.cancel_request_code() == pgmsg.ssl_request_code() - 1)
+
+    test.case("a Startup is a length, version 3.0, the pairs and a last zero")
+    match pgmsg.encode_frontend(pgmsg.PgStartup(parameters: ["user", "database"],
+                                                values: ["postgres", "pg"]))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b),
+            "00000023000300007573657200706f7374677265730064617461626173650070670000")
+
+    test.case("the three codes are the protocol's own constants")
+    test.assert(pgmsg.protocol_version() == 196608)
+    test.assert(pgmsg.ssl_request_code() == 80877103)
+    test.assert(pgmsg.cancel_request_code() == 80877102)
+
+@test
+fn test_a_text_field_with_a_nul_is_refused_and_not_truncated() [io]
+    // A `Str` cannot hold a NUL, but one built by `str.from_byte` or
+    // sliced out of a buffer can carry the byte, and a field that ends
+    // early is a DIFFERENT message rather than a shorter one: the
+    // server reads the rest as the next field.
+    test.case("a query with an embedded NUL is refused")
+    let held = str.slice("SELECT 1\0FROM t", 0, 13)
+    match pgmsg.encode_frontend(pgmsg.PgQuery(sql: held))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "NUL byte"))
+
+    test.case("and a startup parameter is refused by the same check")
+    match pgmsg.encode_frontend(pgmsg.PgStartup(parameters: [str.from_byte(0)], values: ["x"]))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a Bind whose null map disagrees with its values is refused")
+    match pgmsg.encode_frontend(pgmsg.PgBind(portal: "", statement: "",
+                                             parameter_formats: [],
+                                             parameters: [bytes.zeros(0), bytes.zeros(0)],
+                                             parameter_nulls: [true],
+                                             result_formats: []))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "2 parameter(s) and 1 were supplied"))
+
+    test.case("a batch reports the first message it could not encode")
+    match pgmsg.encode_batch([pgmsg.PgSync, pgmsg.PgQuery(sql: str.from_byte(0))])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and a batch of encodable messages is their concatenation")
+    match pgmsg.encode_batch([pgmsg.PgFlush, pgmsg.PgSync, pgmsg.PgTerminate])
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert_eq_str(bytes.to_hex(b), "480000000453000000045800000004")
+
+@test
+fn test_the_backend_decoder_reads_what_a_server_sends() [io]
+    test.case("AuthenticationOk")
+    match pgmsg.decode_backend(wire("520000000800000000"), 0, 1048576)
+        Ok(m)  => test.assert(not pgmsg.ends_exchange(m))
+        Err(_) => test.assert(false)
+
+    test.case("AuthenticationCleartextPassword")
+    match pgmsg.decode_backend(wire("520000000800000003"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgAuthentication(request) =>
+                    match request
+                        PgAuthCleartext => test.assert(true)
+                        _               => test.assert(false)
+                _                         => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("AuthenticationMD5Password, and the salt is the four bytes after the code")
+    match pgmsg.decode_backend(wire("520000000c0000000501020304"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgAuthentication(request) =>
+                    match request
+                        PgAuthMd5(salt) => test.assert_eq_str(bytes.to_hex(salt), "01020304")
+                        _               => test.assert(false)
+                _                         => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("AuthenticationSASL, whose mechanisms are NUL-terminated strings")
+    match pgmsg.decode_backend(wire("520000002a0000000a534352414d2d5348412d32353600534352414d2d5348412d3235362d504c55530000"),
+        0,
+        1048576)
+        Ok(m)  =>
+            match m
+                PgAuthentication(request) =>
+                    match request
+                        PgAuthSasl(mechanisms) =>
+                            test.assert(list.len(mechanisms) == 2)
+                            test.assert_eq_str(mechanisms[0], "SCRAM-SHA-256")
+                            test.assert_eq_str(mechanisms[1], "SCRAM-SHA-256-PLUS")
+                        _                      => test.assert(false)
+                _                         => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("the two SASL steps after it")
+    match pgmsg.decode_backend(wire("520000001a0000000b723d6162632c733d6465662c693d34303936"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgAuthentication(request) =>
+                    match request
+                        PgAuthSaslContinue(data) =>
+                            test.assert_eq_str(bytes.to_str(data), "r=abc,s=def,i=4096")
+                        _                        => test.assert(false)
+                _                         => test.assert(false)
+        Err(_) => test.assert(false)
+    match pgmsg.decode_backend(wire("520000000d0000000c763d78797a"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgAuthentication(request) =>
+                    match request
+                        PgAuthSaslFinal(data) =>
+                            test.assert_eq_str(bytes.to_str(data), "v=xyz")
+                        _                     => test.assert(false)
+                _                         => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("an authentication method this client does not implement is NAMED")
+    match pgmsg.decode_backend(wire("520000000800000007"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgAuthentication(request) =>
+                    match request
+                        PgAuthUnsupported(method, code) =>
+                            test.assert_eq_str(method, "GSSAPI")
+                            test.assert(code == 7)
+                        _                               => test.assert(false)
+                _                         => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("BackendKeyData, which cancellation cannot do without")
+    match pgmsg.decode_backend(wire("4b0000000c0000271012345678"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgBackendKeyData(process_id, secret_key) =>
+                    test.assert(process_id == 10000)
+                    test.assert(secret_key == 305419896)
+                _                                        => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("ParameterStatus, name and value")
+    match pgmsg.decode_backend(wire("5300000017446174655374796c650049534f2c204d445900"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgParameterStatus(name, value) =>
+                    test.assert_eq_str(name, "DateStyle")
+                    test.assert_eq_str(value, "ISO, MDY")
+                _                              => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("all three transaction statuses, and nowhere else")
+    match pgmsg.decode_backend(wire("5a0000000549"), 0, 1048576)
+        Ok(m)  => test.assert(pgmsg.tx_status(m) == Some(pgmsg.PgIdle))
+        Err(_) => test.assert(false)
+    match pgmsg.decode_backend(wire("5a0000000554"), 0, 1048576)
+        Ok(m)  => test.assert(pgmsg.tx_status(m) == Some(pgmsg.PgInTransaction))
+        Err(_) => test.assert(false)
+    match pgmsg.decode_backend(wire("5a0000000545"), 0, 1048576)
+        Ok(m)  =>
+            test.assert(pgmsg.tx_status(m) == Some(pgmsg.PgInFailedTransaction))
+            test.assert(pgmsg.ends_exchange(m))
+        Err(_) => test.assert(false)
+
+    test.case("RowDescription, every field of it")
+    // 540000001b 0001 696400 00000000 0000 00000017 0004 ffffffff 0000
+    match pgmsg.decode_backend(wire("540000001b0001696400000000000000000000170004ffffffff0000"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgRowDescription(columns) =>
+                    test.assert(list.len(columns) == 1)
+                    test.assert_eq_str(columns[0].name, "id")
+                    test.assert(columns[0].table_oid == 0)
+                    test.assert(columns[0].table_column == 0)
+                    test.assert(columns[0].type_oid == 23)
+                    test.assert(columns[0].type_size == 4)
+                    test.assert(columns[0].type_modifier == -1)
+                    test.assert(columns[0].format == PgText)
+                _                         => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("a binary column says so")
+    match pgmsg.decode_backend(wire("540000001b0001696400000000000000000000170004ffffffff0001"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgRowDescription(columns) =>
+                    test.assert(columns[0].format == PgBinary)
+                _                         => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("DataRow: a value, a NULL and an empty string are three different things")
+    match pgmsg.decode_backend(wire("440000001700030000000568656c6c6fffffffff00000000"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgDataRow(values, nulls) =>
+                    test.assert(list.len(values) == 3)
+                    test.assert_eq_str(bytes.to_str(values[0]), "hello")
+                    test.assert(nulls[1])
+                    test.assert(not nulls[2])
+                    test.assert(bytes.len(values[1]) == 0)
+                    test.assert(bytes.len(values[2]) == 0)
+                _                        => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("CommandComplete, whose tag is not parsed here")
+    match pgmsg.decode_backend(wire("430000000f494e534552542030203300"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgCommandComplete(tag) =>
+                    test.assert_eq_str(tag, "INSERT 0 3")
+                    test.assert(pgmsg.tag_rows(tag) == 3)
+                    test.assert_eq_str(pgmsg.tag_command(tag), "INSERT")
+                _                      => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("ErrorResponse, field by field")
+    match pgmsg.decode_backend(wire("450000006d534552524f5200564552524f5200433233353035004d6475706c6963617465206b65792076616c75652076696f6c6174657320756e6971756520636f6e73747261696e74202275736572735f656d61696c5f6b657922006e75736572735f656d61696c5f6b65790000"),
+        0,
+        1048576)
+        Ok(m)  =>
+            match m
+                PgErrorResponse(fields) =>
+                    test.assert_eq_str(fields.severity, "ERROR")
+                    test.assert_eq_str(fields.severity_code, "ERROR")
+                    test.assert_eq_str(fields.code, "23505")
+                    test.assert_eq_str(fields.constraint_name, "users_email_key")
+                    test.assert(str.starts_with(fields.message, "duplicate key value"))
+                    test.assert(pgmsg.discards_until_sync(m))
+                    test.assert(not pgmsg.is_asynchronous(m))
+                _                       => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("a field code this decoder does not name is kept, not dropped")
+    match pgmsg.decode_backend(wire("4e0000000a5a62617463680000"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgNoticeResponse(fields) =>
+                    test.assert(list.len(fields.extra_codes) == 1)
+                    test.assert_eq_str(fields.extra_codes[0], "Z")
+                    test.assert_eq_str(fields.extra_values[0], "batch")
+                    test.assert(pgmsg.is_asynchronous(m))
+                _                        => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("NotificationResponse, which belongs to no exchange")
+    match pgmsg.decode_backend(wire("4100000015000000076368616e007061796c6f616400"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgNotification(process_id, channel, payload) =>
+                    test.assert(process_id == 7)
+                    test.assert_eq_str(channel, "chan")
+                    test.assert_eq_str(payload, "payload")
+                    test.assert(pgmsg.is_asynchronous(m))
+                _                                            => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("ParameterDescription")
+    match pgmsg.decode_backend(wire("740000000e00020000001700000019"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgParameterDescription(type_oids) =>
+                    test.assert(list.len(type_oids) == 2)
+                    test.assert(type_oids[0] == 23)
+                    test.assert(type_oids[1] == 25)
+                _                                 => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("the four empty answers")
+    match pgmsg.decode_backend(wire("3100000004"), 0, 1048576)
+        Ok(m)  => test.assert(not pgmsg.ends_exchange(m))
+        Err(_) => test.assert(false)
+    match pgmsg.decode_backend(wire("6e00000004"), 0, 1048576)
+        Ok(m)  => test.assert(not pgmsg.is_asynchronous(m))
+        Err(_) => test.assert(false)
+    match pgmsg.decode_backend(wire("7300000004"), 0, 1048576)
+        Ok(m)  => test.assert(not pgmsg.discards_until_sync(m))
+        Err(_) => test.assert(false)
+    match pgmsg.decode_backend(wire("4900000004"), 0, 1048576)
+        Ok(m)  => test.assert(not pgmsg.ends_exchange(m))
+        Err(_) => test.assert(false)
+    match pgmsg.decode_backend(wire("3200000004"), 0, 1048576)
+        Ok(m)  => test.assert(pgmsg.tx_status(m) == None)
+        Err(_) => test.assert(false)
+    match pgmsg.decode_backend(wire("3300000004"), 0, 1048576)
+        Ok(m)  => test.assert(pgmsg.tx_status(m) == None)
+        Err(_) => test.assert(false)
+
+    test.case("the three COPY responses, which differ by direction")
+    match pgmsg.decode_backend(wire("47000000090100010000"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgCopyInResponse(format, column_formats) =>
+                    test.assert(format == PgBinary)
+                    test.assert(column_formats[0] == PgText)
+                _                                        => test.assert(false)
+        Err(_) => test.assert(false)
+    match pgmsg.decode_backend(wire("48000000090000010000"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgCopyOutResponse(format, column_formats) =>
+                    test.assert(format == PgText)
+                    test.assert(list.len(column_formats) == 1)
+                _                                         => test.assert(false)
+        Err(_) => test.assert(false)
+    match pgmsg.decode_backend(wire("5700000007000000"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgCopyBothResponse(format, column_formats) =>
+                    test.assert(format == PgText)
+                    test.assert(list.len(column_formats) == 0)
+                _                                          => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("CopyData and CopyDone")
+    match pgmsg.decode_backend(wire("640000000801020304"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgCopyData(data) => test.assert_eq_str(bytes.to_hex(data), "01020304")
+                _                => test.assert(false)
+        Err(_) => test.assert(false)
+    match pgmsg.decode_backend(wire("6300000004"), 0, 1048576)
+        Ok(m)  => test.assert(not pgmsg.ends_exchange(m))
+        Err(_) => test.assert(false)
+
+    test.case("FunctionCallResponse tells a NULL from an empty value")
+    match pgmsg.decode_backend(wire("5600000008ffffffff"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgFunctionCallResponse(value, is_null) =>
+                    test.assert(is_null)
+                    test.assert(bytes.len(value) == 0)
+                _                                      => test.assert(false)
+        Err(_) => test.assert(false)
+    match pgmsg.decode_backend(wire("560000000a000000026162"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgFunctionCallResponse(value, is_null) =>
+                    test.assert(not is_null)
+                    test.assert_eq_str(bytes.to_str(value), "ab")
+                _                                      => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("NegotiateProtocolVersion, with the options it did not know")
+    match pgmsg.decode_backend(wire("760000001500000001000000015f70715f2e666f6f00"), 0, 1048576)
+        Ok(m)  =>
+            match m
+                PgNegotiateProtocolVersion(minor, unrecognised) =>
+                    test.assert(minor == 1)
+                    test.assert_eq_str(unrecognised[0], "_pq_.foo")
+                _                                               => test.assert(false)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_body_this_codec_cannot_read_is_refused_and_not_guessed_at() [io]
+    test.case("a type byte that is not a message is not skipped over")
+    match pgmsg.decode_backend(msg('j', bytes.zeros(0)), 0, 1048576)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(pgerror.describe(f), "unknown message type"))
+
+    test.case("an authentication code the protocol does not define")
+    match pgmsg.decode_backend(wire("520000000800000063"), 0, 1048576)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("an md5 request without a whole salt cannot be answered")
+    match pgmsg.decode_backend(wire("52000000090000000501"), 0, 1048576)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a transaction status that is not I, T or E")
+    match pgmsg.decode_backend(wire("5a0000000558"), 0, 1048576)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a column format that is neither text nor binary")
+    match pgmsg.decode_backend(wire("540000001b0001696400000000000000000000170004ffffffff0007"), 0, 1048576)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and the same for a COPY response's overall format")
+    match pgmsg.decode_backend(wire("47000000090900010000"), 0, 1048576)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a COPY column format that is neither")
+    match pgmsg.decode_backend(wire("47000000090100010007"), 0, 1048576)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a DataRow column whose length runs past the message")
+    match pgmsg.decode_backend(wire("440000000c0001000000056162"), 0, 1048576)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a fast-path result whose length runs past the message")
+    match pgmsg.decode_backend(wire("560000000a00000009aaaa"), 0, 1048576)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_read_loop_walks_a_stream_one_message_at_a_time() [io]
+    // WHAT A CONNECTION ACTUALLY GETS.  A read returns a stream: two
+    // complete messages, a third that is not all there, and an
+    // asynchronous ParameterStatus in the middle that belongs to no
+    // exchange.  A loop that advanced by anything but the frame length
+    // would read the third from the wrong offset, and one that treated
+    // the ParameterStatus as a result would hand a caller a parameter
+    // where a row should be.
+    test.case("three messages, one of them half arrived")
+    let stream = bytes.concat([
+        wire("540000001b0001696400000000000000000000170004ffffffff0000"),
+        wire("440000001700030000000568656c6c6fffffffff00000000"),
+        wire("5300000017446174655374796c650049534f2c204d445900"),
+        bytes.slice(wire("5a0000000549"), 0, 3)])
+    var at = 0
+    var rows = 0
+    var params = 0
+    var more = true
+    while more
+        match pgmsg.frame_length(stream, at, 1048576)
+            Err(_) =>
+                more = false
+            Ok(n)  =>
+                match n
+                    Some(total) =>
+                        match pgmsg.decode_backend(stream, at, 1048576)
+                            Err(_) =>
+                                more = false
+                            Ok(m)  =>
+                                if pgmsg.is_asynchronous(m)
+                                    params = params + 1
+                                if pgmsg.ends_exchange(m)
+                                    more = false
+                                match m
+                                    PgDataRow(_, _) =>
+                                        rows = rows + 1
+                                    _               => ()
+                        at = at + total
+                    None        =>
+                        more = false
+    test.assert(rows == 1)
+    test.assert(params == 1)
+    test.assert(at == 76)
+
+@test
+fn test_the_three_predicates_answer_about_every_shape() [io]
+    // The read loops in `pgconn`, `pgquery`, `pgcopy` and `pgpool` all
+    // route on these, so each is asked about a message on its own side
+    // of the line and one on the other.
+    test.case("an empty query response ends nothing and is not asynchronous")
+    match pgmsg.decode_backend(wire("4900000004"), 0, 1048576)
+        Ok(m)  =>
+            test.assert(not pgmsg.ends_exchange(m))
+            test.assert(not pgmsg.is_asynchronous(m))
+            test.assert(not pgmsg.discards_until_sync(m))
+        Err(_) => test.assert(false)
+
+    test.case("a notice is asynchronous and does not start the discarding")
+    match pgmsg.decode_backend(wire("4e00000009534e4f544943450000"), 0, 1048576)
+        Ok(m)  =>
+            test.assert(pgmsg.is_asynchronous(m))
+            test.assert(not pgmsg.discards_until_sync(m))
+        Err(_) => test.assert(false)
+
+    test.case("an error does, and is not asynchronous")
+    match pgmsg.decode_backend(wire("450000000a534552524f520000"), 0, 1048576)
+        Ok(m)  =>
+            test.assert(pgmsg.discards_until_sync(m))
+            test.assert(not pgmsg.is_asynchronous(m))
+        Err(_) => test.assert(false)
+
+    test.case("the tag parser reads the last word for the count")
+    test.assert(pgmsg.tag_rows("SELECT 12") == 12)
+    test.assert(pgmsg.tag_rows("UPDATE 5") == 5)
+    test.assert(pgmsg.tag_rows("INSERT 0 3") == 3)
+    test.assert(pgmsg.tag_rows("CREATE TABLE") == 0)
+    test.assert(pgmsg.tag_rows("SELECT") == 0)
+    test.assert_eq_str(pgmsg.tag_command("SELECT 12"), "SELECT")
+    test.assert_eq_str(pgmsg.tag_command("INSERT 0 3"), "INSERT")
+    test.assert_eq_str(pgmsg.tag_command("UPDATE 5"), "UPDATE")
+    test.assert_eq_str(pgmsg.tag_command("CREATE TABLE"), "CREATE TABLE")

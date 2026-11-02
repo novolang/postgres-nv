@@ -1,10 +1,6 @@
 // pgauth_tests.nv — SCRAM against RFC 7677's own vectors, and the
 // three refusals that keep it from being a password send.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: postgres-nv.<module>.<fn>`.
-// That is the expected result until the bodies land.
-//
 // THE NONCE IS THE CALLER'S, WHICH IS WHAT MAKES THIS TESTABLE.  RFC
 // 7677 § 3 publishes a complete SCRAM-SHA-256 exchange — the user
 // `user`, the password `pencil`, the client nonce

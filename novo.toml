@@ -1,15 +1,10 @@
 [package]
 name        = "postgres-nv"
-version     = "0.0.3"
-description = "A PostgreSQL client with no libpq: the version 3 wire protocol as a codec that performs nothing, SCRAM-SHA-256 and MD5 authentication, the simple and extended query protocols, the text and binary formats for the types a program actually selects, COPY both ways, LISTEN/NOTIFY, out-of-band cancellation, a TLS hook the caller supplies, a connection pool with a policy, and a std.sql driver.  Interface only — every body is a todo()."
+version     = "0.1.0"
+description = "A PostgreSQL client with no libpq: the version 3 wire protocol as a codec that performs nothing, SCRAM-SHA-256 and MD5 authentication, the simple and extended query protocols, the text and binary formats for the types a program actually selects, COPY both ways, LISTEN/NOTIFY, out-of-band cancellation, a TLS hook the caller supplies, a connection pool with a policy, and a std.sql driver."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+stability   = "experimental"
 
 # `host`, and the split inside it is the point of the package.
 #
@@ -21,8 +16,12 @@ stability   = "draft"
 # pooler and a test double.
 #
 # `pgconn`, `pgquery`, `pgcopy`, `pgpool` and `pgdriver` are the half
-# that connects.  They declare `[net]`, `[time]` where a deadline is
-# consulted, and nothing else; no module here prints.
+# that connects.  A TRANSPORT IS `[io, net]` — `PgTransport`'s three
+# slots move bytes on a handle the caller opened, and `fd_recv` blocks
+# on it — so every function that reaches one declares `[io, net]`, plus
+# `[time]` wherever a deadline or a clock reading is consulted, which
+# is where the `[io, net, time]` row comes from.  No module here
+# prints, and none declares `[fs]` or `[rand]`.
 #
 # The `core` half is a MODULE split and not a package split, and the
 # README argues it: a codec whose only consumer is the client beside
@@ -39,7 +38,7 @@ category    = "databases"
 tags        = ["postgresql", "postgres", "wire-protocol", "scram", "database", "driver", "sql", "native-port"]
 repository  = "https://github.com/novolang/postgres-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+novo        = ">= 0.20.2"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

@@ -1,8 +1,6 @@
 // pgpool.nv — a connection pool as a VALUE with a POLICY, and the
 // three things a pool has to do that a list of sockets does not.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A POOL IS A POLICY, AND THE POLICY IS THE PART WORTH PUBLISHING.
 // Keeping sockets in a list is the easy half and nobody gets it
 // wrong.  What a pool is actually for is three decisions, each of
@@ -38,12 +36,43 @@
 // actually runs.  The README says this rather than leaving a reader
 // to find out.
 //
-// `[time]` IS DECLARED because every one of the three decisions above
-// is about a clock: a wait deadline, an idle age, a lifetime.  A pool
-// without a clock is a list.
+// TWO CONSEQUENCES OF BEING A VALUE ARE WRITTEN DOWN HERE RATHER THAN
+// LEFT FOR A CALLER TO DISCOVER:
+//
+//   * NOTHING CAN CHANGE A POOL WHILE `acquire` IS INSIDE IT.  There
+//     is no other writer to wait for — a wait would be a loop against
+//     a clock that changes nothing — so `acquire` REFUSES as soon as
+//     the limit is reached, whatever `wait_ms` says, and `wait_ms` is
+//     carried for the caller that owns the pool through a `cell` and
+//     retries on its own deadline, which is the only place a wait can
+//     be correct.
+//   * AN `Err` CARRIES NO POOL.  A refusal therefore has nowhere to be
+//     recorded: `PgPoolStats.timeouts_total` stays zero for a pool
+//     this package built, and the refusal is the `PgPoolExhausted` in
+//     the error.  A caller that reports on timeouts counts them where
+//     it sees the error; one that wants them in the pool's own
+//     counter cannot have them there — see `stats`.
+//
+// THE USE COUNT RIDES A LEDGER RATHER THAN THE CONNECTION, because a
+// lent connection is out of the idle list and there is nowhere inside
+// a `PgConn` to keep a number.  Each lend records the backend pid the
+// handshake gave that connection and the count it went out with, and
+// the release that matches the pid gives the count back — which is
+// what makes `max_uses` an exact number of lends rather than a guess
+// at one.  See `lent_pids`.
+//
+// `[io, net, time]` IS DECLARED because every one of the three
+// decisions above is about a clock — an idle age, a lifetime, a wait
+// deadline — and because every connection in the pool is a socket
+// this package writes to.  `now_ms` is the CALLER's reading wherever
+// the API takes one, so a test can age a pool without sleeping and a
+// program with one clock read per request does not take another here;
+// `warm` and `reap` take their own and say so.
 
 use pgconn
 use pgerror
+use pgmsg
+use pgquery
 
 // What the pool is allowed to do.
 pub struct PgPoolPolicy
@@ -54,15 +83,19 @@ pub struct PgPoolPolicy
     // that runs occasionally; a server wants enough to absorb a burst
     // without a handshake on the critical path.
     min_connections: Int
-    // How long `acquire` waits for one to come back before answering
-    // `PgPoolExhausted`.  ZERO MEANS REFUSE IMMEDIATELY, which is the
-    // right answer for a request handler with its own deadline — a
-    // pool that waits forever turns a slow query into a stalled
-    // service.
+    // How long a pool WOULD wait for one to come back.  This package
+    // refuses instead — a value pool has no other writer to wait for,
+    // see the module comment — and the number is kept because a
+    // policy is also a configuration a caller reports on, and because
+    // a caller that owns its pool through a `cell` uses it as the
+    // deadline for its own retry.  ZERO MEANS REFUSE IMMEDIATELY,
+    // which is the right answer for a request handler with its own
+    // deadline — a pool that waits forever turns a slow query into a
+    // stalled service.
     wait_ms: Int
     // Close an idle connection older than this.  Guards against the
     // server, a firewall or an idle timeout having closed it without
-    // telling anyone.
+    // telling anyone.  Zero means never close one for age.
     max_idle_ms: Int
     // Recycle a connection that has served this many times.  What
     // bounds the memory a long-lived backend accumulates from
@@ -74,6 +107,9 @@ pub struct PgPoolPolicy
     reset_on_release: Bool
     // Run this SQL on every freshly opened connection — a
     // `SET search_path`, a `SET statement_timeout`.  Empty for none.
+    // A statement that fails closes the connection and fails the call
+    // that opened it: a pool whose `search_path` could not be set is
+    // a pool whose every later statement runs somewhere else.
     on_connect_sql: Str
 
 // A pool.
@@ -89,11 +125,21 @@ pub struct PgPool
     idle_since_ms: [Int]
     // How many are lent out.  A count rather than the connections
     // themselves, because a borrowed connection is the borrower's and
-    // the pool has nothing to do with it until `release`.
+    // the pool has nothing to do with it until `release`.  Kept equal
+    // to `list.len(lent_pids)`.
     lent: Int
-    // How many times each idle connection has been lent, for
-    // `max_uses`.
+    // How many times each IDLE connection has served, parallel to
+    // `idle` — see `lent_pids` for the count while one is out.
     uses: [Int]
+    // The lends in flight: for each one, the backend pid the handshake
+    // gave the connection and the use count it went out with, so that
+    // the release which matches the pid can give the count back.  A
+    // connection's pid is unique among the live backends of a server,
+    // which is exactly the set a pool holds; a connection that never
+    // got a `BackendKeyData` — a handle built by hand — has pid zero,
+    // and the first such lend is the one a release of one matches.
+    lent_pids: [Int]
+    lent_uses: [Int]
     // Counters a caller reports on.
     opened_total: Int
     closed_total: Int
@@ -105,8 +151,193 @@ pub struct PgAcquired
     pool: PgPool
     conn: pgconn.PgConn
 
+// ── the pieces the bodies are built from ─────────────────────────────
+
+// The clock in milliseconds, the unit every policy number is in.
+//
+// `warm` and `reap` take their own reading because neither has a
+// caller-supplied one; every function that LENDS takes the caller's,
+// so that a test can age a pool without sleeping.
+fn now_of() -> Int [time]
+    float.to_int(time.now() * 1000.0)
+
+fn at_least(a: Int, b: Int) -> Int
+    if a > b
+        a
+    else
+        b
+
+fn at_most(a: Int, b: Int) -> Int
+    if a < b
+        a
+    else
+        b
+
+// The pool again with three counters MOVED TO — the absolute numbers,
+// not deltas, so that a caller cannot double-count by composing two
+// helpers.
+fn counted(p: PgPool, opened: Int, closed: Int, waits: Int) -> PgPool
+    PgPool { options: p.options, transport: p.transport, policy: p.policy,
+             idle: p.idle, idle_since_ms: p.idle_since_ms, uses: p.uses,
+             lent: p.lent, lent_pids: p.lent_pids, lent_uses: p.lent_uses,
+             opened_total: opened, closed_total: closed, waits_total: waits,
+             timeouts_total: p.timeouts_total }
+
+// The pool again with its ledger and its idle list replaced.
+fn relisted(p: PgPool, idle: [pgconn.PgConn], since: [Int], uses: [Int], lent: Int, pids: [Int],
+            lent_uses: [Int]) -> PgPool
+    PgPool { options: p.options, transport: p.transport, policy: p.policy,
+             idle: idle, idle_since_ms: since, uses: uses,
+             lent: lent, lent_pids: pids, lent_uses: lent_uses,
+             opened_total: p.opened_total, closed_total: p.closed_total,
+             waits_total: p.waits_total, timeouts_total: p.timeouts_total }
+
+// A fresh copy of a list of ints, so that a caller can hand it on —
+// a plain return of the list it was given is refused (E2038).
+fn copy_ints(xs: [Int]) -> [Int]
+    var out: [Int] = []
+    for v in xs
+        out = list.concat(out, [v])
+    out
+
+// One list without the element at `at`, and unchanged when `at` is
+// below zero — which is what a lend the ledger does not know answers.
+fn without_int(xs: [Int], at: Int) -> [Int]
+    if at < 0
+        return copy_ints(xs)
+    list.concat(list.take(xs, at), list.drop(xs, at + 1))
+
+// Whether the idle connection at `i` is one the pool will still lend:
+// inside its idle ceiling and under its use count.  Pure, so that
+// `has_idle` can ask it without either closing anything or declaring
+// an effect it does not have.
+fn live_at(p: PgPool, i: Int, now_ms: Int) -> Bool
+    if p.policy.max_idle_ms > 0 and now_ms - p.idle_since_ms[i] > p.policy.max_idle_ms
+        return false
+    if p.policy.max_uses > 0 and p.uses[i] >= p.policy.max_uses
+        return false
+    true
+
+// Close every idle connection and move the counter.
+fn closed_all(p: PgPool) -> PgPool [io, net]
+    var closed = p.closed_total
+    for c in p.idle
+        let _ = pgconn.close(c)
+        closed = closed + 1
+    counted(relisted(p, [], [], [], p.lent, p.lent_pids, p.lent_uses),
+            p.opened_total, closed, p.waits_total)
+
+// Close everything idle and answer the first fault, for the paths that
+// are giving the pool up rather than answering it.
+fn close_idle(p: PgPool) -> ?pgerror.PgFault [io, net]
+    var first: ?pgerror.PgFault = None
+    for c in p.idle
+        match pgconn.close(c)
+            None    => ()
+            Some(f) =>
+                if first == None
+                    first = Some(f)
+    first
+
+// Where a lent connection sits in the ledger, or -1.
+//
+// The MATCH IS THE PID and not the position, because a pool is a
+// value: two borrows can be released in the other order, and a
+// release matched by position would then hand the wrong count back.
+fn ledger_at(p: PgPool, c: pgconn.PgConn) -> Int
+    var found = -1
+    var i = 0
+    while i < list.len(p.lent_pids) and found < 0
+        if p.lent_pids[i] == c.process_id
+            found = i
+        i = i + 1
+    found
+
+// Hand a connection back into the idle list with the count it
+// deserves, and take its lend out of the ledger.
+fn kept(p: PgPool, c: pgconn.PgConn, now_ms: Int, served: Int) -> PgPool
+    let at = ledger_at(p, c)
+    counted(relisted(p, list.concat(p.idle, [c]),
+                     list.concat(p.idle_since_ms, [now_ms]),
+                     list.concat(p.uses, [served]),
+                     at_least(p.lent - 1, 0),
+                     without_int(p.lent_pids, at),
+                     without_int(p.lent_uses, at)),
+            p.opened_total, p.closed_total, p.waits_total)
+
+// A connection that is not coming back at all: out of the ledger,
+// counted closed, and the lend given up.
+fn forgotten(p: PgPool, c: pgconn.PgConn, closed: Int) -> PgPool
+    let at = ledger_at(p, c)
+    counted(relisted(p, p.idle, p.idle_since_ms, p.uses,
+                     at_least(p.lent - 1, 0),
+                     without_int(p.lent_pids, at),
+                     without_int(p.lent_uses, at)),
+            p.opened_total, p.closed_total + closed, p.waits_total)
+
+// The count a returning connection was lent with.  A connection the
+// ledger does not know — one the caller kept a copy of after a release
+// that failed, say — is taken as having served once, which is the
+// count a connection returns with on its first lend.
+fn served_count(p: PgPool, c: pgconn.PgConn) -> Int
+    let at = ledger_at(p, c)
+    if at < 0
+        return 1
+    p.lent_uses[at]
+
+// Open one connection, run the policy's `on_connect_sql` on it, and
+// answer it.
+//
+// A failure anywhere closes what was opened before answering: a
+// connection the pool cannot use is not left open, because a dropped
+// `PgConn` does not close its socket.
+fn open_one(p: PgPool) -> Result<pgconn.PgConn, pgerror.PgFault> [io, net, time]
+    let c = pgconn.connect(p.options, p.transport)!
+    if str.len(p.policy.on_connect_sql) == 0
+        return Ok(c)
+    let sent = match pgconn.send(c, pgmsg.PgQuery(sql: p.policy.on_connect_sql))
+        Err(f) =>
+            let _ = pgconn.close(c)
+            return Err(f)
+        Ok(v)  => v
+    match run_to_boundary(sent)
+        Err(f)   =>
+            let _ = pgconn.close(c)
+            Err(f)
+        Ok(done) => Ok(done)
+
+// Read to `ReadyForQuery`, answering the server's error if it sent one.
+//
+// `pgconn.drain_to_ready` reads to the boundary and cannot fail a
+// statement — an `ErrorResponse` is a message like any other to it —
+// which is the wrong answer for `on_connect_sql`, where a `SET` that
+// did not take must not be reported as a pool that is ready.
+fn run_to_boundary(c: pgconn.PgConn) -> Result<pgconn.PgConn, pgerror.PgFault> [io, net, time]
+    var conn = c
+    var done = false
+    var fault: ?pgerror.PgFault = None
+    while not done
+        let r = pgconn.next_message(conn)!
+        conn = r.conn
+        match r.message
+            PgErrorResponse(fields) =>
+                if fault == None
+                    fault = Some(pgerror.PgServerError(fields: fields))
+            _                       => ()
+        if pgmsg.ends_exchange(r.message)
+            done = true
+    match fault
+        Some(f) => Err(f)
+        None    => Ok(conn)
+
+// ── the pool ─────────────────────────────────────────────────────────
+
 // A sensible policy: ten connections, none kept idle, a five-second
 // wait, a five-minute idle ceiling, reset on release.
+//
+// `max_uses` is zero — never recycle for age of use — because a
+// program that wants a prepared-statement ceiling has to name the
+// number it wants.
 //
 // ```novo
 // use pgpool
@@ -115,7 +346,9 @@ pub struct PgAcquired
 //     println("${pgpool.default_policy().max_connections}")
 // ```
 pub fn default_policy() -> PgPoolPolicy
-    todo("postgres-nv.pgpool.default_policy")
+    PgPoolPolicy { max_connections: 10, min_connections: 0, wait_ms: 5000,
+                   max_idle_ms: 300000, max_uses: 0, reset_on_release: true,
+                   on_connect_sql: "" }
 
 // An empty pool.
 //
@@ -133,23 +366,82 @@ pub fn default_policy() -> PgPoolPolicy
 //     println("${p.lent}")
 // ```
 pub fn new_pool(o: pgconn.PgConnectOptions, t: pgconn.PgTransport, policy: PgPoolPolicy) -> PgPool
-    todo("postgres-nv.pgpool.new_pool")
+    PgPool { options: o, transport: t, policy: policy,
+             idle: [], idle_since_ms: [], uses: [], lent: 0,
+             lent_pids: [], lent_uses: [],
+             opened_total: 0, closed_total: 0,
+             waits_total: 0, timeouts_total: 0 }
 
-// Open up to `min_connections` now.
+// Open connections for start-up, and prove the pool can open one.
 //
 // So that the handshakes — a TCP connect, a TLS handshake and four
 // thousand rounds of SCRAM each — happen at start-up rather than on
 // the first request, which is when somebody is watching.
-pub fn warm(p: PgPool) -> Result<PgPool, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgpool.warm")
+//
+// THE FIRST CONNECTION IS OPENED EVEN WHEN `min_connections` IS ZERO,
+// and that is the point of the call rather than an oversight: a pool
+// that has never opened anything has proved nothing, and a start-up
+// that reported success because there was nothing to do would move
+// the first failure to the first request — the timing this call
+// exists to avoid.  So a warm pool that cannot reach the server is a
+// refusal with the fault, and the connections opened before the
+// failure are closed before it is answered.
+//
+// A `min_connections` above `max_connections` is capped rather than
+// refused: the limit is the limit.
+pub fn warm(p: PgPool) -> Result<PgPool, pgerror.PgFault> [io, net, time]
+    let target = at_most(at_least(p.policy.min_connections, 1),
+                         p.policy.max_connections)
+    var pool = p
+    while pool.lent + list.len(pool.idle) < target
+        let attempt = open_one(pool)
+        match attempt
+            Err(f) =>
+                let _ = closed_all(pool)
+                return Err(f)
+            Ok(c)  =>
+                pool = opened_into(pool, c, now_of())
+    Ok(pool)
+
+// One more idle connection, counted as opened.
+fn opened_into(p: PgPool, c: pgconn.PgConn, now_ms: Int) -> PgPool
+    counted(relisted(p, list.concat(p.idle, [c]),
+                     list.concat(p.idle_since_ms, [now_ms]),
+                     list.concat(p.uses, [0]),
+                     p.lent, p.lent_pids, p.lent_uses),
+            p.opened_total + 1, p.closed_total, p.waits_total)
+
+// Close every idle connection that is past its idle ceiling or its use
+// count.
+fn sweep(p: PgPool, now_ms: Int) -> PgPool [io, net]
+    var kept_conns: [pgconn.PgConn] = []
+    var since: [Int] = []
+    var took: [Int] = []
+    var closed = p.closed_total
+    for i in 0..list.len(p.idle)
+        if live_at(p, i, now_ms)
+            kept_conns = list.concat(kept_conns, [p.idle[i]])
+            since = list.concat(since, [p.idle_since_ms[i]])
+            took = list.concat(took, [p.uses[i]])
+        else
+            let _ = pgconn.close(p.idle[i])
+            closed = closed + 1
+    counted(relisted(p, kept_conns, since, took, p.lent, p.lent_pids,
+                     p.lent_uses),
+            p.opened_total, closed, p.waits_total)
 
 // Take a connection.
 //
 // Lends an idle one that is still good, opens a new one if the limit
-// allows, or waits up to `wait_ms` — and answers `PgPoolExhausted`
-// carrying both numbers when it cannot.  A `wait_ms` of zero refuses
-// immediately, which is what a request handler with its own deadline
-// wants.
+// allows, or answers `PgPoolExhausted` carrying both numbers.
+//
+// IT DOES NOT WAIT, whatever `wait_ms` says, and the reason is in the
+// module comment: with a pool that is a value there is no other
+// writer, so a wait would be a loop against a clock that changes
+// nothing.  A `wait_ms` of zero — the default for a handler with a
+// deadline of its own — and a `wait_ms` of five seconds therefore
+// behave the same here, and a caller that must wait retries on its
+// own deadline against a pool it owns through a `cell`.
 //
 // `now_ms` is the CALLER's clock reading, so that a test can age a
 // pool without sleeping and so that a program with one clock read per
@@ -166,8 +458,44 @@ pub fn warm(p: PgPool) -> Result<PgPool, pgerror.PgFault> [net, time]
 //         Ok(a)  => println("${a.pool.lent}")
 //         Err(_) => println("exhausted")
 // ```
-pub fn acquire(p: PgPool, now_ms: Int) -> Result<PgAcquired, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgpool.acquire")
+pub fn acquire(p: PgPool, now_ms: Int) -> Result<PgAcquired, pgerror.PgFault> [io, net, time]
+    let ready = sweep(p, now_ms)
+    if list.len(ready.idle) > 0
+        return Ok(lend(ready))
+    if ready.lent + list.len(ready.idle) >= ready.policy.max_connections
+        return Err(pgerror.PgPoolExhausted(in_use: ready.lent,
+                                           limit: ready.policy.max_connections))
+    let attempt = open_one(ready)
+    match attempt
+        Err(f) =>
+            let _ = closed_all(ready)
+            Err(f)
+        Ok(c)  =>
+            let grown = counted(opened_into(ready, c, now_ms),
+                                ready.opened_total + 1, ready.closed_total,
+                                ready.waits_total + 1)
+            Ok(lend(grown))
+
+// Lend the head of the idle list, recording the lend in the ledger.
+fn lend(p: PgPool) -> PgAcquired
+    let c = p.idle[0]
+    PgAcquired { pool: relisted(p, list.drop(p.idle, 1),
+                                list.drop(p.idle_since_ms, 1),
+                                list.drop(p.uses, 1),
+                                p.lent + 1,
+                                list.concat(p.lent_pids, [c.process_id]),
+                                list.concat(p.lent_uses, [p.uses[0] + 1])),
+                 conn: c }
+
+// True when the connection is inside a transaction the next borrower
+// must not inherit.
+fn needs_reset(p: PgPool, c: pgconn.PgConn) -> Bool
+    if not p.policy.reset_on_release
+        return false
+    match c.status
+        PgInTransaction       => true
+        PgInFailedTransaction => true
+        _                     => false
 
 // Give a connection back.
 //
@@ -177,6 +505,20 @@ pub fn acquire(p: PgPool, now_ms: Int) -> Result<PgAcquired, pgerror.PgFault> [n
 // `PgInFailedTransaction` or `PgInTransaction` would otherwise hand
 // the next borrower somebody else's transaction.  A connection that
 // is broken, too old or too used is closed instead of kept.
+//
+// A CLOSE ON THE WAY BACK IS A SUCCESSFUL RELEASE: a broken
+// connection, and one whose rollback failed, are closed and counted in
+// `closed_total`, and the pool is answered — there is nothing for the
+// caller to do about a socket that is already gone.
+//
+// THE ONE `Err` IS A ROLLBACK THAT FAILED.  The connection is closed
+// — never kept, because its transaction state is now unknown — and
+// the fault is answered because a caller must hear that a statement
+// it thought had rolled back may not have.  THE POOL THE CALLER STILL
+// HOLDS STILL COUNTS THAT LEND: an `Err` carries no pool, so there is
+// nowhere to give the slot back, and a caller that kept a copy of the
+// connection can free it with `discard`.  That is the trade the value
+// shape makes and it is written here rather than discovered.
 //
 // ```novo
 // use pgpool
@@ -193,28 +535,69 @@ pub fn acquire(p: PgPool, now_ms: Int) -> Result<PgAcquired, pgerror.PgFault> [n
 //                 Err(_) => println("could not reset")
 // ```
 pub fn release(p: PgPool, c: pgconn.PgConn,
-               now_ms: Int) -> Result<PgPool, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgpool.release")
+               now_ms: Int) -> Result<PgPool, pgerror.PgFault> [io, net, time]
+    let served = served_count(p, c)
+    if c.broken
+        let _ = pgconn.close(c)
+        return Ok(forgotten(p, c, 1))
+    if not needs_reset(p, c)
+        return Ok(kept(p, c, now_ms, served))
+    match pgquery.rollback(c)
+        Err(f)    =>
+            let _ = pgconn.close(c)
+            Err(f)
+        // The connection the rollback answered is the one kept: it is
+        // the one whose `status` says the transaction is over, and a
+        // borrower that read the stale one would think otherwise.
+        Ok(reset) => Ok(kept(p, reset, now_ms, served))
 
 // Give a connection back and throw it away.
 //
 // What a caller does when it knows the connection is no good — it
 // cancelled a query on it, or it caught a `pgerror.is_fatal` — rather
 // than making the pool work it out.
-pub fn discard(p: PgPool, c: pgconn.PgConn) -> PgPool [net]
-    todo("postgres-nv.pgpool.discard")
+pub fn discard(p: PgPool, c: pgconn.PgConn) -> PgPool [io, net]
+    let _ = pgconn.close(c)
+    forgotten(p, c, 1)
 
 // Close every idle connection older than `max_idle_ms`, and top back
 // up to `min_connections`.
 //
 // Called by a program's own timer; this package starts no thread and
 // has no timer of its own, which is what keeps it a value.
-pub fn reap(p: PgPool, now_ms: Int) -> Result<PgPool, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgpool.reap")
+//
+// `min_connections` here is honoured as written: a fresh pool that
+// has lost everything is refilled, but a pool that never had a
+// minimum is not obliged to prove anything — that is `warm`'s job,
+// and doing it again on every reap would open a connection on a timer
+// forever.
+pub fn reap(p: PgPool, now_ms: Int) -> Result<PgPool, pgerror.PgFault> [io, net, time]
+    let swept = sweep(p, now_ms)
+    let target = at_most(swept.policy.min_connections, swept.policy.max_connections)
+    var pool = swept
+    while pool.lent + list.len(pool.idle) < target
+        let attempt = open_one(pool)
+        match attempt
+            Err(f) =>
+                let _ = closed_all(pool)
+                return Err(f)
+            Ok(c)  =>
+                pool = opened_into(pool, c, now_ms)
+    Ok(pool)
 
-// Close everything.
-pub fn close_pool(p: PgPool) -> ?pgerror.PgFault [net]
-    todo("postgres-nv.pgpool.close_pool")
+// Close everything the pool holds.
+//
+// THE VALUE THE CALLER HOLDS IS NOT THE THING THAT WAS CLOSED, and
+// this function has to be told so: the sockets are closed, and the
+// `PgPool` in the caller's hand still lists them, so a pool that has
+// been through here must not be used again.  It answers the first
+// close that failed, or `None`.
+//
+// LENT CONNECTIONS ARE NOT CLOSED.  The pool does not hold them —
+// that is what lending means — and a close that reached for one would
+// be a close of somebody else's socket.
+pub fn close_pool(p: PgPool) -> ?pgerror.PgFault [io, net]
+    close_idle(p)
 
 // ── what a caller reports on ─────────────────────────────────────────
 
@@ -229,6 +612,13 @@ pub struct PgPoolStats
     // The pair that says whether the limit is too low: waits without
     // timeouts is a pool at capacity and coping, waits WITH timeouts
     // is a pool that is losing requests.
+    //
+    // `waits_total` counts the acquires that could not be served from
+    // an idle connection — the handshake was on the critical path —
+    // and `timeouts_total` STAYS ZERO for a pool this package built:
+    // a refusal is an `Err`, an `Err` carries no pool, and there is
+    // nowhere to record it.  See the module comment.  A caller that
+    // wants the second number counts its own `PgPoolExhausted`s.
     waits_total: Int
     timeouts_total: Int
 
@@ -244,10 +634,26 @@ pub struct PgPoolStats
 //     println("${pgpool.stats(p).limit}")
 // ```
 pub fn stats(p: PgPool) -> PgPoolStats
-    todo("postgres-nv.pgpool.stats")
+    PgPoolStats { idle: list.len(p.idle), lent: p.lent,
+                  limit: p.policy.max_connections,
+                  opened_total: p.opened_total, closed_total: p.closed_total,
+                  waits_total: p.waits_total,
+                  timeouts_total: p.timeouts_total }
 
-// Whether the pool would lend right now without opening or waiting.
+// Whether the pool would lend right now without opening.
 //
 // The question a load shedder asks before it accepts a request.
+//
+// It COUNTS the same connections `acquire` would lend — the ones that
+// are neither past the idle ceiling nor past their use count — and it
+// does not close the ones that are: closing is not a question a load
+// shedder asks, and a pure predicate is one a caller can call in the
+// middle of anything.
 pub fn has_idle(p: PgPool, now_ms: Int) -> Bool
-    todo("postgres-nv.pgpool.has_idle")
+    var i = 0
+    var found = false
+    while i < list.len(p.idle) and not found
+        if live_at(p, i, now_ms)
+            found = true
+        i = i + 1
+    found

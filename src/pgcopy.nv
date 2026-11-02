@@ -1,8 +1,6 @@
 // pgcopy.nv — `COPY` in both directions: the fastest way to get bulk
 // data in or out of PostgreSQL, and the one that is easiest to corrupt.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `COPY` IS AN ORDER OF MAGNITUDE FASTER THAN `INSERT` and it is the
 // reason this module exists rather than a loop.  A million rows as a
 // million `INSERT`s is a million round trips and a million plans; the
@@ -42,6 +40,15 @@
 // the socket leaves the server to discover the disconnect; a client
 // that sends `CopyFail` with a reason gets that reason into the
 // server's log and an immediate, clean abort.
+//
+// A COPY STREAM CARRIES NO COLUMN TYPES.  There is no `RowDescription`
+// anywhere in it — the server flattens the rows and the type of every
+// column is in the SQL the caller wrote and nowhere on the wire — so
+// every value `recv_rows` answers is a `PgUnknown` carrying its format
+// and its bytes.  A caller with the column OIDs from its own statement
+// reads them with `pgtype.decode`; a caller moving bytes to a file
+// does not care.  Answering `PgStr` instead would be a guess that is
+// silently wrong for every column that is not text.
 
 use pgconn
 use pgtype
@@ -85,6 +92,326 @@ pub struct PgCopyOut
     received_bytes: Int
     // True once `CopyDone` arrived.
     finished: Bool
+    // True once the binary header has been taken off the front of the
+    // stream, so it is skipped once.  It arrives as ordinary
+    // `CopyData` — there is no message for it — so the reader has to
+    // remember that the first bytes of a binary stream are not a row.
+    header_read: Bool
+
+// The row count the server reported for a finished `COPY FROM`.
+pub struct PgCopyInDone
+    conn: pgconn.PgConn
+    rows: Int
+
+// One chunk of raw copy data, and the stream it left behind.
+pub struct PgCopyChunk
+    stream: PgCopyOut
+    data: Bytes
+
+// The complete rows drained from the stream, and the stream.
+pub struct PgCopyRows
+    stream: PgCopyOut
+    rows: [[pgtype.PgValue]]
+
+// ── the pieces the bodies are built from ─────────────────────────────
+
+// The delimiter each format's rows are separated by.  The binary
+// format has none and never reaches this.
+fn delimiter_of(format: PgCopyFormat) -> Str
+    match format
+        PgCopyCsv => ","
+        _         => "\t"
+
+// Whether a format's fields are text on the wire.
+fn is_textual(format: PgCopyFormat) -> Bool
+    match format
+        PgCopyBinary => false
+        _            => true
+
+// Whether a format's bytes are the binary form, on either side of the
+// module — the wire's `PgFormat` and this module's `PgCopyFormat`.
+fn ours_is_binary(f: PgCopyFormat) -> Bool
+    match f
+        PgCopyBinary => true
+        _            => false
+
+fn theirs_is_binary(f: pgmsg.PgFormat) -> Bool
+    match f
+        PgBinary => true
+        PgText   => false
+
+// True when the server's format is the one this module is about to
+// write.  `begin_in`'s whole reason for existing: the SQL names the
+// format too, and an encoder and a statement that disagree produce a
+// stream the server rejects only at the end, after everything has been
+// sent.
+fn format_agrees(ours: PgCopyFormat, theirs: pgmsg.PgFormat) -> Bool
+    ours_is_binary(ours) == theirs_is_binary(theirs)
+
+// One int16 with its sign: 65535 is -1, which is the trailer's column
+// count.
+fn as_i16(raw: Int) -> Int
+    if raw >= 32768
+        raw - 65536
+    else
+        raw
+
+// One int32 with its sign: 4294967295 is -1, which is a NULL column.
+fn as_i32(raw: Int) -> Int
+    if raw >= 2147483648
+        raw - 4294967296
+    else
+        raw
+
+fn i16_at(buf: Bytes, at: Int) -> Int
+    as_i16(bytes.u16_be_at(buf, at) ?? 0)
+
+fn i32_at(buf: Bytes, at: Int) -> Int
+    as_i32(bytes.u32_be_at(buf, at) ?? 0)
+
+// One field of a text-format row, escaped the way PostgreSQL's own
+// reader undoes it: a backslash before a backslash, before a newline,
+// before a carriage return and before the delimiter character.
+//
+// The delimiter is escaped only when it is not the tab: tab, newline
+// and carriage return have a short form of their own (`\t` and so on)
+// and rewriting them twice would put two backslashes in front of one
+// character.
+fn escape_text(s: Str, delimiter: Str) -> Str
+    var out = str.replace_all(s, "\\", "\\\\")
+    out = str.replace_all(out, "\n", "\\n")
+    out = str.replace_all(out, "\r", "\\r")
+    out = str.replace_all(out, "\t", "\\t")
+    if delimiter != "\t" and str.len(delimiter) > 0
+        out = str.replace_all(out, delimiter, "\\${delimiter}")
+    out
+
+// The inverse: one field's text, with its backslash escapes undone.
+fn unescape_text(s: Str, delimiter: Str) -> Str
+    var out = ""
+    var i = 0
+    while i < str.len(s)
+        let c = str.byte_at(s, i) ?? 0
+        if c == '\\' and i + 1 < str.len(s)
+            out = "${out}${unescaped(str.byte_at(s, i + 1) ?? 0)}"
+            i = i + 2
+        else
+            out = "${out}${str.from_byte(c)}"
+            i = i + 1
+    out
+
+// What one escape sequence's letter stands for.  A letter with no
+// meaning is passed through as itself, which is what PostgreSQL's own
+// reader does rather than refusing the row.
+fn unescaped(c: Int) -> Str
+    match c
+        110 => "\n"
+        114 => "\r"
+        116 => "\t"
+        98  => "\b"
+        102 => "\f"
+        118 => "\v"
+        _   => str.from_byte(c)
+
+// One field of a text-format row as a value: the null marker is NULL
+// and everything else is text with its escapes undone.
+fn text_value(field: Str, null_marker: Str, delimiter: Str) -> pgtype.PgValue
+    if field == null_marker
+        return PgNull
+    PgUnknown(oid: 0, format: pgmsg.PgText,
+              raw: bytes.from_str(unescape_text(field, delimiter)))
+
+// One field of a CSV row: a quoted field has its quotes taken off and
+// its doubled quotes collapsed, and an empty unquoted field is NULL —
+// PostgreSQL's own output rule, and the reason `""` and nothing are
+// different values in a CSV copy.
+fn csv_value(field: Str) -> pgtype.PgValue
+    if str.len(field) >= 2 and str.starts_with(field, "\"") and str.ends_with(field, "\"")
+        return PgUnknown(oid: 0, format: pgmsg.PgText,
+                         raw: bytes.from_str(str.replace_all(
+                                 str.slice(field, 1, str.len(field) - 1), "\"\"", "\"")))
+    if field == ""
+        return PgNull
+    PgUnknown(oid: 0, format: pgmsg.PgText, raw: bytes.from_str(field))
+
+// One field of a CSV row, quoted the way PostgreSQL's own CSV reader
+// expects: quoted when it is empty, or holds the delimiter, a quote, a
+// newline or a carriage return, with every quote inside doubled.
+//
+// The quoting is what tells an empty string from a NULL: a field of
+// nothing at all is NULL and `""` is the empty string.  A writer that
+// wrote nothing for both would lose the difference, which is why the
+// generic textual encoder is not used for CSV.
+fn csv_field(s: Str, delimiter: Str) -> Str
+    let needs = str.len(s) == 0
+        or str.contains(s, delimiter)
+        or str.contains(s, "\"")
+        or str.contains(s, "\n")
+        or str.contains(s, "\r")
+    if needs
+        return "\"${str.replace_all(s, "\"", "\"\"")}\""
+    s
+
+// One CSV row, in PostgreSQL's CSV format.
+fn encode_csv_row(values: [pgtype.PgValue]) -> Result<Bytes, pgerror.PgFault>
+    var out = ""
+    var first = true
+    for v in values
+        if not first
+            out = "${out},"
+        first = false
+        let one = pgtype.encode(v, pgmsg.PgText)!
+        if not one.is_null
+            out = "${out}${csv_field(bytes.to_str(one.raw), ",")}"
+    Ok(bytes.from_str("${out}\n"))
+
+// The complete rows at the front of a text or CSV buffer, and the
+// bytes that are not a row yet.
+//
+// A row is complete when its newline has arrived, which is the whole
+// of the framing rule for both of the textual formats — the last
+// newline in the buffer is where the complete part ends.
+fn cut_rows(buf: Bytes, format: PgCopyFormat) -> ([Str], Bytes)
+    match bytes.rfind(buf, bytes.from_byte_list(['\n']))
+        None     => ([], bytes.clone(buf))
+        Some(at) =>
+            let complete = bytes.to_str(bytes.slice(buf, 0, at))
+            let rest = bytes.slice(buf, at + 1, bytes.len(buf))
+            (strip_cr(str.split(complete, "\n"), format), rest)
+
+// A CSV row's carriage return, which a server that wrote its stream on
+// Windows leaves in front of every newline and which is not part of
+// any field.
+fn strip_cr(lines: [Str], format: PgCopyFormat) -> [Str]
+    if format != PgCopyCsv
+        return lines[:]
+    var out: [Str] = []
+    for line in lines
+        if str.ends_with(line, "\r")
+            out = list.concat(out, [str.slice(line, 0, str.len(line) - 1)])
+        else
+            out = list.concat(out, [line])
+    out
+
+// One textual row split into values.
+fn text_row(line: Str, format: PgCopyFormat, null_marker: Str) -> [pgtype.PgValue]
+    let delimiter = delimiter_of(format)
+    var out: [pgtype.PgValue] = []
+    for field in str.split(line, delimiter)
+        if format == PgCopyCsv
+            out = list.concat(out, [csv_value(field)])
+        else
+            out = list.concat(out, [text_value(field, null_marker, delimiter)])
+    out
+
+// How many bytes the binary row at `at` occupies: its length when the
+// whole row is there, -1 when the buffer stops in the middle of one,
+// and -2 for the trailer — a column count of -1, which is where a
+// binary stream ends.
+fn binary_row_size(buf: Bytes, at: Int) -> Int
+    if bytes.len(buf) - at < 2
+        return -1
+    let columns = i16_at(buf, at)
+    if columns < 0
+        return -2
+    var cursor = at + 2
+    var i = 0
+    while i < columns
+        if bytes.len(buf) - cursor < 4
+            return -1
+        let size = i32_at(buf, cursor)
+        cursor = cursor + 4
+        if size > 0
+            if bytes.len(buf) - cursor < size
+                return -1
+            cursor = cursor + size
+        i = i + 1
+    cursor - at
+
+// One binary row decoded as far as the stream allows: a length of -1
+// is a NULL and everything else is bytes whose type is not on the
+// wire — see the module comment.
+fn binary_row_values(buf: Bytes, at: Int) -> [pgtype.PgValue]
+    let columns = i16_at(buf, at)
+    var cursor = at + 2
+    var out: [pgtype.PgValue] = []
+    var i = 0
+    while i < columns
+        let size = i32_at(buf, cursor)
+        cursor = cursor + 4
+        if size < 0
+            out = list.concat(out, [PgNull])
+        else
+            out = list.concat(out, [PgUnknown(oid: 0, format: pgmsg.PgBinary,
+                                              raw: bytes.slice(buf, cursor, cursor + size))])
+            cursor = cursor + size
+        i = i + 1
+    out
+
+// `PgCopyIn` again with the connection or the count moved.
+fn with_sent(s: PgCopyIn, conn: pgconn.PgConn, bytes_sent: Int, header: Bool) -> PgCopyIn
+    PgCopyIn { conn: conn, format: s.format, column_formats: s.column_formats,
+               sent_bytes: bytes_sent, header_sent: header }
+
+// `PgCopyOut` again with the stream moved.
+fn with_partial(s: PgCopyOut, conn: pgconn.PgConn, partial: Bytes, received: Int, header: Bool,
+                finished: Bool) -> PgCopyOut
+    PgCopyOut { conn: conn, format: s.format, column_formats: s.column_formats,
+                partial: partial, received_bytes: received, finished: finished,
+                header_read: header }
+
+// Write one `CopyData` chunk, or nothing at all when there is nothing
+// to write — an empty chunk is legal and is one more thing on the wire
+// for nobody.
+fn send_chunk(s: PgCopyIn, data: Bytes) -> Result<PgCopyIn, pgerror.PgFault> [io, net]
+    if bytes.len(data) == 0
+        return Ok(s)
+    let sent = pgconn.send(s.conn, pgmsg.PgCopyDataOut(data: data))!
+    Ok(with_sent(s, sent, s.sent_bytes + bytes.len(data), s.header_sent))
+
+// Read messages until the one that starts the copy, or the error that
+// says it never will.
+//
+// A `COPY` that the server runs on its own machine — `COPY t TO
+// 'file'` — answers `CommandComplete` and no copy response at all,
+// which is a copy this client cannot stream; it is named rather than
+// left to time out.
+fn await_copy_start(c: pgconn.PgConn) -> Result<(pgconn.PgConn, pgmsg.PgBackend), pgerror.PgFault> [io, net, time]
+    var current = c
+    while true
+        let r = pgconn.next_message(current)!
+        current = r.conn
+        match r.message
+            PgCopyInResponse(_, _)  =>
+                return Ok((current, r.message))
+            PgCopyOutResponse(_, _) =>
+                return Ok((current, r.message))
+            PgErrorResponse(fields) =>
+                return Err(pgerror.PgServerError(fields: fields))
+            PgCommandComplete(_)    =>
+                return Err(pgerror.PgCopyFailed(detail: "the statement finished without a copy: a server-side COPY reads or writes a file this client cannot stream"))
+            _                       => ()
+
+// Read to `ReadyForQuery`, dropping what is in between.
+//
+// The end of every copy: `CommandComplete`, then the boundary.  The
+// tag is what says how many rows the server took, and it is answered
+// rather than dropped so that `finish_in` can report it.
+fn read_to_boundary(conn: pgconn.PgConn) -> Result<(pgconn.PgConn, Str), pgerror.PgFault> [io, net, time]
+    var current = conn
+    var tag = ""
+    var done = false
+    while not done
+        let r = pgconn.next_message(current)!
+        current = r.conn
+        match r.message
+            PgCommandComplete(t) =>
+                tag = t
+            PgErrorResponse(_)   => ()
+            _                    => ()
+        if pgmsg.ends_exchange(r.message)
+            done = true
+    Ok((current, tag))
 
 // ── copying in ───────────────────────────────────────────────────────
 
@@ -96,6 +423,11 @@ pub struct PgCopyOut
 // says what this module will ENCODE, and a mismatch with the
 // statement is refused here rather than discovered by the server
 // after a million rows.
+//
+// The mismatch is caught by asking the SERVER, not by reading the SQL:
+// `CopyInResponse` names the format the statement asked for, and a
+// text encoder pointed at a statement that says `FORMAT binary` is
+// refused before a byte of data is sent.
 //
 // ```novo
 // use pgcopy
@@ -110,23 +442,61 @@ pub struct PgCopyOut
 //                 Err(_) => println("refused")
 // ```
 pub fn begin_in(c: pgconn.PgConn, sql: Str,
-                format: PgCopyFormat) -> Result<PgCopyIn, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgcopy.begin_in")
+                format: PgCopyFormat) -> Result<PgCopyIn, pgerror.PgFault> [io, net, time]
+    let sent = pgconn.send(c, pgmsg.PgQuery(sql: sql))!
+    let started = await_copy_start(sent)!
+    // THE PROJECTIONS ARE BOUND BEFORE THE `match`.  Matching a
+    // projection — `match started.1` — leaves the field's own allocation
+    // neither dropped nor moved, one object per call; the copy suite
+    // reported six.  `NOVO_PERCEUS_VERIFY_LEAKS=1` names it as a
+    // Perceus-verifier leak in this function, and binding the two
+    // projections to `let`s is the workaround the compiler accepts.
+    let copied = started.0
+    let message = started.1
+    match message
+        PgCopyInResponse(server_format, column_formats) =>
+            if not format_agrees(format, server_format)
+                return Err(pgerror.PgCopyFailed(detail: "the statement asks the server for one format and this call encodes another"))
+            Ok(PgCopyIn { conn: copied, format: format,
+                          column_formats: column_formats, sent_bytes: 0,
+                          header_sent: false })
+        _                                               =>
+            Err(pgerror.PgCopyFailed(detail: "the statement is not a COPY FROM STDIN"))
 
 // Send a chunk of already-encoded data.
 //
 // The low-level door: a caller with a file already in PostgreSQL's
 // text format streams it through here without this module encoding
 // anything.
-pub fn send_raw(s: PgCopyIn, data: Bytes) -> Result<PgCopyIn, pgerror.PgFault> [net]
-    todo("postgres-nv.pgcopy.send_raw")
+pub fn send_raw(s: PgCopyIn, data: Bytes) -> Result<PgCopyIn, pgerror.PgFault> [io, net]
+    send_chunk(s, data)
 
 // Send one row, encoded in the stream's format.
 //
 // In binary format this writes the header first if it has not gone
 // out yet — see `header_sent`.
-pub fn send_row(s: PgCopyIn, values: [pgtype.PgValue]) -> Result<PgCopyIn, pgerror.PgFault> [net]
-    todo("postgres-nv.pgcopy.send_row")
+pub fn send_row(s: PgCopyIn,
+                values: [pgtype.PgValue]) -> Result<PgCopyIn, pgerror.PgFault> [io, net]
+    var stream = s
+    if s.format == PgCopyBinary and not s.header_sent
+        stream = send_chunk(s, binary_header())!
+        stream = with_sent(stream, stream.conn, stream.sent_bytes, true)
+    // The `!` is applied to the `match` once, not inside each arm, and
+    // that is a workaround rather than a preference.  With the `!` on
+    // the arms this line stranded the row — one object per `send_row`
+    // call, four in the copy suite — and with the arms returning their
+    // `Result` and one `!` below, the same suite is clean.  It is the
+    // same family as
+    // `memory-perceus/an-inline-argument-allocation-under-a-bang-unwrap-takes-no-scope-end-drop`;
+    // that filing's standalone reduction does not cover this shape (the
+    // small programs tried here were clean), so what is recorded is the
+    // measurement, not a cause.
+    let encoded = match s.format
+        PgCopyText   => encode_text_row(values, "\t", "\\N")
+        PgCopyCsv    => encode_csv_row(values)
+        PgCopyBinary => encode_binary_row(values)
+    let row = encoded!
+    send_chunk(stream, row)
 
 // Finish: the binary trailer if the format needs one, then
 // `CopyDone`, then read to `ReadyForQuery`.
@@ -134,13 +504,13 @@ pub fn send_row(s: PgCopyIn, values: [pgtype.PgValue]) -> Result<PgCopyIn, pgerr
 // THE TRAILER IS THE PART A WRITER FORGETS — see the module comment.
 // Answering the row count the server reports is what tells a caller
 // the server agreed about how many rows there were.
-pub struct PgCopyInDone
-    conn: pgconn.PgConn
-    rows: Int
-
-// End the copy.
-pub fn finish_in(s: PgCopyIn) -> Result<PgCopyInDone, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgcopy.finish_in")
+pub fn finish_in(s: PgCopyIn) -> Result<PgCopyInDone, pgerror.PgFault> [io, net, time]
+    var stream = s
+    if s.format == PgCopyBinary and s.header_sent
+        stream = send_chunk(s, binary_trailer())!
+    let said = pgconn.send(stream.conn, pgmsg.PgCopyDoneOut)!
+    let ended = read_to_boundary(said)!
+    Ok(PgCopyInDone { conn: ended.0, rows: pgmsg.tag_rows(ended.1) })
 
 // Abort the copy with a reason.
 //
@@ -148,32 +518,110 @@ pub fn finish_in(s: PgCopyIn) -> Result<PgCopyInDone, pgerror.PgFault> [net, tim
 // comment.  The reason reaches the server's log and the abort is
 // immediate.
 //
+// The server answers with an error of its own for the aborted copy —
+// `COPY from stdin failed: <reason>` — and that error is EXPECTED and
+// is not what this answers: the call did what it was asked to do, and
+// reporting the server's complaint as this call's failure would make
+// every deliberate abort look like a fault.
+//
 // ```novo
 // use pgcopy
 //
 // fn main() [io, net, time]
 //     println("a client that gives up says why")
 // ```
-pub fn fail_in(s: PgCopyIn, reason: Str) -> Result<pgconn.PgConn, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgcopy.fail_in")
+pub fn fail_in(s: PgCopyIn, reason: Str) -> Result<pgconn.PgConn, pgerror.PgFault> [io, net, time]
+    let said = pgconn.send(s.conn, pgmsg.PgCopyFail(reason: reason))!
+    let ended = read_to_boundary(said)!
+    Ok(ended.0)
 
 // ── copying out ──────────────────────────────────────────────────────
 
 // Start a `COPY … TO STDOUT`.
 pub fn begin_out(c: pgconn.PgConn, sql: Str,
-                 format: PgCopyFormat) -> Result<PgCopyOut, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgcopy.begin_out")
+                 format: PgCopyFormat) -> Result<PgCopyOut, pgerror.PgFault> [io, net, time]
+    let sent = pgconn.send(c, pgmsg.PgQuery(sql: sql))!
+    let started = await_copy_start(sent)!
+    // Projections bound before the `match` — see `begin_in`.
+    let copied = started.0
+    let message = started.1
+    match message
+        PgCopyOutResponse(server_format, column_formats) =>
+            if not format_agrees(format, server_format)
+                return Err(pgerror.PgCopyFailed(detail: "the statement asks the server for one format and this call decodes another"))
+            Ok(PgCopyOut { conn: copied, format: format,
+                           column_formats: column_formats, partial: bytes.zeros(0),
+                           received_bytes: 0, finished: false, header_read: false })
+        _                                                =>
+            Err(pgerror.PgCopyFailed(detail: "the statement is not a COPY TO STDOUT"))
 
 // Read the next chunk of raw data, whatever the server sent.
 //
 // An empty chunk with `finished` set is the end.
-pub struct PgCopyChunk
-    stream: PgCopyOut
-    data: Bytes
+//
+// The header of a binary stream is NOT skipped here: this is the raw
+// door, a caller that asked for it gets the stream exactly as the
+// server wrote it, signature and all.
+pub fn recv_raw(s: PgCopyOut) -> Result<PgCopyChunk, pgerror.PgFault> [io, net, time]
+    if s.finished
+        return Ok(PgCopyChunk { stream: s, data: bytes.zeros(0) })
+    let r = pgconn.next_message(s.conn)!
+    // Projections bound before the `match` — see `begin_in`.
+    let arrived = r.conn
+    let message = r.message
+    match message
+        PgCopyData(data)        =>
+            let moved = with_partial(s, arrived, s.partial,
+                                     s.received_bytes + bytes.len(data),
+                                     s.header_read, false)
+            Ok(PgCopyChunk { stream: moved, data: data })
+        PgCopyDone              =>
+            Ok(PgCopyChunk { stream: with_partial(s, arrived, s.partial,
+                                                  s.received_bytes, s.header_read, true),
+                             data: bytes.zeros(0) })
+        PgErrorResponse(fields) => Err(pgerror.PgServerError(fields: fields))
+        _                       =>
+            Err(pgerror.PgCopyFailed(detail: "a message that is not copy data arrived inside a COPY TO STDOUT"))
 
-// Read a chunk.
-pub fn recv_raw(s: PgCopyOut) -> Result<PgCopyChunk, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgcopy.recv_raw")
+// The complete rows in the buffer, and the bytes that are not a row
+// yet.  The binary header, if the stream is binary and it has not been
+// taken off yet, is dropped here.
+fn drain_rows(s: PgCopyOut) -> ([[pgtype.PgValue]], Bytes, Bool)
+    var buf = bytes.clone(s.partial)
+    var header = s.header_read
+    if ours_is_binary(s.format) and not header
+        if bytes.len(buf) < bytes.len(binary_header())
+            return ([], bytes.clone(buf), header)
+        buf = bytes.slice(buf, bytes.len(binary_header()), bytes.len(buf))
+        header = true
+    if not is_textual(s.format)
+        return drain_binary(buf, header)
+    let cut = cut_rows(buf, s.format)
+    var rows: [[pgtype.PgValue]] = []
+    for line in cut.0
+        rows = list.concat(rows, [text_row(line, s.format, "\\N")])
+    (rows, cut.1, header)
+
+// The binary rows in a buffer: as many as are whole, and the rest.
+//
+// The trailer — a column count of -1 — is not a row and is consumed
+// rather than answered: it is the end of the stream, and the
+// `CopyDone` that follows is what says so.
+fn drain_binary(buf: Bytes, header: Bool) -> ([[pgtype.PgValue]], Bytes, Bool)
+    var rows: [[pgtype.PgValue]] = []
+    var at = 0
+    var more = true
+    while more
+        let size = binary_row_size(buf, at)
+        if size == -2
+            at = at + 2
+            more = false
+        elif size < 0
+            more = false
+        else
+            rows = list.concat(rows, [binary_row_values(buf, at)])
+            at = at + size
+    (rows, bytes.slice(buf, at, bytes.len(buf)), header)
 
 // Read the next COMPLETE rows, whatever the chunking was.
 //
@@ -183,6 +631,14 @@ pub fn recv_raw(s: PgCopyOut) -> Result<PgCopyChunk, pgerror.PgFault> [net, time
 // list with `finished` set is the end; an empty list without it means
 // the chunk that arrived did not complete a row and the caller should
 // ask again.
+//
+// ONE CHUNK PER CALL, which is what the sentence above promises: a
+// caller that wants the whole result loops until `finished`, and a
+// caller reading a stream it intends to stop early still sees every
+// chunk.
+//
+// The values are `PgUnknown` — a copy stream carries no column types.
+// See the module comment.
 //
 // ```novo
 // use pgcopy
@@ -200,20 +656,48 @@ pub fn recv_raw(s: PgCopyOut) -> Result<PgCopyChunk, pgerror.PgFault> [net, time
 //                         Ok(b)  => println("${list.len(b.rows)}")
 //                         Err(_) => println("lost")
 // ```
-pub struct PgCopyRows
-    stream: PgCopyOut
-    rows: [[pgtype.PgValue]]
-
-// Read complete rows.
-pub fn recv_rows(s: PgCopyOut) -> Result<PgCopyRows, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgcopy.recv_rows")
+pub fn recv_rows(s: PgCopyOut) -> Result<PgCopyRows, pgerror.PgFault> [io, net, time]
+    let buffered = drain_rows(s)
+    let found = buffered.0
+    let kept = with_partial(s, s.conn, buffered.1, s.received_bytes,
+                            buffered.2, s.finished)
+    if list.len(found) > 0 or s.finished
+        return Ok(PgCopyRows { stream: kept, rows: found })
+    let chunk = recv_raw(kept)!
+    let arrived = chunk.stream
+    let data = chunk.data
+    // `together` is bound before the call rather than written inline as the
+    // argument, and it is the `!` above that makes the difference: on 0.20.2
+    // an allocation built inline in an argument list inside a `!`-unwrapped
+    // `Ok` arm takes no scope-end drop, so this continuation stranded one
+    // object every time it consumed a chunk (one per call, tag 0, rc==1).
+    // Measured here: the inline form leaks, the bound form does not, and the
+    // same is true of an explicit `match` in place of the `!`.  Filed as
+    // `memory-perceus/an-inline-argument-allocation-under-a-bang-unwrap-takes-no-scope-end-drop`.
+    let together = arrived.partial + data
+    let fed = with_partial(arrived, arrived.conn,
+                           together,
+                           arrived.received_bytes, arrived.header_read,
+                           arrived.finished)
+    let drained = drain_rows(fed)
+    let more = drained.0
+    let next = with_partial(fed, fed.conn, drained.1, fed.received_bytes,
+                            drained.2, fed.finished)
+    Ok(PgCopyRows { stream: next, rows: more })
 
 // Read to the end of the copy and return the connection.
 //
 // A caller that stops early still has to drain: the server is sending
 // and the connection is unusable until it stops.
-pub fn finish_out(s: PgCopyOut) -> Result<pgconn.PgConn, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgcopy.finish_out")
+pub fn finish_out(s: PgCopyOut) -> Result<pgconn.PgConn, pgerror.PgFault> [io, net, time]
+    var current = s
+    var done = s.finished
+    while not done
+        let chunk = recv_raw(current)!
+        current = chunk.stream
+        done = chunk.stream.finished
+    let ended = read_to_boundary(current.conn)!
+    Ok(ended.0)
 
 // ── the binary framing, published because it is where a writer goes wrong ──
 
@@ -232,19 +716,30 @@ pub fn finish_out(s: PgCopyOut) -> Result<pgconn.PgConn, pgerror.PgFault> [net, 
 //     println("${bytes.len(pgcopy.binary_header())}")
 // ```
 pub fn binary_header() -> Bytes
-    todo("postgres-nv.pgcopy.binary_header")
+    // "PGCOPY\n\377\r\n\0" — eleven bytes, and the 0xFF in the middle
+    // is the part that makes the signature binary rather than text.
+    let signature = bytes.from_byte_list([80, 71, 67, 79, 80, 89, 10, 255, 13, 10, 0])
+    bytes.concat([signature, bytes.u32_be(0), bytes.u32_be(0)])
 
 // The trailer: a column count of -1.
 //
 // The part a writer forgets, and a stream without it is one the
 // server accepts and then reports as truncated at the very end.
 pub fn binary_trailer() -> Bytes
-    todo("postgres-nv.pgcopy.binary_trailer")
+    // The field is an int16 and 65535 is -1 read with its sign.
+    bytes.u16_be(65535)
 
 // Encode one row in the binary format: a column count, then per
 // column a length and the value.
 pub fn encode_binary_row(values: [pgtype.PgValue]) -> Result<Bytes, pgerror.PgFault>
-    todo("postgres-nv.pgcopy.encode_binary_row")
+    var parts: [Bytes] = [bytes.u16_be(list.len(values))]
+    for v in values
+        let one = pgtype.encode(v, pgmsg.PgBinary)!
+        if one.is_null
+            parts = list.concat(parts, [bytes.u32_be(-1)])
+        else
+            parts = list.concat(parts, [bytes.u32_be(bytes.len(one.raw)), one.raw])
+    Ok(bytes.concat(parts))
 
 // Encode one row in the text format, with PostgreSQL's own escaping
 // and `\N` for NULL.
@@ -252,6 +747,19 @@ pub fn encode_binary_row(values: [pgtype.PgValue]) -> Result<Bytes, pgerror.PgFa
 // Published because "produce a file a `COPY` will accept" is a thing
 // programs do without a database connection, and because the escaping
 // is the part everyone gets almost right.
+//
+// The row's newline is written here; the caller writes the chunks.
 pub fn encode_text_row(values: [pgtype.PgValue], delimiter: Str,
                        null_marker: Str) -> Result<Bytes, pgerror.PgFault>
-    todo("postgres-nv.pgcopy.encode_text_row")
+    var out = ""
+    var first = true
+    for v in values
+        if not first
+            out = "${out}${delimiter}"
+        first = false
+        let one = pgtype.encode(v, pgmsg.PgText)!
+        if one.is_null
+            out = "${out}${null_marker}"
+        else
+            out = "${out}${escape_text(bytes.to_str(one.raw), delimiter)}"
+    Ok(bytes.from_str("${out}\n"))

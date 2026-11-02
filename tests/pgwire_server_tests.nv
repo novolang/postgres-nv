@@ -1,0 +1,1127 @@
+// pgwire_server_tests.nv — the client against a SOCKET, with a
+// scripted PostgreSQL on the other end of it.
+//
+// WHERE THIS SITS NEXT TO `pgwire_edge_tests.nv`.  That suite pins
+// every message's bytes with no socket anywhere: an encoder is checked
+// by hex, a decoder by the hex a server would send.  What it cannot
+// reach is everything that exists only BETWEEN two ends — that the
+// eight bytes of an `SSLRequest` go out before the startup packet and
+// are answered with one byte, that the password frame is read as a
+// frame of the length it says, that a SASL exchange is four messages
+// in the order the server expects them, that a `NoticeResponse` in the
+// middle of a startup is absorbed and a `NotificationResponse` is
+// queued rather than dropped, that `ReadyForQuery` is the message that
+// ends a wait.  So this file is the same client code, over a loopback
+// socket that a `cell` runs a scripted server on.
+//
+// THE FIXTURE'S FRAMES ARE BUILT OUT OF RAW BYTES AND NOT OUT OF
+// `pgmsg`.  A fixture that asked this package's writer what to send
+// would agree with it by construction and pin nothing.  Every frame
+// below is spelled with `bytes.u32_be` and literal strings, and every
+// frame the CLIENT sends is asserted as a literal hex string — the
+// length fields included, because a length field that is off by one is
+// invisible until a server is on the other end and then is invisible
+// no more.
+//
+// THE FIXED SCRAM EXCHANGE.  The client nonce is pinned in the
+// options, so the whole four-message exchange is deterministic, and
+// the two values that cannot be written by hand — the client proof and
+// the server signature over the auth message — are pasted in as the
+// strings a Python implementation of RFC 7677 (`hashlib.pbkdf2_hmac`
+// and `hmac`) computes for this file's nonce, salt, iteration count
+// and password.  That is deliberate: the proof is over the auth
+// message, which is over the client-first-bare, the server-first and
+// the `c=` channel-binding field, so a client that got the nonce, the
+// nonce extension or the binding field wrong produces different bytes
+// and a client that got the auth message wrong produces a proof the
+// server-side check refuses.
+//
+// NO POSTGRESQL SERVER WAS REACHABLE WHEN THIS WAS WRITTEN.  The
+// sockets here are loopback ones this file makes itself, so what is
+// exercised is the client's half of the protocol and nothing about a
+// real server's behaviour; the README says the same thing.  What is
+// exercised is the whole of what a server would see on the wire.
+//
+// The parent half is the server: it listens on an ephemeral port,
+// spawns a worker in another cell with that port, accepts the
+// connection the worker opens, and asserts the bytes.  A worker
+// reports with bits because only an `Int` crosses a cell boundary and
+// `test` is the parent's.
+
+use std.test
+use std.bytes
+use pgconn
+use pgmsg
+use pgquery
+use pgtype
+use pgpool
+use pgcopy
+use pgdriver
+use pgauth
+use pgerror
+
+// ── what crosses a cell boundary ─────────────────────────────────────
+
+fn bit(n: Int) -> Int
+    1 << n
+
+fn flag(n: Int, ok: Bool) -> Int
+    if ok
+        bit(n)
+    else
+        0
+
+fn all_set(report: Int, bits: [Int]) -> Bool
+    var seen = 0
+    for i in 0..list.len(bits)
+        seen = seen | list.get(bits, i, 0)
+    (report & seen) == seen
+
+// ── the fixture's frames, from raw bytes ─────────────────────────────
+
+// One NUL-terminated field, terminator included.
+fn cstr(s: Str) -> Bytes
+    bytes.concat([bytes.from_str(s), bytes.zeros(1)])
+
+// A typed frame: the type byte, then a length counting itself and the
+// body and NOT the type byte.
+fn frame(kind: Int, body: Bytes) -> Bytes
+    bytes.concat([bytes.u8(kind), bytes.u32_be(bytes.len(body) + 4), body])
+
+// A frame with no body at all — five bytes.
+fn bare(kind: Int) -> Bytes
+    frame(kind, bytes.zeros(0))
+
+// `AuthenticationOk`, `AuthenticationCleartextPassword` and the two
+// SASL codes are all four bytes of request code.
+fn auth(code: Int) -> Bytes
+    frame('R', bytes.u32_be(code))
+
+// `AuthenticationMD5Password`: the code, then the four-byte salt.
+fn auth_md5(salt: Bytes) -> Bytes
+    frame('R', bytes.concat([bytes.u32_be(5), salt]))
+
+// `AuthenticationSASL`: the code, then the mechanism names, each
+// NUL-terminated, closed by an empty name.
+fn auth_sasl(mechanisms: [Str]) -> Bytes
+    var parts: [Bytes] = [bytes.u32_be(10)]
+    for m in mechanisms
+        parts = list.concat(parts, [cstr(m)])
+    parts = list.concat(parts, [bytes.zeros(1)])
+    frame('R', bytes.concat(parts))
+
+// `AuthenticationSASLContinue` (11) and `AuthenticationSASLFinal`
+// (12): the code, then the server's message.
+fn auth_sasl_step(code: Int, data: Str) -> Bytes
+    frame('R', bytes.concat([bytes.u32_be(code), bytes.from_str(data)]))
+
+// `ParameterStatus`.
+fn parameter(name: Str, value: Str) -> Bytes
+    frame('S', bytes.concat([cstr(name), cstr(value)]))
+
+// `BackendKeyData`.
+fn key_data(pid: Int, key: Int) -> Bytes
+    frame('K', bytes.concat([bytes.u32_be(pid), bytes.u32_be(key)]))
+
+// `ReadyForQuery`, with the one byte of transaction status.
+fn ready(status: Int) -> Bytes
+    frame('Z', bytes.u8(status))
+
+// `NotificationResponse`.
+fn notified(pid: Int, channel: Str, payload: Str) -> Bytes
+    frame('A', bytes.concat([bytes.u32_be(pid), cstr(channel), cstr(payload)]))
+
+// `NoticeResponse`: a severity, a SQLSTATE and a message, then the
+// zero byte that ends the field set.
+fn notice(text: Str) -> Bytes
+    frame('N', bytes.concat([bytes.from_str("S"), cstr("NOTICE"),
+                             bytes.from_str("C"), cstr("00000"),
+                             bytes.from_str("M"), cstr(text), bytes.zeros(1)]))
+
+// `ErrorResponse`, the same shape with a severity of ERROR.
+fn refusal(code: Str, text: Str) -> Bytes
+    frame('E', bytes.concat([bytes.from_str("S"), cstr("ERROR"),
+                             bytes.from_str("C"), cstr(code),
+                             bytes.from_str("M"), cstr(text), bytes.zeros(1)]))
+
+// One column of a `RowDescription`: an `int4` in text format, from no
+// table, with no type modifier — name, table OID, column number, type
+// OID, type size, type modifier, format.
+fn int4_text_column(name: Str) -> Bytes
+    bytes.concat([cstr(name), bytes.u32_be(0), bytes.u16_be(0), bytes.u32_be(23),
+                  bytes.u16_be(4), bytes.u32_be(-1), bytes.u16_be(0)])
+
+fn row_description(name: Str) -> Bytes
+    frame('T', bytes.concat([bytes.u16_be(1), int4_text_column(name)]))
+
+// One `DataRow` of text values.
+fn text_rows(values: [Str]) -> Bytes
+    var parts: [Bytes] = [bytes.u16_be(list.len(values))]
+    for v in values
+        parts = list.concat(parts, [bytes.u32_be(str.len(v)), bytes.from_str(v)])
+    frame('D', bytes.concat(parts))
+
+// One `DataRow` holding a single SQL NULL.  A length of -1 and no
+// bytes after it.
+fn null_row() -> Bytes
+    frame('D', bytes.concat([bytes.u16_be(1), bytes.u32_be(-1)]))
+
+fn command(tag: Str) -> Bytes
+    frame('C', cstr(tag))
+
+// `CopyInResponse` and `CopyOutResponse`: the overall format, one
+// column, and that column's format — all text.
+fn copy_response(kind: Int) -> Bytes
+    frame(kind, bytes.concat([bytes.u8(0), bytes.u16_be(1), bytes.u16_be(0)]))
+
+fn copy_data(text: Str) -> Bytes
+    frame('d', bytes.from_str(text))
+
+// ── the fixture's fixed values ───────────────────────────────────────
+
+// The client nonce the SCRAM test puts in the options, and the
+// extension the fixture's server appends to it.  A server that echoed
+// the client's nonce back unchanged would be refused by `server_first`
+// — the extension is the replay defence — so the second half is not
+// decoration.
+fn fixture_nonce() -> Str
+    "NVFIXTURENONCE"
+
+fn fixture_salt_b64() -> Str
+    "cGdzYWx0eXNhbHQwMDAwMA=="
+
+// The server-first message for the exchange above: the full nonce, a
+// base64 salt (`pgsaltysalt00000`) and 4096 iterations, which is the
+// floor `pgauth.min_iterations` enforces.
+fn fixture_server_first() -> Str
+    "r=NVFIXTURENONCESRVFIXTURE9,s=cGdzYWx0eXNhbHQwMDAwMA==,i=4096"
+
+// The client-final message, proof included, and the server signature,
+// both as computed by `hashlib.pbkdf2_hmac('sha256', b'pencil', salt,
+// 4096)` over the auth message this exchange produces.
+fn fixture_client_final() -> Str
+    "c=biws,r=NVFIXTURENONCESRVFIXTURE9,p=pR8IEXn9H5c/VAl32K16fSEayi+AutR0F0Y0U4QkDx8="
+
+fn fixture_server_final() -> Str
+    "v=PLr9ttH54iO214eQGNJokIGCCRbd5xyWB76hgSwGvok="
+
+// The password the fixture's exchange is computed for.
+fn fixture_password() -> Str
+    "pencil"
+
+// Options pointed at the fixture's ephemeral port.  `database` and
+// `application_name` are left out so that the startup packet carries
+// exactly two pairs and can be pinned as a literal.
+//
+// THE TYPE NAME IS UNQUALIFIED AND THE LITERAL IS NOT `pgconn.PgConnect
+// Options { … }`.  A module-qualified struct literal is refused by the
+// parser — `{` after a dotted path is `E1002`, whichever side of the
+// `=` it is on — while a bare name reaches the type through the `use`
+// above.  Filed as
+// `language/a-qualified-struct-literal-is-a-parse-error`; the day it
+// lands the qualifier can come back.
+fn options_at(port: Int, password: Str, ssl: pgconn.PgSslMode,
+              allow_cleartext: Bool) -> pgconn.PgConnectOptions
+    PgConnectOptions { host: "127.0.0.1", port: port, user: "postgres",
+                       password: password, database: "", application_name: "",
+                       ssl_mode: ssl, allow_cleartext: allow_cleartext,
+                       channel_binding: pgauth.PgBindingNone,
+                       nonce: fixture_nonce(), max_message_bytes: 1048576,
+                       connect_timeout_ms: 10000, read_timeout_ms: 10000 }
+
+// ── the parent's half of the socket ──────────────────────────────────
+
+// As many bytes as the peer sent, up to `want`.  A socket read is not
+// a message: one may hand back half of one, and this is what says so
+// by answering short.
+fn filled(peer: net.Sock, want: Int) -> Bytes [net]
+    var out = bytes.zeros(0)
+    while bytes.len(out) < want
+        match net.recv_bytes(peer, want - bytes.len(out))
+            Some(got) =>
+                if bytes.len(got) == 0
+                    return out
+                out = out + got
+            None      =>
+                return out
+    out
+
+// One whole typed frame from the client: the type byte, the length,
+// and exactly as many bytes as the length declares.  Empty means the
+// peer closed or stopped mid-frame, and the assertion that wanted the
+// frame is what fails.
+fn frame_from(peer: net.Sock) -> Bytes [net]
+    let head = filled(peer, 5)
+    if bytes.len(head) < 5
+        return bytes.zeros(0)
+    let n = bytes.u32_be_at(head, 1) ?? 0
+    let whole = filled(peer, n - 4)
+    if bytes.len(whole) < n - 4
+        return bytes.zeros(0)
+    head + whole
+
+// One whole STARTUP packet, which is the one thing on this wire with no
+// type byte in front of its length.
+fn startup_from(peer: net.Sock) -> Bytes [net]
+    let head = filled(peer, 4)
+    if bytes.len(head) < 4
+        return bytes.zeros(0)
+    let n = bytes.u32_be_at(head, 0) ?? 0
+    let rest = filled(peer, n - 4)
+    if bytes.len(rest) < n - 4
+        return bytes.zeros(0)
+    head + rest
+
+fn say(peer: net.Sock, data: Bytes) -> Bool [net]
+    net.send_bytes(peer, data)
+
+// ACCEPT, BUT GIVE UP RATHER THAN BLOCK FOR EVER.  `net.accept` has no
+// deadline, so a fixture whose client died before it connected — a
+// regression in the handshake, say — would park the test until the
+// runner's own 300-second wall-clock budget killed it, with no
+// assertion named.  A bounded accept turns that into an assertion that
+// fails in fifteen seconds and says which one: the `None` arm's
+// `test.assert(false)` is the step that did not happen.
+//
+// The listener goes non-blocking for the poll, because `SO_RCVTIMEO`
+// does not apply to `accept` — `net.set_nonblocking`'s own note says
+// so — and a readable listener whose accept returned `None` is retried
+// rather than spun on.
+fn accept_within(server: net.Sock, ms: Int) -> ?(net.Sock, Str) [net]
+    let _ = net.set_nonblocking(server)
+    var waited = 0
+    while waited < ms
+        match net.accept(server)
+            Some(p) =>
+                return Some(p)
+            None    =>
+                let _ = net.fd_wait_readable(server, 100)
+                waited = waited + 100
+    None
+
+fn hex_of(b: Bytes) -> Str
+    bytes.to_hex(b)
+
+fn kind_of(m: Bytes) -> Int
+    bytes.byte_at(m, 0) ?? 0
+
+// ── the workers ──────────────────────────────────────────────────────
+
+// The startup packet, a cleartext password, the parameter and
+// identity messages, a notice, a notification, a cancel and a close.
+fn cleartext_over(port: Int) -> Int [io, net, time, ipc]
+    let o = options_at(port, "secret", pgconn.PgSslPrefer, true)
+    match pgconn.connect(o, pgconn.plain_transport())
+        Err(_) => 0
+        Ok(c)  =>
+            var report = bit(0)
+            report = report + flag(1, c.process_id == 4711)
+            report = report + flag(2, c.secret_key == 0x0badc0de)
+            report = report + flag(3, pgconn.parameter(c, "server_version") == "16.4")
+            report = report + flag(4, pgconn.parameter(c, "DateStyle") == "ISO, YMD")
+            report = report + flag(5, pgconn.parameter(c, "nothing_sent") == "")
+            let taken = pgconn.take_notifications(c)
+            report = report + flag(6, list.len(taken.notifications) == 1)
+            let first = list.get(taken.notifications, 0,
+                                 pgmsg.PgReadyForQuery(status: pgmsg.PgIdle))
+            match first
+                PgNotification(_, channel, payload) =>
+                    report = report + flag(7, channel == "chan")
+                    report = report + flag(8, payload == "hi")
+                _                                   =>
+                    report = report + 0
+            let again = pgconn.take_notifications(taken.conn)
+            report = report + flag(9, list.len(again.notifications) == 0)
+            match pgconn.cancel(taken.conn)
+                None    =>
+                    report = report + flag(10, true)
+                Some(_) =>
+                    report = report + 0
+            match pgconn.close(taken.conn)
+                None    =>
+                    report = report + flag(11, true)
+                Some(_) =>
+                    report = report + 0
+            report
+
+// A login whose password is hashed rather than sent.
+fn md5_over(port: Int) -> Int [io, net, time, ipc]
+    let o = options_at(port, "secret", pgconn.PgSslDisable, false)
+    match pgconn.connect(o, pgconn.plain_transport())
+        Err(_) => 0
+        Ok(c)  =>
+            var report = bit(0)
+            report = report + flag(1, c.process_id == 4711)
+            match pgconn.close(c)
+                None    =>
+                    report = report + flag(2, true)
+                Some(_) =>
+                    report = report + 0
+            report
+
+// A login whose password is proved rather than sent.
+fn scram_over(port: Int) -> Int [io, net, time, ipc]
+    let o = options_at(port, fixture_password(), pgconn.PgSslDisable, false)
+    match pgconn.connect(o, pgconn.plain_transport())
+        Err(_) => 0
+        Ok(c)  =>
+            var report = bit(0)
+            report = report + flag(1, c.process_id == 4711)
+            match pgconn.close(c)
+                None    =>
+                    report = report + flag(2, true)
+                Some(_) =>
+                    report = report + 0
+            report
+
+// A statement the server refuses, the drain that follows it, and the
+// rollback that gets the session out of a failed transaction.
+fn error_over(port: Int) -> Int [io, net, time, ipc]
+    let o = options_at(port, "secret", pgconn.PgSslDisable, false)
+    match pgconn.connect(o, pgconn.plain_transport())
+        Err(_) => 0
+        Ok(c)  =>
+            var report = bit(0)
+            match pgconn.send_batch(c, [pgmsg.PgQuery(sql: "THIS IS NOT SQL"),
+                                        pgmsg.PgSync])
+                Err(_)   =>
+                    report = report + 0
+                Ok(sent) =>
+                    match pgconn.next_message(sent)
+                        Err(_) =>
+                            report = report + 0
+                        Ok(r)  =>
+                            match r.message
+                                PgErrorResponse(fields) =>
+                                    report = report + flag(1, pgerror.sqlstate(
+                                        pgerror.PgServerError(fields: fields)) == "42601")
+                                    report = report + flag(2, str.len(pgerror.describe(
+                                        pgerror.PgServerError(fields: fields))) > 0)
+                                _                       =>
+                                    report = report + 0
+                            // The server is discarding until `Sync`, so
+                            // the boundary is where the next statement
+                            // may start.
+                            match pgconn.drain_to_ready(r.conn)
+                                Err(_)      =>
+                                    report = report + 0
+                                Ok(drained) =>
+                                    report = report + flag(3,
+                                        pgquery.in_failed_transaction(drained))
+                                    match pgquery.rollback(drained)
+                                        Err(_)        =>
+                                            report = report + 0
+                                        Ok(recovered) =>
+                                            report = report + flag(4, not pgquery.in_failed_transaction(recovered))
+                                            match pgconn.close(recovered)
+                                                None    =>
+                                                    report = report + flag(5, true)
+                                                Some(_) =>
+                                                    report = report + 0
+            report
+
+// A result set in the simple protocol and one in the extended
+// protocol, with the rows decoded.
+fn rows_over(port: Int) -> Int [io, net, time, ipc]
+    let o = options_at(port, "secret", pgconn.PgSslDisable, false)
+    match pgconn.connect(o, pgconn.plain_transport())
+        Err(_) => 0
+        Ok(c)  =>
+            var report = bit(0)
+            match pgquery.simple(c, "SELECT n FROM t")
+                Err(_)   =>
+                    report = report + 0
+                Ok(done) =>
+                    report = report + flag(1, list.len(done.results) == 1)
+                    let set = list.get(done.results, 0,
+                                      PgResult { columns: [], rows: [],
+                                                 tag: "", affected: 0,
+                                                 notices: [] })
+                    report = report + flag(2, list.len(set.rows) == 2)
+                    report = report + flag(3, set.tag == "SELECT 2")
+                    report = report + flag(4, set.affected == 2)
+                    report = report + flag(5, is_int(value_at(set.rows, 0, 0), 7))
+                    report = report + flag(6, is_null_value(value_at(set.rows, 1, 0)))
+                    match pgquery.query(done.conn, "SELECT $1::int8",
+                                        [pgtype.PgInt(v: 5)], pgmsg.PgText)
+                        Err(_)   =>
+                            report = report + 0
+                        Ok(made) =>
+                            report = report + flag(7, list.len(made.result.rows) == 1)
+                            report = report + flag(8,
+                                is_int(value_at(made.result.rows, 0, 0), 5))
+                            match pgconn.close(made.conn)
+                                None    =>
+                                    report = report + flag(9, true)
+                                Some(_) =>
+                                    report = report + 0
+            report
+
+// A COPY in both directions, over one connection.
+fn copy_over(port: Int) -> Int [io, net, time, ipc]
+    let o = options_at(port, "secret", pgconn.PgSslDisable, false)
+    match pgconn.connect(o, pgconn.plain_transport())
+        Err(_) => 0
+        Ok(c)  =>
+            var report = bit(0)
+            match pgcopy.begin_out(c, "COPY t TO STDOUT", pgcopy.PgCopyText)
+                Err(_)    =>
+                    report = report + 0
+                Ok(start) =>
+                    var stream = start
+                    var rows: [[pgtype.PgValue]] = []
+                    var done = false
+                    while not done
+                        let batch = match pgcopy.recv_rows(stream)
+                            Err(_) =>
+                                return report
+                            Ok(b)  => b
+                        rows = list.concat(rows, batch.rows)
+                        stream = batch.stream
+                        done = stream.finished
+                    report = report + flag(1, list.len(rows) == 3)
+                    report = report + flag(2, is_text(value_at(rows, 0, 0), "7"))
+                    report = report + flag(3, is_text(value_at(rows, 1, 0), "8"))
+                    report = report + flag(4, is_null_value(value_at(rows, 2, 0)))
+                    match pgcopy.finish_out(stream)
+                        Err(_)  =>
+                            report = report + 0
+                        Ok(out) =>
+                            report = report + flag(5, true)
+                            match pgcopy.begin_in(out, "COPY t FROM STDIN",
+                                                  pgcopy.PgCopyText)
+                                Err(_)   =>
+                                    report = report + 0
+                                Ok(into) =>
+                                    let one = match pgcopy.send_row(into,
+                                                  [pgtype.PgInt(v: 7)])
+                                        Err(_) =>
+                                            return report
+                                        Ok(s)  => s
+                                    let two = match pgcopy.send_row(one,
+                                                  [pgtype.PgInt(v: 8)])
+                                        Err(_) =>
+                                            return report
+                                        Ok(s)  => s
+                                    match pgcopy.finish_in(two)
+                                        Err(_)       =>
+                                            report = report + 0
+                                        Ok(finished) =>
+                                            report = report + flag(6,
+                                                finished.rows == 2)
+                                            match pgconn.close(finished.conn)
+                                                None    =>
+                                                    report = report + flag(7, true)
+                                                Some(_) =>
+                                                    report = report + 0
+            report
+
+// A pool: an open, a lend, an exhausted limit, a discard, and the
+// driver over a pool's connection.
+fn pool_over(port: Int) -> Int [io, net, time, ipc]
+    let o = options_at(port, "secret", pgconn.PgSslDisable, false)
+    let t = pgconn.plain_transport()
+    let tight = PgPoolPolicy { max_connections: 1, min_connections: 0,
+                               wait_ms: 0, max_idle_ms: 300000, max_uses: 0,
+                               reset_on_release: true, on_connect_sql: "" }
+    var report = 0
+    let warmed = match pgpool.warm(pgpool.new_pool(o, t, tight))
+        Err(_) =>
+            return 0
+        Ok(p)  => p
+    let held = match pgpool.acquire(warmed, 1000)
+        Err(_) =>
+            return 0
+        Ok(h)  => h
+    report = report + flag(0, held.pool.lent == 1)
+    match pgpool.acquire(held.pool, 1000)
+        Err(f) =>
+            report = report + flag(1, is_pool_exhausted(f))
+        Ok(_)  =>
+            report = report + 0
+    var pool_a = pgpool.discard(held.pool, held.conn)
+    match pgpool.close_pool(pool_a)
+        None    =>
+            report = report + flag(2, true)
+        Some(_) =>
+            report = report + 0
+    // The second pool, and the driver over a connection it lent.
+    var pool_b = match pgpool.warm(pgpool.new_pool(o, t, pgpool.default_policy()))
+        Err(_) =>
+            return report
+        Ok(p)  => p
+    let lent = match pgpool.acquire(pool_b, 1000)
+        Err(_) =>
+            return report
+        Ok(l)  => l
+    pool_b = lent.pool
+    let db = pgdriver.of_conn(lent.conn)
+    match db.exec("CREATE TABLE t (n INTEGER)")
+        Some(_) =>
+            report = report + 0
+        None    =>
+            report = report + flag(3, true)
+    match db.query_count("SELECT n FROM t")
+        Err(_) =>
+            report = report + 0
+        Ok(n)  =>
+            report = report + flag(4, n == 2)
+    match db.exec("THIS IS NOT SQL")
+        None    =>
+            report = report + 0
+        Some(e) =>
+            report = report + flag(5, is_syntax_error(e))
+    db.close()
+    match pgdriver.give_back(pool_b, db, 2000)
+        Err(_)   =>
+            report = report + 0
+        Ok(back) =>
+            let s = pgpool.stats(back)
+            report = report + flag(6, s.idle == 1)
+            report = report + flag(7, s.lent == 0)
+            report = report + flag(8, s.opened_total == 1)
+            match pgpool.close_pool(back)
+                None    =>
+                    report = report + flag(9, true)
+                Some(_) =>
+                    report = report + 0
+    report
+
+// A wait with nothing coming, and a wait that is ended by a
+// notification the server sends after it has seen the client's own
+// bytes.
+fn waiting_over(port: Int) -> Int [io, net, time, ipc]
+    let o = options_at(port, "secret", pgconn.PgSslDisable, false)
+    match pgconn.connect(o, pgconn.plain_transport())
+        Err(_) => 0
+        Ok(c)  =>
+            var report = bit(0)
+            // Nothing is coming: the deadline passes and that is not a
+            // fault.
+            match pgconn.wait_notification(c, 200)
+                Err(_)   =>
+                    report = report + 0
+                Ok(none) =>
+                    report = report + flag(1, list.len(none.notifications) == 0)
+            let sent = match pgconn.send(c, pgmsg.PgQuery(sql: "LISTEN chan"))
+                Err(_) =>
+                    return report
+                Ok(s)  => s
+            var conn = sent
+            var at_ready = false
+            while not at_ready
+                match pgconn.next_message(conn)
+                    Err(_) =>
+                        return report
+                    Ok(r)  =>
+                        conn = r.conn
+                        at_ready = pgmsg.ends_exchange(r.message)
+            report = report + flag(2, at_ready)
+            // The one message that tells the server the client is
+            // about to wait, so the notification is sent while it is
+            // waiting rather than before.
+            let marked = match pgconn.send(conn, pgmsg.PgFlush)
+                Err(_) =>
+                    return report
+                Ok(s)  => s
+            match pgconn.wait_notification(marked, 5000)
+                Err(_)  =>
+                    report = report + 0
+                Ok(got) =>
+                    report = report + flag(3, list.len(got.notifications) == 1)
+                    let first = list.get(got.notifications, 0,
+                                         pgmsg.PgReadyForQuery(status: pgmsg.PgIdle))
+                    match first
+                        PgNotification(_, channel, payload) =>
+                            report = report + flag(4, channel == "chan")
+                            report = report + flag(5, payload == "woke")
+                        _                                   =>
+                            report = report + 0
+                    match pgconn.close(got.conn)
+                        None    =>
+                            report = report + flag(6, true)
+                        Some(_) =>
+                            report = report + 0
+            report
+
+// ── the small matchers the workers need ──────────────────────────────
+
+fn is_int(v: pgtype.PgValue, want: Int) -> Bool
+    match v
+        PgInt(n) => n == want
+        _        => false
+
+fn is_null_value(v: pgtype.PgValue) -> Bool
+    match v
+        PgNull => true
+        _      => false
+
+// A COPY stream carries no column types, so a text value arrives as
+// the bytes it was, in `PgUnknown`.
+fn is_text(v: pgtype.PgValue, want: Str) -> Bool
+    match v
+        PgUnknown(_, _, raw) => bytes.to_str(raw) == want
+        _                    => false
+
+fn value_at(rows: [[pgtype.PgValue]], r: Int, c: Int) -> pgtype.PgValue
+    let row = list.get(rows, r, [])
+    list.get(row, c, PgNull)
+
+fn is_pool_exhausted(f: pgerror.PgFault) -> Bool
+    match f
+        PgPoolExhausted(_, _) => true
+        _                     => false
+
+fn is_syntax_error(e: DbError) -> Bool
+    match e
+        SyntaxError(_) => true
+        _              => false
+
+// ── the tests ────────────────────────────────────────────────────────
+
+@test
+fn test_the_ssl_request_the_startup_packet_and_a_cleartext_password() [io, net, time, ipc]
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.assert(false)
+        Some(server) =>
+            let port = net.local_port(server)
+            let worker = cell.spawn(cleartext_over, port)
+            test.assert(worker != 0)
+            match accept_within(server, 15000)
+                None            => test.assert(false)
+                Some((peer, _)) =>
+                    let _ = net.set_recv_timeout(peer, 5000)
+
+                    test.case("the SSLRequest is eight bytes: a length, and the request code where a version goes")
+                    test.assert_eq_str(hex_of(filled(peer, 8)), "0000000804d2162f")
+
+                    test.case("`N` is the server refusing TLS, which PgSslPrefer continues in the clear on")
+                    test.assert(say(peer, bytes.from_byte_list([78])))
+
+                    test.case("the startup packet: a length counting itself and the version and the pairs, `user` and `client_encoding`, and no type byte at all")
+                    test.assert_eq_str(hex_of(startup_from(peer)),
+                        "0000002c000300007573657200706f73746772657300636c69656e745f656e636f64696e6700555446380000")
+
+                    test.case("AuthenticationCleartextPassword")
+                    test.assert(say(peer, auth(3)))
+
+                    test.case("the password goes out as a NUL-terminated string on `p`, and the NUL is inside the length")
+                    test.assert_eq_str(hex_of(frame_from(peer)), "700000000b73656372657400")
+
+                    test.case("AuthenticationOk, then the parameters")
+                    test.assert(say(peer, auth(0)))
+                    test.assert(say(peer, parameter("server_version", "16.4")))
+                    test.assert(say(peer, parameter("client_encoding", "UTF8")))
+                    // A name the server has already sent, sent again:
+                    // the second value is the current one and a client
+                    // that appended would answer the first for ever.
+                    test.assert(say(peer, parameter("DateStyle", "ISO, MDY")))
+                    test.assert(say(peer, parameter("DateStyle", "ISO, YMD")))
+
+                    test.case("a notice in the middle of startup is absorbed and not an error")
+                    test.assert(say(peer, notice("this is not a problem")))
+
+                    test.case("a notification arrives on its own and is queued, not dropped")
+                    test.assert(say(peer, notified(4711, "chan", "hi")))
+
+                    test.case("the identity and the boundary")
+                    test.assert(say(peer, key_data(4711, 0x0badc0de)))
+                    test.assert(say(peer, ready('I')))
+
+                    test.case("the cancel request opens a SECOND connection and is sixteen bytes of nothing else")
+                    match accept_within(server, 15000)
+                        None              => test.assert(false)
+                        Some((second, _)) =>
+                            let _ = net.set_recv_timeout(second, 5000)
+                            test.assert_eq_str(hex_of(filled(second, 16)),
+                                "0000001004d2162e000012670badc0de")
+                            // A cancel is never answered: any byte here
+                            // would be a server that broke the protocol.
+                            test.assert_eq_str(hex_of(filled(second, 1)), "")
+                            net.close(second)
+
+                    test.case("the goodbye is `X`, five bytes, before the socket closes")
+                    test.assert_eq_str(hex_of(frame_from(peer)), "5800000004")
+
+                    test.case("and every step of the client's half agreed")
+                    test.assert(all_set(cell.join(worker),
+                        [bit(0), bit(1), bit(2), bit(3), bit(4), bit(5), bit(6),
+                         bit(7), bit(8), bit(9), bit(10), bit(11)]))
+            net.close(server)
+
+@test
+fn test_the_md5_answer_keeps_its_terminator_and_its_length() [io, net, time, ipc]
+    // The doubled MD5 is what a server with `password_encryption = md5`
+    // asks for.  The digest is pinned as the hex an independent MD5
+    // computes for the password `secret`, the user `postgres` and the
+    // salt 01020304, and the TERMINATOR is the part a hand-rolled
+    // answer forgets: `md5_password` answers text, and the wire field
+    // is a string that ends in a NUL counted inside the length.
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.assert(false)
+        Some(server) =>
+            let port = net.local_port(server)
+            let worker = cell.spawn(md5_over, port)
+            test.assert(worker != 0)
+            match accept_within(server, 15000)
+                None            => test.assert(false)
+                Some((peer, _)) =>
+                    let _ = net.set_recv_timeout(peer, 5000)
+
+                    test.case("PgSslDisable asks nothing, so the startup packet is the first thing on the wire")
+                    test.assert_eq_str(hex_of(startup_from(peer)),
+                        "0000002c000300007573657200706f73746772657300636c69656e745f656e636f64696e6700555446380000")
+
+                    test.case("AuthenticationMD5Password, with a four-byte salt")
+                    test.assert(say(peer, auth_md5(bytes.from_byte_list([1, 2, 3, 4]))))
+
+                    test.case("the answer is `md5` and the double digest, and it ends in a NUL")
+                    test.assert_eq_str(hex_of(frame_from(peer)),
+                        "70000000286d6435626234316132393661616236626163636233366666323433613536326162666600")
+
+                    test.assert(say(peer, auth(0)))
+                    test.assert(say(peer, parameter("server_version", "16.4")))
+                    test.assert(say(peer, key_data(4711, 0x0badc0de)))
+                    test.assert(say(peer, ready('I')))
+
+                    test.case("the goodbye")
+                    test.assert_eq_str(hex_of(frame_from(peer)), "5800000004")
+
+                    test.case("the client's half")
+                    test.assert(all_set(cell.join(worker), [bit(0), bit(1), bit(2)]))
+            net.close(server)
+
+@test
+fn test_the_scram_exchange_matches_a_server_computed_signature() [io, net, time, ipc]
+    // FOUR MESSAGES, IN THE ORDER THE SERVER EXPECTS THEM, and two of
+    // them are asserted against values a server implementation computes
+    // rather than values this package does.  The nonce is fixed in the
+    // options, and the extension the fixture appends is what makes the
+    // server-first a fresh message rather than an echo.
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.assert(false)
+        Some(server) =>
+            let port = net.local_port(server)
+            let worker = cell.spawn(scram_over, port)
+            test.assert(worker != 0)
+            match accept_within(server, 15000)
+                None            => test.assert(false)
+                Some((peer, _)) =>
+                    let _ = net.set_recv_timeout(peer, 5000)
+
+                    test.assert_eq_str(hex_of(startup_from(peer)),
+                        "0000002c000300007573657200706f73746772657300636c69656e745f656e636f64696e6700555446380000")
+
+                    test.case("AuthenticationSASL, with one mechanism and the empty name that closes the list")
+                    test.assert(say(peer, auth_sasl(["SCRAM-SHA-256"])))
+
+                    test.case("the SASL INITIAL response carries the mechanism, a FOUR-BYTE length, and then the client-first message — not the bare message it would be if the frame were a password")
+                    test.assert_eq_str(hex_of(frame_from(peer)),
+                        "700000002c534352414d2d5348412d32353600000000166e2c2c6e3d2c723d4e56464958545552454e4f4e4345")
+
+                    test.case("the server-first message: the extended nonce, the salt and the iteration count")
+                    test.assert(say(peer, auth_sasl_step(11, fixture_server_first())))
+
+                    test.case("the client-final carries the channel binding AND the proof the server's own arithmetic produces")
+                    test.assert_eq_str(hex_of(frame_from(peer)),
+                        "7000000055633d626977732c723d4e56464958545552454e4f4e434553525646495854555245392c703d7052384945586e394835632f56416c33324b31366653456179692b4175745230463059305534516b4478383d")
+
+                    test.case("the server-final proves the server knows the password too, and a client that skipped the check would accept any bytes here")
+                    test.assert(say(peer, auth_sasl_step(12, fixture_server_final())))
+
+                    test.assert(say(peer, auth(0)))
+                    test.assert(say(peer, parameter("server_version", "16.4")))
+                    test.assert(say(peer, key_data(4711, 0x0badc0de)))
+                    test.assert(say(peer, ready('I')))
+
+                    test.case("the goodbye")
+                    test.assert_eq_str(hex_of(frame_from(peer)), "5800000004")
+
+                    test.case("the client's half")
+                    test.assert(all_set(cell.join(worker), [bit(0), bit(1), bit(2)]))
+            net.close(server)
+
+@test
+fn test_an_error_comes_back_and_a_drain_reaches_the_boundary() [io, net, time, ipc]
+    // What a client does after the server refuses a statement: the
+    // server is discarding until a `Sync`, so the client sends one and
+    // drains to the boundary rather than reading the next statement's
+    // answers as this one's.
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.assert(false)
+        Some(server) =>
+            let port = net.local_port(server)
+            let worker = cell.spawn(error_over, port)
+            test.assert(worker != 0)
+            match accept_within(server, 15000)
+                None            => test.assert(false)
+                Some((peer, _)) =>
+                    let _ = net.set_recv_timeout(peer, 5000)
+
+                    test.assert_eq_str(hex_of(startup_from(peer)),
+                        "0000002c000300007573657200706f73746772657300636c69656e745f656e636f64696e6700555446380000")
+                    test.assert(say(peer, auth(0)))
+                    test.assert(say(peer, key_data(4711, 0x0badc0de)))
+                    test.assert(say(peer, ready('I')))
+
+                    test.case("the statement and the Sync go out together, as one batch")
+                    test.assert_eq_str(hex_of(frame_from(peer)),
+                        "510000001454484953204953204e4f542053514c00")
+                    test.assert_eq_str(hex_of(frame_from(peer)), "5300000004")
+
+                    test.case("the server says no, and the session is in a FAILED transaction until the rollback")
+                    test.assert(say(peer, refusal("42601", "syntax error at or near \"THIS\"")))
+                    test.assert(say(peer, ready('E')))
+
+                    test.case("the rollback is an ordinary statement")
+                    test.assert_eq_str(hex_of(frame_from(peer)),
+                        "510000000d524f4c4c4241434b00")
+                    test.assert(say(peer, command("ROLLBACK")))
+                    test.assert(say(peer, ready('I')))
+
+                    test.case("the goodbye")
+                    test.assert_eq_str(hex_of(frame_from(peer)), "5800000004")
+
+                    test.case("the client's half")
+                    test.assert(all_set(cell.join(worker),
+                        [bit(0), bit(1), bit(2), bit(3), bit(4), bit(5)]))
+            net.close(server)
+
+@test
+fn test_a_result_set_of_text_rows_and_a_parameterised_query() [io, net, time, ipc]
+    // The simple protocol answers one result per statement; the
+    // extended protocol is five messages in one write, and the fourth
+    // of them is the `Execute` that produces no description — which is
+    // why the `Describe` in front of it is not decoration.
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.assert(false)
+        Some(server) =>
+            let port = net.local_port(server)
+            let worker = cell.spawn(rows_over, port)
+            test.assert(worker != 0)
+            match accept_within(server, 15000)
+                None            => test.assert(false)
+                Some((peer, _)) =>
+                    let _ = net.set_recv_timeout(peer, 5000)
+
+                    test.assert_eq_str(hex_of(startup_from(peer)),
+                        "0000002c000300007573657200706f73746772657300636c69656e745f656e636f64696e6700555446380000")
+                    test.assert(say(peer, auth(0)))
+                    test.assert(say(peer, key_data(4711, 0x0badc0de)))
+                    test.assert(say(peer, ready('I')))
+
+                    test.case("the simple query goes out as `Q` and its own text")
+                    test.assert_eq_str(hex_of(frame_from(peer)),
+                        "510000001453454c454354206e2046524f4d207400")
+
+                    test.case("a description, two rows — the second a NULL, which is a length of -1 and no bytes — a tag and the boundary")
+                    test.assert(say(peer, row_description("n")))
+                    test.assert(say(peer, text_rows(["7"])))
+                    test.assert(say(peer, null_row()))
+                    test.assert(say(peer, command("SELECT 2")))
+                    test.assert(say(peer, ready('I')))
+
+                    test.case("the parameterised query is Parse, Bind, Describe, Execute and Sync in one write")
+                    test.assert_eq_str(hex_of(frame_from(peer)),
+                        "500000001b0053454c4543542024313a3a696e743800000100000014")
+                    test.assert_eq(kind_of(frame_from(peer)), 'B')
+                    test.assert_eq(kind_of(frame_from(peer)), 'D')
+                    test.assert_eq(kind_of(frame_from(peer)), 'E')
+                    test.assert_eq_str(hex_of(frame_from(peer)), "5300000004")
+
+                    test.case("and the answer to it")
+                    test.assert(say(peer, bare('1')))
+                    test.assert(say(peer, bare('2')))
+                    test.assert(say(peer, row_description("n")))
+                    test.assert(say(peer, text_rows(["5"])))
+                    test.assert(say(peer, command("SELECT 1")))
+                    test.assert(say(peer, ready('I')))
+
+                    test.case("the goodbye")
+                    test.assert_eq_str(hex_of(frame_from(peer)), "5800000004")
+
+                    test.case("the client's half")
+                    test.assert(all_set(cell.join(worker),
+                        [bit(0), bit(1), bit(2), bit(3), bit(4), bit(5), bit(6),
+                         bit(7), bit(8), bit(9)]))
+            net.close(server)
+
+@test
+fn test_a_copy_stream_goes_out_and_comes_back() [io, net, time, ipc]
+    // A COPY stream carries no column types and no row description:
+    // the server flattens the rows, the chunking is the server's, and
+    // a row can span two chunks.  In the other direction every row is
+    // one `CopyData` frame and the stream ends with `CopyDone`.
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.assert(false)
+        Some(server) =>
+            let port = net.local_port(server)
+            let worker = cell.spawn(copy_over, port)
+            test.assert(worker != 0)
+            match accept_within(server, 15000)
+                None            => test.assert(false)
+                Some((peer, _)) =>
+                    let _ = net.set_recv_timeout(peer, 5000)
+
+                    test.assert_eq_str(hex_of(startup_from(peer)),
+                        "0000002c000300007573657200706f73746772657300636c69656e745f656e636f64696e6700555446380000")
+                    test.assert(say(peer, auth(0)))
+                    test.assert(say(peer, key_data(4711, 0x0badc0de)))
+                    test.assert(say(peer, ready('I')))
+
+                    test.case("COPY … TO STDOUT is an ordinary `Q`")
+                    test.assert_eq_str(hex_of(frame_from(peer)),
+                        "5100000015434f5059207420544f205354444f555400")
+
+                    test.case("`H` says the copy runs out, then two whole rows and a `\\N` — three rows across THREE chunks, because a chunk is not a row")
+                    test.assert(say(peer, copy_response('H')))
+                    test.assert(say(peer, copy_data("7\n")))
+                    test.assert(say(peer, copy_data("8\n")))
+                    test.assert(say(peer, copy_data("\\N\n")))
+                    test.assert(say(peer, bare('c')))
+                    test.assert(say(peer, command("COPY 3")))
+                    test.assert(say(peer, ready('I')))
+
+                    test.case("COPY … FROM STDIN is an ordinary `Q` too")
+                    test.assert_eq_str(hex_of(frame_from(peer)),
+                        "5100000016434f505920742046524f4d20535444494e00")
+
+                    test.case("`G`, and then one `CopyData` per row, encoded as the text format spells it")
+                    test.assert(say(peer, copy_response('G')))
+                    test.assert_eq_str(hex_of(frame_from(peer)), "6400000006370a")
+                    test.assert_eq_str(hex_of(frame_from(peer)), "6400000006380a")
+
+                    test.case("the end of the stream is `CopyDone`, not a socket that closed")
+                    test.assert_eq_str(hex_of(frame_from(peer)), "6300000004")
+                    test.assert(say(peer, command("COPY 2")))
+                    test.assert(say(peer, ready('I')))
+
+                    test.case("the goodbye")
+                    test.assert_eq_str(hex_of(frame_from(peer)), "5800000004")
+
+                    test.case("the client's half")
+                    test.assert(all_set(cell.join(worker),
+                        [bit(0), bit(1), bit(2), bit(3), bit(4), bit(5), bit(6), bit(7)]))
+            net.close(server)
+
+@test
+fn test_the_pool_lends_resets_and_the_driver_borrows() [io, net, time, ipc]
+    // A pool is a value, so one connection is opened per pool and the
+    // second `acquire` on a limit of one is refused without a socket
+    // being touched.  The driver then runs over a connection the pool
+    // lent it: a statement the server takes, a count, a statement the
+    // server refuses, and the rollback the borrowed handle performs
+    // instead of closing somebody else's socket.
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.assert(false)
+        Some(server) =>
+            let port = net.local_port(server)
+            let worker = cell.spawn(pool_over, port)
+            test.assert(worker != 0)
+            match accept_within(server, 15000)
+                None             => test.assert(false)
+                Some((first, _)) =>
+                    let _ = net.set_recv_timeout(first, 5000)
+                    test.assert_eq_str(hex_of(startup_from(first)),
+                        "0000002c000300007573657200706f73746772657300636c69656e745f656e636f64696e6700555446380000")
+                    test.assert(say(first, auth(0)))
+                    test.assert(say(first, key_data(4711, 0x0badc0de)))
+                    test.assert(say(first, ready('I')))
+
+                    test.case("a pool of one opens exactly one connection, and `discard` closes it")
+                    test.assert_eq_str(hex_of(frame_from(first)), "5800000004")
+                    net.close(first)
+
+                    test.case("the second pool's own connection")
+                    match accept_within(server, 15000)
+                        None            => test.assert(false)
+                        Some((peer, _)) =>
+                            let _ = net.set_recv_timeout(peer, 5000)
+                            test.assert_eq_str(hex_of(startup_from(peer)),
+                                "0000002c000300007573657200706f73746772657300636c69656e745f656e636f64696e6700555446380000")
+                            test.assert(say(peer, auth(0)))
+                            test.assert(say(peer, key_data(4711, 0x0badc0de)))
+                            test.assert(say(peer, ready('I')))
+
+                            test.case("`exec` is the simple protocol: one `Q`, one tag, one boundary")
+                            test.assert_eq_str(hex_of(frame_from(peer)),
+                                "510000001f435245415445205441424c45207420286e20494e54454745522900")
+                            test.assert(say(peer, command("CREATE TABLE")))
+                            test.assert(say(peer, ready('I')))
+
+                            test.case("`query_count` is the extended protocol, because a count is a result set")
+                            test.assert_eq_str(hex_of(frame_from(peer)),
+                                "50000000170053454c454354206e2046524f4d2074000000")
+                            test.assert_eq(kind_of(frame_from(peer)), 'B')
+                            test.assert_eq(kind_of(frame_from(peer)), 'D')
+                            test.assert_eq(kind_of(frame_from(peer)), 'E')
+                            test.assert_eq_str(hex_of(frame_from(peer)), "5300000004")
+                            test.assert(say(peer, bare('1')))
+                            test.assert(say(peer, bare('2')))
+                            test.assert(say(peer, row_description("n")))
+                            test.assert(say(peer, text_rows(["7"])))
+                            test.assert(say(peer, text_rows(["8"])))
+                            test.assert(say(peer, command("SELECT 2")))
+                            test.assert(say(peer, ready('I')))
+
+                            test.case("a statement the server refuses, and the rollback the borrowed handle sends instead of a goodbye")
+                            test.assert_eq_str(hex_of(frame_from(peer)),
+                                "510000001454484953204953204e4f542053514c00")
+                            test.assert(say(peer, refusal("42601", "syntax error at or near \"THIS\"")))
+                            test.assert(say(peer, ready('I')))
+                            test.assert_eq_str(hex_of(frame_from(peer)),
+                                "510000000d524f4c4c4241434b00")
+                            test.assert(say(peer, command("ROLLBACK")))
+                            test.assert(say(peer, ready('I')))
+
+                            test.case("and now, at last, the pool's goodbye")
+                            test.assert_eq_str(hex_of(frame_from(peer)), "5800000004")
+
+                            test.case("the client's half")
+                            test.assert(all_set(cell.join(worker),
+                                [bit(0), bit(1), bit(2), bit(3), bit(4), bit(5),
+                                 bit(6), bit(7), bit(8), bit(9)]))
+                    net.close(server)
+
+@test
+fn test_a_notification_wakes_a_connection_waiting_for_one() [io, net, time, ipc]
+    // `wait_notification` blocks on purpose and reads nothing else: a
+    // deadline that passes answers zero notifications rather than a
+    // fault, and a notification that arrives while the client is
+    // blocked is returned by the read that found it.  The `Flush` is
+    // what tells the fixture the client is about to block, so the
+    // notification is sent during the wait rather than before it.
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.assert(false)
+        Some(server) =>
+            let port = net.local_port(server)
+            let worker = cell.spawn(waiting_over, port)
+            test.assert(worker != 0)
+            match accept_within(server, 15000)
+                None            => test.assert(false)
+                Some((peer, _)) =>
+                    let _ = net.set_recv_timeout(peer, 5000)
+
+                    test.assert_eq_str(hex_of(startup_from(peer)),
+                        "0000002c000300007573657200706f73746772657300636c69656e745f656e636f64696e6700555446380000")
+                    test.assert(say(peer, auth(0)))
+                    test.assert(say(peer, key_data(4711, 0x0badc0de)))
+                    test.assert(say(peer, ready('I')))
+
+                    test.case("the LISTEN is an ordinary statement, and the fixture sends nothing during the 200 ms the client waits first")
+                    test.assert_eq_str(hex_of(frame_from(peer)),
+                        "51000000104c495354454e206368616e00")
+                    test.assert(say(peer, command("LISTEN")))
+                    test.assert(say(peer, ready('I')))
+
+                    test.case("the client says it is about to wait, and only then does the notification go out")
+                    test.assert_eq_str(hex_of(frame_from(peer)), "4800000004")
+                    test.assert(say(peer, notified(4711, "chan", "woke")))
+
+                    test.case("the goodbye")
+                    test.assert_eq_str(hex_of(frame_from(peer)), "5800000004")
+
+                    test.case("the client's half")
+                    test.assert(all_set(cell.join(worker),
+                        [bit(0), bit(1), bit(2), bit(3), bit(4), bit(5), bit(6)]))
+            net.close(server)

@@ -1,0 +1,91 @@
+// pgwire_hostile_tests.nv — messages whose counts and lengths a
+// server chose to lie about.
+//
+// Every case is a whole frame, so the framing accepts it and the
+// decoder alone has to refuse it, without looping on the count and
+// without building values from bytes that are not there.
+
+use std.test
+use std.bytes
+use pgmsg
+use pgauth
+
+fn frame(kind: Int, body: Bytes) -> Bytes
+    bytes.concat([bytes.u8(kind), bytes.u32_be(bytes.len(body) + 4), body])
+
+fn refused(m: Bytes) -> Bool
+    match pgmsg.decode_backend(m, 0, 1048576)
+        Err(_) => true
+        Ok(_)  => false
+
+@test
+fn test_a_negotiate_count_above_the_bytes_left_is_refused() [io]
+    test.case("a count of 2^31 - 1 over no names")
+    let body = bytes.concat([bytes.u32_be(0), bytes.u32_be(2147483647)])
+    test.assert(refused(frame('v', body)))
+
+    test.case("a count of one over an empty tail")
+    test.assert(refused(frame('v', bytes.concat([bytes.u32_be(0), bytes.u32_be(1)]))))
+
+    test.case("a negative count")
+    test.assert(refused(frame('v', bytes.concat([bytes.u32_be(0), bytes.u32_be(4294967295)]))))
+
+    test.case("an honest count still decodes")
+    let ok = bytes.concat([bytes.u32_be(0), bytes.u32_be(1), bytes.from_str("_pq_.x"), bytes.u8(0)])
+    test.assert(not refused(frame('v', ok)))
+
+@test
+fn test_a_row_description_count_above_the_bytes_left_is_refused() [io]
+    test.case("32767 columns over an empty body")
+    test.assert(refused(frame('T', bytes.u16_be(32767))))
+
+    test.case("a column whose fixed fields are cut short")
+    let cut = bytes.concat([bytes.u16_be(1), bytes.from_str("a"), bytes.u8(0), bytes.zeros(10)])
+    test.assert(refused(frame('T', cut)))
+
+    test.case("a negative column count")
+    test.assert(refused(frame('T', bytes.u16_be(65535))))
+
+@test
+fn test_a_data_row_count_above_the_bytes_left_is_refused() [io]
+    test.case("32767 columns over an empty body")
+    test.assert(refused(frame('D', bytes.u16_be(32767))))
+
+    test.case("a length that runs past the message")
+    test.assert(refused(frame('D', bytes.concat([bytes.u16_be(1), bytes.u32_be(2147483647)]))))
+
+    test.case("a length of -1 is a NULL and decodes")
+    test.assert(not refused(frame('D', bytes.concat([bytes.u16_be(1), bytes.u32_be(4294967295)]))))
+
+@test
+fn test_the_other_counted_messages_refuse_a_count_past_the_end() [io]
+    test.case("a parameter description of 32767 oids over none")
+    test.assert(refused(frame('t', bytes.u16_be(32767))))
+
+    test.case("a COPY response of 32767 formats over none")
+    test.assert(refused(frame('G', bytes.concat([bytes.u8(0), bytes.u16_be(32767)]))))
+
+    test.case("a function call result whose length runs past the message")
+    test.assert(refused(frame('V', bytes.u32_be(2147483647))))
+
+@test
+fn test_a_scram_iteration_count_without_a_ceiling_is_refused() [io]
+    // The count would otherwise hold the client in the key derivation
+    // for as long as the server liked.
+    test.case("an iteration count of 2^62")
+    match pgauth.begin("SCRAM-SHA-256", "abcdefghijklmnopqrst", pgauth.PgBindingNone)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            let first = "r=abcdefghijklmnopqrstXYZ,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4611686018427387904"
+            match pgauth.server_first(s, bytes.from_str(first), "pencil", pgauth.min_iterations())
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(false)
+
+    test.case("the same message with the default count is accepted")
+    match pgauth.begin("SCRAM-SHA-256", "abcdefghijklmnopqrst", pgauth.PgBindingNone)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            let first = "r=abcdefghijklmnopqrstXYZ,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+            match pgauth.server_first(s, bytes.from_str(first), "pencil", pgauth.min_iterations())
+                Err(_) => test.assert(false)
+                Ok(_)  => test.assert(true)

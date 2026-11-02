@@ -1,0 +1,934 @@
+// THE PACKAGE'S OWN API, DRIVEN WITH CONSTRUCTED BYTES.
+//
+// Same road as `pgcover_conn_tests.nv` and for the same reason — no
+// PostgreSQL server is reachable on this machine — and the same limit:
+// every assertion is between this package and the version 3 protocol's
+// own spelling, never between this package and a server's answer.
+//
+// A `PgConn` whose inbox already holds the server's half of an
+// exchange is what drives the query half: `read_exchange` takes whole
+// frames out of the inbox and reaches for the transport only when the
+// inbox runs dry, so a complete script gets through the wire-side code
+// with no socket at all.  The transport here throws every write away
+// and REFUSES the next read, which is what makes a script that runs
+// out fail loudly instead of hanging.
+//
+// A `COPY` stream is built the same way, out of its own public
+// structs: a `PgCopyOut` whose `partial` holds bytes is a stream whose
+// rows have already arrived, and the same bytes fed a row at a time
+// are the chunking the module comment is about.
+
+use std.test
+use std.bytes
+use pgconn
+use pgmsg
+use pgtype
+use pgerror
+use pgauth
+use pgquery
+use pgcopy
+
+// ── the wire, as bytes ───────────────────────────────────────────────
+
+// One NUL-terminated field, terminator included.
+fn cstr(s: Str) -> Bytes
+    bytes.concat([bytes.from_str(s), bytes.zeros(1)])
+
+// A typed frame: 84 is `T`, 68 is `D`, 67 is `C`, 90 is `Z`, 73 is
+// `I`, 78 is `N`, 69 is `E`, 116 is `t`, 115 is `s`, 51 is `3`, 100 is
+// `d`, 99 is `c`, 71 is `G`, 72 is `H`.
+fn frame(kind: Int, body: Bytes) -> Bytes
+    bytes.concat([bytes.u8(kind), bytes.u32_be(bytes.len(body) + 4), body])
+
+// A frame with no body at all — five bytes.
+fn bare(kind: Int) -> Bytes
+    frame(kind, bytes.zeros(0))
+
+fn ready(status: Int) -> Bytes
+    frame(90, bytes.u8(status))
+
+fn command(tag: Str) -> Bytes
+    frame(67, cstr(tag))
+
+// One `DataRow` of one text value.
+fn one_text_row(value: Str) -> Bytes
+    frame(68, bytes.concat([bytes.u16_be(1), bytes.u32_be(str.len(value)),
+                            bytes.from_str(value)]))
+
+// One `ParameterDescription` naming one `int4`.
+fn describes_one_int4() -> Bytes
+    frame(116, bytes.concat([bytes.u16_be(1), bytes.u32_be(23)]))
+
+// `RowDescription` of one `int4` column in text format.
+fn one_int4_column() -> Bytes
+    frame(84, bytes.concat([bytes.u16_be(1), cstr("n"), bytes.u32_be(0),
+                            bytes.u16_be(0), bytes.u32_be(23), bytes.u16_be(4),
+                            bytes.u32_be(-1), bytes.u16_be(0)]))
+
+fn refusal(code: Str, text: Str) -> Bytes
+    frame(69, bytes.concat([bytes.from_str("S"), cstr("ERROR"),
+                            bytes.from_str("C"), cstr(code),
+                            bytes.from_str("M"), cstr(text), bytes.zeros(1)]))
+
+fn notice(text: Str) -> Bytes
+    frame(78, bytes.concat([bytes.from_str("S"), cstr("NOTICE"),
+                            bytes.from_str("C"), cstr("00000"),
+                            bytes.from_str("M"), cstr(text), bytes.zeros(1)]))
+
+fn portal_suspended() -> Bytes
+    bare(115)
+
+fn close_complete() -> Bytes
+    bare(51)
+
+fn empty_query() -> Bytes
+    bare(73)
+
+// `CopyInResponse`: the overall format, then per column the format the
+// server will take.  0 is text and 1 is binary.
+fn copy_in_response(overall: Int, columns: [Int]) -> Bytes
+    var parts: [Bytes] = [bytes.u8(overall), bytes.u16_be(list.len(columns))]
+    for c in columns
+        parts = list.concat(parts, [bytes.u16_be(c)])
+    frame(71, bytes.concat(parts))
+
+fn copy_out_response(overall: Int, columns: [Int]) -> Bytes
+    var parts: [Bytes] = [bytes.u8(overall), bytes.u16_be(list.len(columns))]
+    for c in columns
+        parts = list.concat(parts, [bytes.u16_be(c)])
+    frame(72, bytes.concat(parts))
+
+// One `CopyData` message holding `data`.
+fn copy_data(data: Bytes) -> Bytes
+    frame(100, data)
+
+// ── transports, and connections over them ────────────────────────────
+
+// Every write goes nowhere.  The scripts here are about what the
+// client does with what it READS, and the assertions that matter are
+// on the reads.
+fn drops(fd: Int, data: Bytes) -> ?pgerror.PgFault [io, net]
+    None
+
+// Nothing in this file opens a descriptor, so a close that does
+// nothing is a close that cannot take the test harness's own
+// descriptors with it.
+fn shuts(fd: Int) -> ?pgerror.PgFault [io, net]
+    None
+
+// The peer is gone: the answer to any read a script does not cover.
+fn recv_no_peer(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io, net]
+    Err(pgerror.PgConnectionLost(during: "read"))
+
+fn scripting(r: fn(Int, Int) -> Result<Bytes, pgerror.PgFault> [io, net]) -> PgTransport [io, net]
+    PgTransport { send: drops, recv: r, close: shuts }
+
+fn opts_plain() -> PgConnectOptions
+    PgConnectOptions { host: "127.0.0.1", port: 5432, user: "postgres",
+                              password: "", database: "", application_name: "",
+                              ssl_mode: pgconn.PgSslDisable, allow_cleartext: false,
+                              channel_binding: pgauth.PgBindingNone, nonce: "",
+                              max_message_bytes: 1048576, connect_timeout_ms: 0,
+                              read_timeout_ms: 0 }
+
+fn conn_over(script: Bytes) -> PgConn [io, net]
+    conn_in_status(script, pgmsg.PgIdle)
+
+// A connection whose server's bytes are already in its inbox, and
+// whose transport refuses to add any.
+fn conn_in_status(script: Bytes, st: PgTxStatus) -> PgConn [io, net]
+    PgConn { handle: 0, transport: scripting(recv_no_peer),
+                    options: opts_plain(), process_id: 4711, secret_key: 7,
+                    parameter_names: [], parameter_values: [],
+                    settings: pgtype.default_settings(), inbox: script,
+                    notifications: [], status: st, broken: false }
+
+// The one column a scripted result set describes.
+fn int4_column() -> PgColumn
+    PgColumn { name: "n", table_oid: 0, table_column: 0, type_oid: 23,
+                     type_size: 4, type_modifier: -1, format: pgmsg.PgText }
+
+fn statement_of(sql: Str, columns: [PgColumn]) -> PgStatement
+    PgStatement { name: "", sql: sql, parameter_oids: [], columns: columns }
+
+fn cursor_of(portal: Str, batch: Int, finished: Bool) -> PgCursor
+    PgCursor { portal: portal,
+                       statement: statement_of("SELECT n FROM t", [int4_column()]),
+                       batch_rows: batch, finished: finished }
+
+// One complete `int4` result: the description, a row, the tag and the
+// boundary.
+fn int4_exchange(value: Str, tag: Str) -> Bytes
+    bytes.concat([one_int4_column(), one_text_row(value), command(tag), ready(73)])
+
+// ── the simple protocol ──────────────────────────────────────────────
+
+@test
+fn test_the_simple_protocol_answers_one_result_per_statement() [io, net, time]
+    test.case("one statement, one result")
+    let one = conn_over(int4_exchange("7", "SELECT 1"))
+    match pgquery.simple(one, "SELECT 1")
+        Err(f)   => test.fail(pgerror.describe(f))
+        Ok(done) =>
+            test.assert_eq(list.len(done.results), 1)
+            test.assert_eq(list.len(done.results[0].rows), 1)
+            test.assert_eq_str(done.results[0].tag, "SELECT 1")
+
+    test.case("two statements in one Query, two results")
+    let two = conn_over(bytes.concat([one_int4_column(), one_text_row("7"),
+                                      command("SELECT 1"), one_int4_column(),
+                                      one_text_row("8"), command("SELECT 1"), ready(73)]))
+    match pgquery.simple(two, "SELECT 1; SELECT 2")
+        Err(f)   => test.fail(pgerror.describe(f))
+        Ok(done) =>
+            test.assert_eq(list.len(done.results), 2)
+            test.assert_eq(list.len(done.results[1].rows), 1)
+
+    test.case("a notice before the result is carried on it")
+    let noisy = conn_over(bytes.concat([notice("there is a notice"),
+                                        command("SELECT 1"), ready(73)]))
+    match pgquery.simple(noisy, "SELECT 1")
+        Err(f)   => test.fail(pgerror.describe(f))
+        Ok(done) => test.assert_eq(list.len(done.results[0].notices), 1)
+
+    test.case("an empty statement answers a result with nothing in it")
+    let nothing = conn_over(bytes.concat([empty_query(), ready(73)]))
+    match pgquery.simple(nothing, "")
+        Err(f)   => test.fail(pgerror.describe(f))
+        Ok(done) =>
+            test.assert_eq(list.len(done.results), 1)
+            test.assert_eq(list.len(done.results[0].rows), 0)
+            test.assert_eq(done.results[0].affected, 0)
+
+@test
+fn test_a_read_that_fails_after_a_server_error_reports_the_server() [io, net, time]
+    test.case("a read failure with no server error is the read failure")
+    let dry = conn_over(bytes.zeros(0))
+    match pgquery.simple(dry, "SELECT 1")
+        Ok(_)  => test.fail("a connection with no bytes answered a query")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "read"),
+                              pgerror.describe(f))
+
+    test.case("a server error heard before the read failure is the failure")
+    // The error with no `ReadyForQuery` after it: the session is over
+    // and the next read is the one that finds out.  The server's own
+    // sentence is what a caller can act on, so it is the one reported.
+    let cut = conn_over(refusal("57P01", "terminating connection due to administrator command"))
+    match pgquery.simple(cut, "SELECT 1")
+        Ok(_)  => test.fail("a dying backend answered a query")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "terminating connection"),
+                              pgerror.describe(f))
+
+    test.case("a row that does not fit its description is a fault")
+    // A `DataRow` with no `RowDescription` in front of it: one value
+    // and zero columns, which is not a row this decoder reads.
+    let ragged = conn_over(bytes.concat([one_text_row("7"), command("SELECT 1"), ready(73)]))
+    match pgquery.simple(ragged, "SELECT 1")
+        Ok(_)  => test.fail("a row with no description decoded")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "wants 0 parameter"),
+                              pgerror.describe(f))
+
+// ── the extended protocol ────────────────────────────────────────────
+
+@test
+fn test_prepare_keeps_the_oids_the_server_named_or_the_callers_own() [io, net, time]
+    test.case("the server's ParameterDescription is what is kept")
+    let told = conn_over(bytes.concat([describes_one_int4(), one_int4_column(), ready(73)]))
+    match pgquery.prepare(told, "by_id", "SELECT n FROM t WHERE n = $1", [])
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(p)  =>
+            test.assert_eq(list.len(p.statement.parameter_oids), 1)
+            test.assert_eq(p.statement.parameter_oids[0], 23)
+            test.assert_eq(list.len(p.statement.columns), 1)
+            test.assert_eq_str(p.statement.name, "by_id")
+
+    test.case("a server that named no parameter type leaves the caller's list")
+    let silent = conn_over(bytes.concat([one_int4_column(), ready(73)]))
+    match pgquery.prepare(silent, "by_id", "SELECT n FROM t WHERE n = $1", [23])
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(p)  =>
+            test.assert_eq(list.len(p.statement.parameter_oids), 1)
+            test.assert_eq(p.statement.parameter_oids[0], 23)
+            test.assert_eq_str(p.statement.sql, "SELECT n FROM t WHERE n = $1")
+
+    test.case("a prepare the server refuses is that refusal")
+    let refused = conn_over(bytes.concat([refusal("42P01", "relation \"t\" does not exist"),
+                                          ready(73)]))
+    match pgquery.prepare(refused, "by_id", "SELECT n FROM t", [])
+        Ok(_)  => test.fail("a refused prepare answered a statement")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "does not exist"),
+                              pgerror.describe(f))
+
+@test
+fn test_execute_and_close_statement_and_the_parameter_count_they_refuse() [io, net, time]
+    test.case("a parameter count the statement does not take is refused here")
+    let spare = conn_over(bytes.zeros(0))
+    let st = statement_of("SELECT n FROM t WHERE n = $1", [int4_column()])
+    // `statement_of` names no parameters, so the count is not checked
+    // against them — the prepared statement below is the one that has
+    // a list to disagree with.
+    let named = PgStatement { name: "by_id", sql: st.sql,
+                                      parameter_oids: [23], columns: st.columns }
+    match pgquery.execute(spare, named, [], pgmsg.PgText)
+        Ok(_)  => test.fail("a statement that wants one parameter ran with none")
+        Err(f) =>
+            test.assert_true(str.contains(pgerror.describe(f), "wants 1 parameter"),
+                        pgerror.describe(f))
+
+    test.case("a statement with the parameters it wants runs")
+    let ready_conn = conn_over(int4_exchange("7", "SELECT 1"))
+    match pgquery.execute(ready_conn, named, [pgtype.PgInt(v: 7)], pgmsg.PgText)
+        Err(f)   => test.fail(pgerror.describe(f))
+        Ok(done) =>
+            test.assert_eq(list.len(done.result.rows), 1)
+            test.assert_eq_str(done.result.tag, "SELECT 1")
+
+    test.case("an execute the server refuses is that refusal")
+    let refused = conn_over(bytes.concat([refusal("22012", "division by zero"), ready(73)]))
+    match pgquery.execute(refused, named, [pgtype.PgInt(v: 7)], pgmsg.PgText)
+        Ok(_)  => test.fail("a refused execute answered a result")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "division by zero"),
+                              pgerror.describe(f))
+
+    test.case("closing a statement is a round trip and a connection back")
+    let closing = conn_over(bytes.concat([close_complete(), ready(73)]))
+    match pgquery.close_statement(closing, "by_id")
+        Err(f)    => test.fail(pgerror.describe(f))
+        Ok(after) => test.assert_eq(after.process_id, 4711)
+
+    test.case("a close the server refuses is that refusal")
+    let refused_close = conn_over(bytes.concat([refusal("26000", "prepared statement does not exist"),
+                                                ready(73)]))
+    match pgquery.close_statement(refused_close, "by_id")
+        Ok(_)  => test.fail("a refused close answered a connection")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "does not exist"),
+                              pgerror.describe(f))
+
+@test
+fn test_one_round_trip_query_and_the_count_of_what_it_changed() [io, net, time]
+    test.case("a query answers the rows the server sent")
+    let c = conn_over(int4_exchange("7", "SELECT 1"))
+    match pgquery.query(c, "SELECT 1", [], pgmsg.PgText)
+        Err(f)   => test.fail(pgerror.describe(f))
+        Ok(done) =>
+            test.assert_eq(list.len(done.result.rows), 1)
+            test.assert_eq_str(done.result.tag, "SELECT 1")
+
+    test.case("a query the server refuses is that refusal")
+    let refused = conn_over(bytes.concat([refusal("42601", "syntax error at or near \"SELEC\""),
+                                          ready(73)]))
+    match pgquery.query(refused, "SELEC 1", [], pgmsg.PgText)
+        Ok(_)  => test.fail("a syntax error answered a result")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "syntax error"),
+                              pgerror.describe(f))
+
+    test.case("the rows a statement changed come off its tag")
+    let updating = conn_over(bytes.concat([command("UPDATE 3"), ready(73)]))
+    match pgquery.execute_count(updating, "UPDATE t SET n = 1", [])
+        Err(f)   => test.fail(pgerror.describe(f))
+        Ok(done) => test.assert_eq(done.affected, 3)
+
+    test.case("a statement that changed nothing says so")
+    let quiet = conn_over(bytes.concat([command("DELETE 0"), ready(73)]))
+    match pgquery.execute_count(quiet, "DELETE FROM t WHERE false", [])
+        Err(f)   => test.fail(pgerror.describe(f))
+        Ok(done) => test.assert_eq(done.affected, 0)
+
+// ── pipelining ───────────────────────────────────────────────────────
+
+@test
+fn test_a_pipeline_reports_each_statement_in_its_own_slot() [io, net, time]
+    test.case("one statement failing does not end the batch")
+    let mixed = conn_over(bytes.concat([int4_exchange("7", "SELECT 1"),
+                                        refusal("42P01", "relation \"t\" does not exist"),
+                                        ready(73)]))
+    match pgquery.pipeline(mixed, ["SELECT 1", "SELECT * FROM t"], [[], []])
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(p)  =>
+            test.assert_eq(list.len(p.results), 2)
+            test.assert_eq(list.len(p.faults), 2)
+            match p.faults[0]
+                None    => ()
+                Some(_) => test.fail("the first statement was said to have failed")
+            match p.faults[1]
+                None    => test.fail("the failing statement was said to have succeeded")
+                Some(f) => test.assert_true(str.contains(pgerror.describe(f), "does not exist"),
+                                       pgerror.describe(f))
+
+    test.case("every statement answering is every slot empty")
+    let all = conn_over(bytes.concat([int4_exchange("7", "SELECT 1"),
+                                      int4_exchange("8", "SELECT 2"), ready(73)]))
+    match pgquery.pipeline(all, ["SELECT 1", "SELECT 2"], [[], []])
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(p)  =>
+            test.assert_eq(list.len(p.results), 2)
+            match p.faults[1]
+                None    => ()
+                Some(f) => test.fail(pgerror.describe(f))
+
+    test.case("a connection that fails ends the batch with no results")
+    let dry = conn_over(bytes.zeros(0))
+    match pgquery.pipeline(dry, ["SELECT 1"], [[]])
+        Ok(_)  => test.fail("a connection with no bytes answered a batch")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "read"),
+                              pgerror.describe(f))
+
+@test
+fn test_an_unsynced_pipeline_says_how_many_statements_the_server_skipped() [io, net, time]
+    test.case("the results that came back and the count of the ones that did not")
+    // Three statements, one `Sync`: the first answers, the second
+    // fails, and the server discards the third — which is one result
+    // for three statements and the number this call exists for.
+    let stopped = conn_over(bytes.concat([one_int4_column(), one_text_row("7"),
+                                          command("SELECT 1"),
+                                          refusal("42P01", "relation \"t\" does not exist"),
+                                          ready(73)]))
+    match pgquery.pipeline_unsynced(stopped, ["SELECT 1", "SELECT * FROM t", "SELECT 3"],
+                                    [[], [], []])
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(p)  =>
+            test.assert_eq(list.len(p.results), 1)
+            test.assert_eq(p.skipped, 2)
+            match p.fault
+                None    => test.fail("a batch that failed reported no fault")
+                Some(f) => test.assert_true(str.contains(pgerror.describe(f), "does not exist"),
+                                       pgerror.describe(f))
+
+    test.case("nothing failed, nothing was skipped")
+    let all = conn_over(bytes.concat([one_int4_column(), one_text_row("7"), command("SELECT 1"),
+                                      one_int4_column(), one_text_row("8"), command("SELECT 2"),
+                                      ready(73)]))
+    match pgquery.pipeline_unsynced(all, ["SELECT 1", "SELECT 2"], [[], []])
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(p)  =>
+            test.assert_eq(list.len(p.results), 2)
+            test.assert_eq(p.skipped, 0)
+            match p.fault
+                None    => ()
+                Some(f) => test.fail(pgerror.describe(f))
+
+// ── cursors ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_cursor_that_answers_a_batch_at_a_time() [io, net, time]
+    test.case("a batch of zero is refused before anything is sent")
+    let idle = conn_over(bytes.zeros(0))
+    match pgquery.open_cursor(idle, "big", "SELECT n FROM t", [], 0)
+        Ok(_)  => test.fail("a cursor with a batch of zero was opened")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "at least 1"),
+                              pgerror.describe(f))
+
+    test.case("an open portal is a cursor with the columns it described")
+    let opening = conn_over(bytes.concat([one_int4_column(), ready(73)]))
+    match pgquery.open_cursor(opening, "big", "SELECT n FROM t", [], 2)
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(o)  =>
+            test.assert_eq_str(o.cursor.portal, "big")
+            test.assert_eq(o.cursor.batch_rows, 2)
+            test.assert_false(o.cursor.finished, "a cursor that just opened is not finished")
+
+    test.case("an open the server refuses is that refusal")
+    let refused = conn_over(bytes.concat([refusal("42P01", "relation \"t\" does not exist"),
+                                          ready(73)]))
+    match pgquery.open_cursor(refused, "big", "SELECT n FROM t", [], 2)
+        Ok(_)  => test.fail("a refused cursor was opened")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "does not exist"),
+                              pgerror.describe(f))
+
+    test.case("a suspended portal is a batch and a cursor that is still open")
+    let more = conn_over(bytes.concat([one_text_row("7"), portal_suspended(), ready(73)]))
+    match pgquery.fetch(more, cursor_of("big", 2, false))
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(b)  =>
+            test.assert_eq(list.len(b.rows), 1)
+            test.assert_false(b.cursor.finished, "a suspended portal is not finished")
+
+    test.case("a portal that answered its last batch is finished")
+    let last = conn_over(int4_exchange("7", "SELECT 1"))
+    match pgquery.fetch(last, cursor_of("big", 2, false))
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(b)  =>
+            test.assert_eq(list.len(b.rows), 1)
+            test.assert(b.cursor.finished)
+
+    test.case("a cursor already finished sends nothing at all")
+    let untouched = conn_over(bytes.zeros(0))
+    match pgquery.fetch(untouched, cursor_of("big", 2, true))
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(b)  =>
+            test.assert_eq(list.len(b.rows), 0)
+            test.assert(b.cursor.finished)
+
+    test.case("a fetch the server refuses is that refusal")
+    let refused_fetch = conn_over(bytes.concat([refusal("34000", "portal \"big\" does not exist"),
+                                                ready(73)]))
+    match pgquery.fetch(refused_fetch, cursor_of("big", 2, false))
+        Ok(_)  => test.fail("a fetch against no portal answered rows")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "does not exist"),
+                              pgerror.describe(f))
+
+    test.case("closing a cursor is a round trip and a connection back")
+    let closing = conn_over(bytes.concat([close_complete(), ready(73)]))
+    match pgquery.close_cursor(closing, cursor_of("big", 2, false))
+        Err(f)    => test.fail(pgerror.describe(f))
+        Ok(after) => test.assert_eq(after.process_id, 4711)
+
+    test.case("a close the server refuses is that refusal")
+    let refused_close = conn_over(bytes.concat([refusal("34000", "portal \"big\" does not exist"),
+                                                ready(73)]))
+    match pgquery.close_cursor(refused_close, cursor_of("big", 2, false))
+        Ok(_)  => test.fail("a refused close answered a connection")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "does not exist"),
+                              pgerror.describe(f))
+
+// ── transactions ─────────────────────────────────────────────────────
+
+@test
+fn test_begin_says_which_isolation_level_and_whether_it_reads_only() [io, net, time]
+    test.case("read committed, as the default, and no read-only clause")
+    let c = conn_over(bytes.concat([command("BEGIN"), ready(73)]))
+    match pgquery.begin(c, pgquery.PgReadCommitted, false)
+        Err(f)    => test.fail(pgerror.describe(f))
+        Ok(after) => test.assert_eq(after.process_id, 4711)
+
+    test.case("repeatable read, read only")
+    let c = conn_over(bytes.concat([command("BEGIN"), ready(73)]))
+    match pgquery.begin(c, pgquery.PgRepeatableRead, true)
+        Err(f)    => test.fail(pgerror.describe(f))
+        Ok(after) => test.assert_eq(after.process_id, 4711)
+
+    test.case("serializable")
+    let c = conn_over(bytes.concat([command("BEGIN"), ready(73)]))
+    match pgquery.begin(c, pgquery.PgSerializable, false)
+        Err(f)    => test.fail(pgerror.describe(f))
+        Ok(after) => test.assert_eq(after.process_id, 4711)
+
+    test.case("commit and rollback")
+    let c = conn_over(bytes.concat([command("COMMIT"), ready(73)]))
+    match pgquery.commit(c)
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(_)  => test.assert(true)
+    let back = conn_over(bytes.concat([command("ROLLBACK"), ready(73)]))
+    match pgquery.rollback(back)
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(_)  => test.assert(true)
+
+@test
+fn test_a_failed_transaction_is_the_status_the_boundary_reported() [io, net, time]
+    // 69 is `I`, 84 is `T` and 69 is `E` — `pgmsg`'s own table — and
+    // the status is the whole of the answer, so it is put there by
+    // hand rather than read off a wire that would have to be right
+    // about something else first.
+    test.assert(pgquery.in_failed_transaction(
+            conn_in_status(bytes.zeros(0), pgmsg.PgInFailedTransaction)))
+    test.assert_false(pgquery.in_failed_transaction(
+            conn_in_status(bytes.zeros(0), pgmsg.PgIdle)),
+            "an idle connection is not in a failed transaction")
+    test.assert(pgquery.in_failed_transaction(
+            conn_in_status(bytes.zeros(0), pgmsg.PgInFailedTransaction)))
+
+// ── the COPY sub-protocol ────────────────────────────────────────────
+
+// A copy-out stream whose bytes have already arrived.
+fn out_of(conn: PgConn, format: PgCopyFormat, partial: Bytes, finished: Bool) -> PgCopyOut
+    PgCopyOut { conn: conn, format: format, column_formats: [], partial: partial,
+                received_bytes: bytes.len(partial), finished: finished,
+                header_read: false }
+
+fn one_text_value(v: Str) -> PgValue
+    pgtype.PgUnknown(oid: 0, format: pgmsg.PgText, raw: bytes.from_str(v))
+
+// One value of a row, as text: `PgNull` for the empty string so a
+// reader test can put a NULL where it wants one.
+fn value_or_null(v: Str) -> PgValue
+    if str.len(v) == 0
+        return PgNull
+    one_text_value(v)
+
+fn raw_at(values: [PgValue], at: Int) -> Str
+    match list.get(values, at, PgNull)
+        PgUnknown(_, _, raw) => bytes.to_str(raw)
+        PgStr(v)             => v
+        _                    => "<not text>"
+
+fn is_null_at(values: [PgValue], at: Int) -> Bool
+    match list.get(values, at, PgNull)
+        PgNull => true
+        _      => false
+
+fn row_len(rows: [[PgValue]], at: Int) -> Int
+    match list.get(rows, at, [])
+        row => list.len(row)
+
+@test
+fn test_text_rows_read_from_a_buffer_with_their_escapes_undone() [io, net, time]
+    test.case("tab-separated, with a null marker and an escape in a field")
+    // `a`, NULL and `b\n` — the third field's escape undone, which is
+    // the difference between a tab in the data and the delimiter.
+    let s = out_of(conn_over(bytes.zeros(0)), pgcopy.PgCopyText,
+                   bytes.from_str("a\t\\N\tb\\n\n"), false)
+    match pgcopy.recv_rows(s)
+        Err(f)    => test.fail(pgerror.describe(f))
+        Ok(batch) =>
+            test.assert_eq(list.len(batch.rows), 1)
+            test.assert_eq(row_len(batch.rows, 0), 3)
+            test.assert_eq_str(raw_at(batch.rows[0], 0), "a")
+            test.assert(is_null_at(batch.rows[0], 1))
+            test.assert_eq_str(raw_at(batch.rows[0], 2), "b\n")
+
+    test.case("every escape letter, and one with no meaning passes through")
+    let escaped = out_of(conn_over(bytes.zeros(0)), pgcopy.PgCopyText,
+                         bytes.from_str("\\n\\r\\t\\b\\f\\v\\x\n"), false)
+    match pgcopy.recv_rows(escaped)
+        Err(f)    => test.fail(pgerror.describe(f))
+        Ok(batch) =>
+            test.assert_eq_str(raw_at(batch.rows[0], 0), "\n\r\t\b\f\vx")
+
+    test.case("a row that has not finished arriving is not a row yet")
+    // No newline: the bytes are kept and nothing is answered — and
+    // the connection's next chunk completes them.
+    let chunky = out_of(conn_over(bytes.concat([copy_data(bytes.from_str("c\n")),
+                                                bare(99), command("COPY 1"), ready(73)])),
+                        pgcopy.PgCopyText, bytes.from_str("a\tb"), false)
+    match pgcopy.recv_rows(chunky)
+        Err(f)    => test.fail(pgerror.describe(f))
+        Ok(batch) =>
+            test.assert_eq(list.len(batch.rows), 1)
+            test.assert_eq_str(raw_at(batch.rows[0], 1), "bc")
+
+@test
+fn test_csv_rows_are_quoted_and_a_carriage_return_is_not_a_field() [io, net, time]
+    test.case("a quoted field, an empty field that is NULL, and a \\r")
+    let s = out_of(conn_over(bytes.zeros(0)), pgcopy.PgCopyCsv,
+                   bytes.from_str("\"a\"\"b\",,\"c\"\r\nplain\n"), false)
+    match pgcopy.recv_rows(s)
+        Err(f)    => test.fail(pgerror.describe(f))
+        Ok(batch) =>
+            test.assert_eq(list.len(batch.rows), 2)
+            test.assert_eq_str(raw_at(batch.rows[0], 0), "a\"b")
+            test.assert(is_null_at(batch.rows[0], 1))
+            test.assert_eq_str(raw_at(batch.rows[0], 2), "c")
+            test.assert_eq_str(raw_at(batch.rows[1], 0), "plain")
+
+@test
+fn test_binary_rows_read_from_a_buffer_with_a_signature_and_a_trailer() [io, net, time]
+    test.case("the header, one row, and the trailer that ends the stream")
+    let row = pgcopy.encode_binary_row([pgtype.PgStr(v: "hi"), PgNull])!
+    let stream = bytes.concat([pgcopy.binary_header(), row, pgcopy.binary_trailer()])
+    let s = out_of(conn_over(bytes.zeros(0)), pgcopy.PgCopyBinary, stream, false)
+    match pgcopy.recv_rows(s)
+        Err(f)    => test.fail(pgerror.describe(f))
+        Ok(batch) =>
+            test.assert_eq(list.len(batch.rows), 1)
+            test.assert_eq(row_len(batch.rows, 0), 2)
+            test.assert_eq_str(raw_at(batch.rows[0], 0), "hi")
+            test.assert(is_null_at(batch.rows[0], 1))
+
+    test.case("a header that has not finished arriving is not taken off")
+    let stub = out_of(conn_over(bytes.zeros(0)), pgcopy.PgCopyBinary,
+                      bytes.slice(pgcopy.binary_header(), 0, 5), false)
+    match pgcopy.recv_rows(stub)
+        Ok(_)  => test.fail("a stream with a stub of a header answered rows")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "read"),
+                                   pgerror.describe(f))
+
+    test.case("a row whose bytes have not all arrived is kept for the next chunk")
+    // A whole row, then a column count and a length with no value
+    // after them: the row is answered and the stub is kept, because a
+    // row is complete only when its last column is.
+    let half = bytes.concat([pgcopy.binary_header(), row,
+                             bytes.from_byte_list([0, 1, 0, 0, 0, 5, 97])])
+    let partial_stream = out_of(conn_over(bytes.zeros(0)), pgcopy.PgCopyBinary, half, false)
+    match pgcopy.recv_rows(partial_stream)
+        Err(f)    => test.fail(pgerror.describe(f))
+        Ok(batch) =>
+            test.assert_eq(list.len(batch.rows), 1)
+            test.assert_eq(bytes.len(batch.stream.partial), 7)
+
+    test.case("a column count with no room for its first column's length")
+    // Two columns announced, then two bytes and no more: the row is
+    // not short of a VALUE, it is short of the four-byte length the
+    // next column needs, which is the other way a row can be
+    // incomplete.
+    let no_length = bytes.concat([pgcopy.binary_header(), row,
+                                  bytes.from_byte_list([0, 2, 0, 0])])
+    let cut_stream = out_of(conn_over(bytes.zeros(0)), pgcopy.PgCopyBinary, no_length, false)
+    match pgcopy.recv_rows(cut_stream)
+        Err(f)    => test.fail(pgerror.describe(f))
+        Ok(batch) =>
+            test.assert_eq(list.len(batch.rows), 1)
+            test.assert_eq(bytes.len(batch.stream.partial), 4)
+
+    test.case("one byte is not a column count")
+    let tiny = bytes.concat([pgcopy.binary_header(), row, bytes.u8(0)])
+    let tiny_stream = out_of(conn_over(bytes.zeros(0)), pgcopy.PgCopyBinary, tiny, false)
+    match pgcopy.recv_rows(tiny_stream)
+        Err(f)    => test.fail(pgerror.describe(f))
+        Ok(batch) =>
+            test.assert_eq(list.len(batch.rows), 1)
+            test.assert_eq(bytes.len(batch.stream.partial), 1)
+
+@test
+fn test_the_binary_framing_is_the_signature_the_trailer_and_a_row() [io, net, time]
+    test.case("the signature is eleven bytes and the header nineteen")
+    test.assert_eq(bytes.len(pgcopy.binary_header()), 19)
+    test.assert_eq(bytes.len(pgcopy.binary_trailer()), 2)
+
+    // THE BYTES, not just their length.  Every other case in this tree
+    // that touches the trailer builds its stream out of `binary_trailer()`
+    // itself, so a writer that answered `\xFF\xFE` for the trailer's -1
+    // would agree with its own reader and pass every one of them — a
+    // mutation to exactly that survived all thirteen suites.  A literal
+    // is the only assertion here that cannot agree with the code.
+    test.case("and the bytes are the signature and the -1 a `COPY` stream carries")
+    test.assert_eq_str(bytes.to_hex(pgcopy.binary_header()),
+                       "5047434f50590aff0d0a000000000000000000")
+    test.assert_eq_str(bytes.to_hex(pgcopy.binary_trailer()), "ffff")
+
+    let row = pgcopy.encode_binary_row([pgtype.PgStr(v: "ab"), PgNull])!
+    // Two columns, then a length and a value, then -1 for the NULL.
+    test.assert_eq(bytes.len(row), 2 + 4 + 2 + 4)
+
+    test.case("a text row escapes the delimiter it was given")
+    let csv_row = pgcopy.encode_text_row([one_text_value("a,b"), one_text_value("c"),
+                                         PgNull],
+                                         ",", "\\N")!
+    test.assert_eq_str(bytes.to_str(csv_row), "a\\,b,c,\\N\n")
+
+    test.case("the tab delimiter has a short escape of its own")
+    let tabs = pgcopy.encode_text_row([one_text_value("a\tb"), PgNull], "\t", "\\N")!
+    test.assert_eq_str(bytes.to_str(tabs), "a\\tb\t\\N\n")
+
+@test
+fn test_copying_in_writes_the_rows_and_ends_with_the_trailer() [io, net, time]
+    test.case("text rows, and the row count the server reported")
+    let c = conn_over(bytes.concat([copy_in_response(0, [0]), command("COPY 2"), ready(73)]))
+    match pgcopy.begin_in(c, "COPY t FROM STDIN", pgcopy.PgCopyText)
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(s)  =>
+            test.assert_eq(s.sent_bytes, 0)
+            match pgcopy.send_row(s, [one_text_value("a"), PgNull])
+                Err(f)    => test.fail(pgerror.describe(f))
+                Ok(after) => test.assert(after.sent_bytes > 0)
+            match pgcopy.finish_in(s)
+                Err(f)   => test.fail(pgerror.describe(f))
+                Ok(done) => test.assert_eq(done.rows, 2)
+
+    test.case("binary rows: the header goes out once, before the first row")
+    let cb = conn_over(bytes.concat([copy_in_response(1, [1, 1]), command("COPY 1"), ready(73)]))
+    match pgcopy.begin_in(cb, "COPY t FROM STDIN WITH (FORMAT binary)", pgcopy.PgCopyBinary)
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(s)  =>
+            test.assert_false(s.header_sent, "no byte has gone out yet")
+            match pgcopy.send_row(s, [pgtype.PgStr(v: "ab"), PgNull])
+                Err(f)    => test.fail(pgerror.describe(f))
+                Ok(first) =>
+                    test.assert(first.header_sent)
+                    let header_len = bytes.len(pgcopy.binary_header())
+                    test.assert_eq(first.sent_bytes, header_len + 2 + 4 + 2 + 4)
+                    // The second row does not write the header again.
+                    match pgcopy.send_row(first, [pgtype.PgStr(v: "cd"), PgNull])
+                        Err(f)     => test.fail(pgerror.describe(f))
+                        Ok(second) =>
+                            test.assert_eq(second.sent_bytes,
+                                           first.sent_bytes + 2 + 4 + 2 + 4)
+                            // THE TRAILER IS OWED BY THIS STATE AND NOT
+                            // BY `s`: a binary stream ends with the
+                            // two-byte -1 column count only once the
+                            // header has gone out, and finishing the
+                            // state that has written nothing would
+                            // leave the server waiting for a row that
+                            // never comes.
+                            match pgcopy.finish_in(second)
+                                Err(f)   => test.fail(pgerror.describe(f))
+                                Ok(done) => test.assert_eq(done.rows, 1)
+
+    test.case("csv rows, and the raw door")
+    let cc = conn_over(bytes.concat([copy_in_response(0, [0]), command("COPY 1"), ready(73)]))
+    match pgcopy.begin_in(cc, "COPY t FROM STDIN WITH (FORMAT csv)", pgcopy.PgCopyCsv)
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(s)  =>
+            match pgcopy.send_row(s, [one_text_value("a,b"), one_text_value("c"), PgNull])
+                Err(f)    => test.fail(pgerror.describe(f))
+                Ok(after) => test.assert(after.sent_bytes > 0)
+            match pgcopy.send_raw(s, bytes.from_str("x,y\n"))
+                Err(f)    => test.fail(pgerror.describe(f))
+                Ok(after) => test.assert(after.sent_bytes > 0)
+            // An empty chunk is legal and is one more thing on the
+            // wire for nobody, so it is not sent at all.
+            match pgcopy.send_raw(s, bytes.zeros(0))
+                Err(f)    => test.fail(pgerror.describe(f))
+                Ok(after) => test.assert_eq(after.sent_bytes, 0)
+            match pgcopy.finish_in(s)
+                Err(f)   => test.fail(pgerror.describe(f))
+                Ok(done) => test.assert_eq(done.rows, 1)
+
+    test.case("a format the statement did not ask for is refused before the first byte")
+    let text_statement = conn_over(bytes.concat([copy_in_response(1, [1]),
+                                                 command("COPY 0"), ready(73)]))
+    match pgcopy.begin_in(text_statement, "COPY t FROM STDIN WITH (FORMAT binary)",
+                          pgcopy.PgCopyText)
+        Ok(_)  => test.fail("a text encoder started against a binary statement")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "encodes another"),
+                                   pgerror.describe(f))
+
+    test.case("a statement the server answered with a COPY OUT is not a COPY FROM STDIN")
+    let other_way = conn_over(bytes.concat([copy_out_response(0, [0]), ready(73)]))
+    match pgcopy.begin_in(other_way, "COPY t TO STDOUT", pgcopy.PgCopyText)
+        Ok(_)  => test.fail("a COPY TO STDOUT started a stream this client writes to")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "COPY FROM STDIN"),
+                                   pgerror.describe(f))
+
+    test.case("a COPY the server ran itself never starts a stream")
+    let not_a_copy = conn_over(bytes.concat([command("COPY 1"), ready(73)]))
+    match pgcopy.begin_in(not_a_copy, "COPY t TO 'file'", pgcopy.PgCopyText)
+        Ok(_)  => test.fail("a statement that copied on the server started a stream")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "without a copy"),
+                                   pgerror.describe(f))
+
+    test.case("a server error before the copy starts is that error")
+    let refused = conn_over(bytes.concat([refusal("42501", "permission denied for table t"),
+                                          ready(73)]))
+    match pgcopy.begin_in(refused, "COPY t FROM STDIN", pgcopy.PgCopyText)
+        Ok(_)  => test.fail("a refused COPY started a stream")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "permission denied"),
+                                   pgerror.describe(f))
+
+    test.case("a notice before the copy response is skipped rather than answered")
+    let noisy = conn_over(bytes.concat([notice("starting the copy"),
+                                        copy_in_response(0, [0]), command("COPY 1"),
+                                        ready(73)]))
+    match pgcopy.begin_in(noisy, "COPY t FROM STDIN", pgcopy.PgCopyText)
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(s)  => test.assert_eq(s.sent_bytes, 0)
+
+    test.case("giving up says why, and the server's complaint about it is not this call's failure")
+    let aborting = conn_over(bytes.concat([copy_in_response(0, [0]),
+                                           refusal("57014", "COPY from stdin failed: bad row"),
+                                           ready(73)]))
+    match pgcopy.begin_in(aborting, "COPY t FROM STDIN", pgcopy.PgCopyText)
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(s)  =>
+            match pgcopy.fail_in(s, "bad row")
+                Err(f)    => test.fail(pgerror.describe(f))
+                Ok(after) => test.assert_eq(after.process_id, 4711)
+
+@test
+fn test_copying_out_reads_rows_however_the_server_chunked_them() [io, net, time]
+    test.case("a row split across two CopyData messages is one row")
+    let c = conn_over(bytes.concat([copy_out_response(0, [0]), copy_data(bytes.from_str("a\tb\n")),
+                                    copy_data(bytes.from_str("c\td")), copy_data(bytes.from_str("\n")),
+                                    bare(99), command("COPY 2"), ready(73)]))
+    match pgcopy.begin_out(c, "COPY t TO STDOUT", pgcopy.PgCopyText)
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(s)  =>
+            test.assert_false(s.finished, "the copy has not ended yet")
+            match pgcopy.recv_rows(s)
+                Err(f)    => test.fail(pgerror.describe(f))
+                Ok(first) =>
+                    test.assert_eq(list.len(first.rows), 1)
+                    test.assert_eq_str(raw_at(first.rows[0], 0), "a")
+                    // The chunk that arrives mid-row answers no rows —
+                    // the empty list with `finished` clear is "ask
+                    // again".
+                    match pgcopy.recv_rows(first.stream)
+                        Err(f)     => test.fail(pgerror.describe(f))
+                        Ok(second) =>
+                            test.assert_eq(list.len(second.rows), 0)
+                            match pgcopy.recv_rows(second.stream)
+                                Err(f)    => test.fail(pgerror.describe(f))
+                                Ok(third) =>
+                                    test.assert_eq(list.len(third.rows), 1)
+                                    test.assert_eq_str(raw_at(third.rows[0], 1), "d")
+                                    // Draining the rest is what makes the
+                                    // connection usable again.
+                                    match pgcopy.finish_out(third.stream)
+                                        Err(f)    => test.fail(pgerror.describe(f))
+                                        Ok(after) => test.assert_eq(after.process_id, 4711)
+
+    test.case("a finished stream sends nothing and answers nothing")
+    let ended = out_of(conn_over(bytes.zeros(0)), pgcopy.PgCopyText, bytes.zeros(0), true)
+    match pgcopy.recv_raw(ended)
+        Err(f)    => test.fail(pgerror.describe(f))
+        Ok(chunk) =>
+            test.assert_eq(bytes.len(chunk.data), 0)
+    match pgcopy.recv_rows(ended)
+        Err(f)    => test.fail(pgerror.describe(f))
+        Ok(batch) => test.assert_eq(list.len(batch.rows), 0)
+
+    test.case("binary rows: the signature is taken off before the first row is read")
+    let row = pgcopy.encode_binary_row([pgtype.PgStr(v: "hi")])!
+    let cb = conn_over(bytes.concat([copy_out_response(1, [1]),
+                                     copy_data(bytes.concat([pgcopy.binary_header(), row])),
+                                     copy_data(pgcopy.binary_trailer()),
+                                     bare(99), command("COPY 1"), ready(73)]))
+    match pgcopy.begin_out(cb, "COPY t TO STDOUT WITH (FORMAT binary)", pgcopy.PgCopyBinary)
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(s)  =>
+            match pgcopy.recv_rows(s)
+                Err(f)    => test.fail(pgerror.describe(f))
+                Ok(batch) =>
+                    test.assert_eq(list.len(batch.rows), 1)
+                    test.assert_eq_str(raw_at(batch.rows[0], 0), "hi")
+                    match pgcopy.recv_rows(batch.stream)
+                        Err(f)  => test.fail(pgerror.describe(f))
+                        Ok(end) => test.assert_eq(list.len(end.rows), 0)
+
+    test.case("the raw door hands back the signature with everything else")
+    let cr = conn_over(bytes.concat([copy_out_response(1, [1]),
+                                     copy_data(pgcopy.binary_header()), bare(99),
+                                     command("COPY 0"), ready(73)]))
+    match pgcopy.begin_out(cr, "COPY t TO STDOUT WITH (FORMAT binary)", pgcopy.PgCopyBinary)
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(s)  =>
+            match pgcopy.recv_raw(s)
+                Err(f)    => test.fail(pgerror.describe(f))
+                Ok(chunk) =>
+                    test.assert_eq(bytes.len(chunk.data), 19)
+                    test.assert_false(chunk.stream.finished, "no CopyDone yet")
+
+    test.case("a format the statement did not ask for is refused")
+    let binary_statement = conn_over(bytes.concat([copy_out_response(1, [1]),
+                                                   command("COPY 0"), ready(73)]))
+    match pgcopy.begin_out(binary_statement, "COPY t TO STDOUT WITH (FORMAT binary)",
+                           pgcopy.PgCopyText)
+        Ok(_)  => test.fail("a text decoder started against a binary statement")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "decodes another"),
+                                   pgerror.describe(f))
+
+    test.case("a statement the server answered with a COPY IN is not a COPY TO STDOUT")
+    let other_way = conn_over(bytes.concat([copy_in_response(0, [0]), ready(73)]))
+    match pgcopy.begin_out(other_way, "COPY t FROM STDIN", pgcopy.PgCopyText)
+        Ok(_)  => test.fail("a COPY FROM STDIN started a stream this client reads from")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "COPY TO STDOUT"),
+                                   pgerror.describe(f))
+
+    test.case("a COPY the server ran itself never starts a stream")
+    let not_a_copy = conn_over(bytes.concat([command("COPY 1"), ready(73)]))
+    match pgcopy.begin_out(not_a_copy, "COPY t TO 'file'", pgcopy.PgCopyText)
+        Ok(_)  => test.fail("a statement that copied on the server started a stream")
+        Err(f) => test.assert_true(str.contains(pgerror.describe(f), "without a copy"),
+                                   pgerror.describe(f))
+
+    test.case("an error inside the copy is that error")
+    let refused = conn_over(bytes.concat([copy_out_response(0, [0]),
+                                          refusal("57014", "canceling statement due to user request"),
+                                          ready(73)]))
+    match pgcopy.begin_out(refused, "COPY t TO STDOUT", pgcopy.PgCopyText)
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(s)  =>
+            match pgcopy.recv_raw(s)
+                Ok(_)  => test.fail("a cancelled copy answered data")
+                Err(f) => test.assert_true(str.contains(pgerror.describe(f), "canceling statement"),
+                                           pgerror.describe(f))
+
+    test.case("a message that is not copy data is refused")
+    let wrong = conn_over(bytes.concat([copy_out_response(0, [0]), one_text_row("7"),
+                                        bare(99), command("COPY 0"), ready(73)]))
+    match pgcopy.begin_out(wrong, "COPY t TO STDOUT", pgcopy.PgCopyText)
+        Err(f) => test.fail(pgerror.describe(f))
+        Ok(s)  =>
+            match pgcopy.recv_raw(s)
+                Ok(_)  => test.fail("a row arrived where copy data belonged")
+                Err(f) => test.assert_true(str.contains(pgerror.describe(f), "not copy data"),
+                                           pgerror.describe(f))

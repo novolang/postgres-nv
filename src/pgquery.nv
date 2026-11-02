@@ -1,8 +1,6 @@
 // pgquery.nv — the two query protocols, and the one rule that makes
 // the second of them safe to pipeline.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // TWO PROTOCOLS, AND ONLY ONE OF THEM HAS PARAMETERS.
 //
 //   * SIMPLE: one `Query` message carrying SQL text, possibly several
@@ -45,6 +43,22 @@
 // open for the next `Execute`.  That is how a result set larger than
 // memory is read, and it is the reason `PgPortalSuspended` exists in
 // the message enum at all.
+//
+// A CURSOR NEEDS A TRANSACTION, AND THAT IS THE PROTOCOL'S RULE.
+// A portal lives until the end of the transaction that made it, and a
+// `Sync` outside an explicit transaction ENDS the implicit one — so a
+// portal opened and then synchronised without a `begin` is gone by the
+// time the first `fetch` asks for it, and the server says the portal
+// does not exist.  Every driver has this rule; here it is stated where
+// the cursor is opened rather than left to the error message.
+//
+// PARAMETERS GO OUT AS TEXT AND VALUES COME BACK IN BINARY.  Text
+// because the parameter's type is the one the `Parse` named, and the
+// text form of every value this package carries is PostgreSQL's own
+// input syntax for it; binary for results because a binary value needs
+// no parser and has no locale.  `execute` and `query` take the result
+// format because a caller reading a `numeric` with a scale it has to
+// preserve may have a different opinion.
 
 use pgconn
 use pgerror
@@ -92,6 +106,241 @@ pub struct PgCursor
     // `PortalSuspended`.
     finished: Bool
 
+// A script's results, one per statement, and the connection.
+pub struct PgSimpleDone
+    conn: pgconn.PgConn
+    results: [PgResult]
+
+// A prepared statement and the connection that holds it.
+pub struct PgPrepared
+    conn: pgconn.PgConn
+    statement: PgStatement
+
+// One result and the connection it came off.
+pub struct PgExecuted
+    conn: pgconn.PgConn
+    result: PgResult
+
+// How many rows a statement changed, and the connection.
+pub struct PgAffected
+    conn: pgconn.PgConn
+    affected: Int
+
+// One result per statement, in order, with a fault in the slot of
+// every statement that failed.
+pub struct PgPipelined
+    conn: pgconn.PgConn
+    // One per statement, in order.  A statement that failed is an
+    // `Err` in its own slot rather than ending the batch.
+    results: [PgResult]
+    faults: [?pgerror.PgFault]
+
+// What a batch under one `Sync` produced: the results that came back,
+// how many statements the server skipped, and why.
+pub struct PgPipelinedUnsynced
+    conn: pgconn.PgConn
+    results: [PgResult]
+    // The fault that stopped the batch, or `None`.
+    fault: ?pgerror.PgFault
+    // How many statements the server discarded after it.  Zero when
+    // nothing failed.
+    skipped: Int
+
+// An open portal and the connection.
+pub struct PgCursorOpened
+    conn: pgconn.PgConn
+    cursor: PgCursor
+
+// The next batch of rows.
+pub struct PgBatch
+    conn: pgconn.PgConn
+    cursor: PgCursor
+    rows: [[pgtype.PgValue]]
+
+// How much a transaction is protected from concurrent ones.
+pub enum PgIsolation
+    // PostgreSQL's default, and NOT what the standard calls read
+    // committed elsewhere: a statement sees a snapshot taken when
+    // THAT STATEMENT started, so two statements in one transaction can
+    // see different data.
+    PgReadCommitted
+    // One snapshot for the whole transaction.  What the standard
+    // calls repeatable read, and PostgreSQL's implementation also
+    // prevents phantom reads, which the standard does not require.
+    PgRepeatableRead
+    // True serialisability, enforced by aborting transactions with
+    // SQLSTATE 40001 — so a caller that asks for it MUST have a retry
+    // loop, and `pgerror.is_retryable` is what it branches on.
+    PgSerializable
+
+// What one exchange left behind, before anyone decided what to make
+// of it.
+struct PgRead
+    conn: pgconn.PgConn
+    // Every result the exchange finished, in order.
+    results: [PgResult]
+    // The last `RowDescription`, which for a `Describe` is the answer
+    // rather than the preamble to rows.
+    columns: [pgmsg.PgColumn]
+    // The last `ParameterDescription`.
+    parameter_oids: [Int]
+    // The rows read since the last result was finished, which for a
+    // portal that stopped at its row limit IS the batch: a suspended
+    // portal sends `PortalSuspended` in place of `CommandComplete`, so
+    // its rows are here and in no result.
+    rows: [[pgtype.PgValue]]
+    // True when the server stopped at a portal's row limit.
+    suspended: Bool
+    // The first `ErrorResponse`, and the only one reported.
+    fault: ?pgerror.PgFault
+
+// ── the pieces the bodies are built from ─────────────────────────────
+
+// A result with no rows, no columns and no tag: what an exchange that
+// produced nothing is worth, and what an empty statement answers.
+fn empty_result() -> PgResult
+    PgResult { columns: [], rows: [], tag: "", affected: 0, notices: [] }
+
+// One finished result.
+fn finished(columns: [pgmsg.PgColumn], rows: [[pgtype.PgValue]], tag: Str,
+            notices: [pgerror.PgFields]) -> PgResult
+    PgResult { columns: columns, rows: rows, tag: tag,
+               affected: pgmsg.tag_rows(tag), notices: notices }
+
+// The one result of an exchange that expects exactly one.
+fn only_result(read: PgRead) -> PgResult
+    if list.len(read.results) > 0
+        return list.get(read.results, 0, empty_result())
+    empty_result()
+
+// The OIDs of a parameter list, for a `Parse` that names them.
+//
+// Naming them is the alternative to letting the server infer, and
+// `prepare`'s comment says why inference is a trap.  `pgtype.oid_for`
+// is the table this reads; an `Int` binds as `int8`, which is the
+// width that holds every value this package can carry.
+fn oids_of(values: [pgtype.PgValue]) -> [Int]
+    var oids: [Int] = []
+    for v in values
+        oids = list.concat(oids, [pgtype.oid_for(v)])
+    oids
+
+// The two lists a `Bind` carries: the bytes and the NULL flags.
+//
+// Text format, because the `Parse` named every parameter's type and
+// the text form of each value is PostgreSQL's input syntax for it.
+fn encode_parameters(values: [pgtype.PgValue],
+                     format: pgmsg.PgFormat) -> Result<([Bytes], [Bool]), pgerror.PgFault>
+    var raw: [Bytes] = []
+    var nulls: [Bool] = []
+    for v in values
+        let one = pgtype.encode(v, format)!
+        raw = list.concat(raw, [one.raw])
+        nulls = list.concat(nulls, [one.is_null])
+    Ok((raw, nulls))
+
+// One statement's extended-protocol messages, on the unnamed
+// statement and portal, ending before `Execute` — so a caller adds
+// its own row limit and its own `Sync`.
+//
+// `Describe` is not optional and is not decoration: `Execute` sends
+// rows and no description, and a client that skipped the describe has
+// rows it cannot decode.
+fn statement_messages(sql: Str, values: [pgtype.PgValue], format: pgmsg.PgFormat,
+                      max_rows: Int) -> Result<[pgmsg.PgFrontend], pgerror.PgFault>
+    let encoded = encode_parameters(values, pgmsg.PgText)!
+    Ok([pgmsg.PgParse(name: "", sql: sql, parameter_oids: oids_of(values)),
+        pgmsg.PgBind(portal: "", statement: "", parameter_formats: [],
+                     parameters: encoded.0, parameter_nulls: encoded.1,
+                     result_formats: [format]),
+        pgmsg.PgDescribePortal(name: ""),
+        pgmsg.PgExecute(portal: "", max_rows: max_rows)])
+
+// The `BEGIN` a level and a read-only flag spell.
+//
+// `READ ONLY` is the part worth having: it is what makes the server
+// refuse an accidental write inside a report, rather than leaving the
+// mistake to be found in the data.
+fn begin_sql(level: PgIsolation, read_only: Bool) -> Str
+    let base = match level
+        PgReadCommitted  => "BEGIN ISOLATION LEVEL READ COMMITTED"
+        PgRepeatableRead => "BEGIN ISOLATION LEVEL REPEATABLE READ"
+        PgSerializable   => "BEGIN ISOLATION LEVEL SERIALIZABLE"
+    if read_only
+        return "${base} READ ONLY"
+    base
+
+// Read one exchange to its `ReadyForQuery`.
+//
+// `columns` is the description the caller already holds — a `fetch`
+// gets rows with no `RowDescription` in front of them, because the
+// description arrived when the portal was opened — and a
+// `RowDescription` met on the way replaces it.
+//
+// EVERY MESSAGE OF EVERY EXCHANGE GOES THROUGH HERE, which is why the
+// loop continues to the boundary after a server error instead of
+// returning at it: the server discards until `Sync`, and a caller that
+// stopped reading there would leave responses in the inbox for the
+// next statement to read as its own.
+fn read_exchange(conn: pgconn.PgConn,
+                 columns: [pgmsg.PgColumn]) -> Result<PgRead, pgerror.PgFault> [io, net, time]
+    var current = conn
+    var known = columns[:]
+    var results: [PgResult] = []
+    var rows: [[pgtype.PgValue]] = []
+    var notices: [pgerror.PgFields] = []
+    var parameter_oids: [Int] = []
+    var suspended = false
+    var fault: ?pgerror.PgFault = None
+    var done = false
+    while not done
+        match pgconn.next_message(current)
+            Err(f) =>
+                // A connection that died AFTER the server told us why
+                // is a connection whose cause is the server's message:
+                // a FATAL error is the last thing a session hears, so
+                // reporting the read failure instead would bury it.
+                match fault
+                    Some(server) =>
+                        return Err(server)
+                    None         =>
+                        return Err(f)
+            Ok(r)  =>
+                current = r.conn
+                match r.message
+                    PgRowDescription(cols)       =>
+                        known = cols[:]
+                    PgParameterDescription(oids) =>
+                        parameter_oids = oids[:]
+                    PgDataRow(values, nulls)     =>
+                        match pgtype.decode_row(known, values, nulls,
+                                                current.settings)
+                            Ok(row) =>
+                                rows = list.concat(rows, [row])
+                            Err(f)  =>
+                                if fault == None
+                                    fault = Some(f)
+                    PgCommandComplete(tag)       =>
+                        results = list.concat(results, [finished(known, rows, tag, notices)])
+                        rows = []
+                        notices = []
+                        known = []
+                    PgEmptyQueryResponse         =>
+                        results = list.concat(results, [empty_result()])
+                    PgNoticeResponse(fields)     =>
+                        notices = list.concat(notices, [fields])
+                    PgErrorResponse(fields)      =>
+                        if fault == None
+                            fault = Some(pgerror.PgServerError(fields: fields))
+                    PgPortalSuspended            =>
+                        suspended = true
+                    _                            => ()
+                if pgmsg.ends_exchange(r.message)
+                    done = true
+    Ok(PgRead { conn: current, results: results, columns: known,
+                parameter_oids: parameter_oids, rows: rows,
+                suspended: suspended, fault: fault })
+
 // ── the simple protocol ──────────────────────────────────────────────
 
 // Run SQL text in one `Query` message.
@@ -119,13 +368,12 @@ pub struct PgCursor
 //                 Ok(r)  => println("${list.len(r.results)}")
 //                 Err(_) => println("failed")
 // ```
-pub struct PgSimpleDone
-    conn: pgconn.PgConn
-    results: [PgResult]
-
-// Run a script.
-pub fn simple(c: pgconn.PgConn, sql: Str) -> Result<PgSimpleDone, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgquery.simple")
+pub fn simple(c: pgconn.PgConn, sql: Str) -> Result<PgSimpleDone, pgerror.PgFault> [io, net, time]
+    let sent = pgconn.send(c, pgmsg.PgQuery(sql: sql))!
+    let read = read_exchange(sent, [])!
+    match read.fault
+        Some(f) => Err(f)
+        None    => Ok(PgSimpleDone { conn: read.conn, results: read.results })
 
 // ── the extended protocol ────────────────────────────────────────────
 
@@ -148,14 +396,27 @@ pub fn simple(c: pgconn.PgConn, sql: Str) -> Result<PgSimpleDone, pgerror.PgFaul
 //                 Ok(p)  => println(p.statement.name)
 //                 Err(_) => println("refused")
 // ```
-pub struct PgPrepared
-    conn: pgconn.PgConn
-    statement: PgStatement
-
-// Prepare.
 pub fn prepare(c: pgconn.PgConn, name: Str, sql: Str,
-               parameter_oids: [Int]) -> Result<PgPrepared, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgquery.prepare")
+               parameter_oids: [Int]) -> Result<PgPrepared, pgerror.PgFault> [io, net, time]
+    let sent = pgconn.send_batch(c, [pgmsg.PgParse(name: name, sql: sql,
+                                                   parameter_oids: parameter_oids),
+                                     pgmsg.PgDescribeStatement(name: name),
+                                     pgmsg.PgSync])!
+    let read = read_exchange(sent, [])!
+    match read.fault
+        Some(f) => Err(f)
+        None    =>
+            // The description is the server's answer to what the
+            // parameters and the columns ARE; the caller's list is the
+            // fallback for a server that sent no description at all.
+            let oids = if list.len(read.parameter_oids) > 0
+                read.parameter_oids
+            else
+                parameter_oids
+            Ok(PgPrepared { conn: read.conn,
+                            statement: PgStatement { name: name, sql: sql,
+                                                     parameter_oids: oids,
+                                                     columns: read.columns } })
 
 // Release a prepared statement.
 //
@@ -163,22 +424,41 @@ pub fn prepare(c: pgconn.PgConn, name: Str, sql: Str,
 // request holds every one of them until it closes, and the server's
 // memory is where that shows up.
 pub fn close_statement(c: pgconn.PgConn,
-                       name: Str) -> Result<pgconn.PgConn, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgquery.close_statement")
+                       name: Str) -> Result<pgconn.PgConn, pgerror.PgFault> [io, net, time]
+    let sent = pgconn.send_batch(c, [pgmsg.PgCloseStatement(name: name),
+                                     pgmsg.PgSync])!
+    let read = read_exchange(sent, [])!
+    match read.fault
+        Some(f) => Err(f)
+        None    => Ok(read.conn)
 
 // Run a prepared statement with these parameters.
 //
 // `result_format` applies to every column; a caller that wants a
 // mixture builds the `Bind` itself.  Binary is what to ask for — see
 // `pgtype`'s module comment.
-pub struct PgExecuted
-    conn: pgconn.PgConn
-    result: PgResult
-
-// Execute.
+//
+// A parameter count that does not match the statement is refused here
+// rather than sent: the server's own error for it names the statement
+// and not the call site, and it is a shape a caller cannot see.
 pub fn execute(c: pgconn.PgConn, st: PgStatement, parameters: [pgtype.PgValue],
-               result_format: pgmsg.PgFormat) -> Result<PgExecuted, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgquery.execute")
+               result_format: pgmsg.PgFormat) -> Result<PgExecuted, pgerror.PgFault> [io, net, time]
+    if list.len(st.parameter_oids) > 0 and list.len(parameters) != list.len(st.parameter_oids)
+        return Err(pgerror.PgBadParameters(want: list.len(st.parameter_oids),
+                                           got: list.len(parameters)))
+    let encoded = encode_parameters(parameters, pgmsg.PgText)!
+    let sent = pgconn.send_batch(c, [pgmsg.PgBind(portal: "", statement: st.name,
+                                                  parameter_formats: [],
+                                                  parameters: encoded.0,
+                                                  parameter_nulls: encoded.1,
+                                                  result_formats: [result_format]),
+                                     pgmsg.PgDescribePortal(name: ""),
+                                     pgmsg.PgExecute(portal: "", max_rows: 0),
+                                     pgmsg.PgSync])!
+    let read = read_exchange(sent, [])!
+    match read.fault
+        Some(f) => Err(f)
+        None    => Ok(PgExecuted { conn: read.conn, result: only_result(read) })
 
 // Parse, bind, execute and sync, in one round trip, on the unnamed
 // statement.
@@ -202,21 +482,22 @@ pub fn execute(c: pgconn.PgConn, st: PgStatement, parameters: [pgtype.PgValue],
 //                 Err(_) => println("failed")
 // ```
 pub fn query(c: pgconn.PgConn, sql: Str, parameters: [pgtype.PgValue],
-             result_format: pgmsg.PgFormat) -> Result<PgExecuted, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgquery.query")
+             result_format: pgmsg.PgFormat) -> Result<PgExecuted, pgerror.PgFault> [io, net, time]
+    let batch = statement_messages(sql, parameters, result_format, 0)!
+    let sent = pgconn.send_batch(c, list.concat(batch, [pgmsg.PgSync]))!
+    let read = read_exchange(sent, [])!
+    match read.fault
+        Some(f) => Err(f)
+        None    => Ok(PgExecuted { conn: read.conn, result: only_result(read) })
 
 // Run a statement and answer only how many rows it changed.
 //
 // For an `INSERT`, `UPDATE` or `DELETE`, where building a result set
 // of no rows is work nobody asked for.
-pub struct PgAffected
-    conn: pgconn.PgConn
-    affected: Int
-
-// Execute for the count alone.
 pub fn execute_count(c: pgconn.PgConn, sql: Str,
-                     parameters: [pgtype.PgValue]) -> Result<PgAffected, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgquery.execute_count")
+                     parameters: [pgtype.PgValue]) -> Result<PgAffected, pgerror.PgFault> [io, net, time]
+    let done = query(c, sql, parameters, pgmsg.PgBinary)!
+    Ok(PgAffected { conn: done.conn, affected: done.result.affected })
 
 // ── pipelining ───────────────────────────────────────────────────────
 
@@ -226,6 +507,11 @@ pub fn execute_count(c: pgconn.PgConn, sql: Str,
 // statement and the next one still runs, and every statement's result
 // is bounded by its own `ReadyForQuery`.  It costs one extra five-byte
 // message per statement and it is what a caller should use.
+//
+// A statement that fails is an `Err` in its own slot rather than the
+// end of the batch — and a CONNECTION that fails ends the batch, with
+// an `Err` and no results, because every later slot would be the same
+// fault and a caller cannot act on thirty copies of it.
 //
 // ```novo
 // use pgquery
@@ -240,17 +526,26 @@ pub fn execute_count(c: pgconn.PgConn, sql: Str,
 //                 Ok(p)  => println("${list.len(p.results)}")
 //                 Err(_) => println("failed")
 // ```
-pub struct PgPipelined
-    conn: pgconn.PgConn
-    // One per statement, in order.  A statement that failed is an
-    // `Err` in its own slot rather than ending the batch.
-    results: [PgResult]
-    faults: [?pgerror.PgFault]
-
-// Pipeline with one `Sync` per statement.
 pub fn pipeline(c: pgconn.PgConn, sqls: [Str],
-                parameters: [[pgtype.PgValue]]) -> Result<PgPipelined, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgquery.pipeline")
+                parameters: [[pgtype.PgValue]]) -> Result<PgPipelined, pgerror.PgFault> [io, net, time]
+    var sent = c
+    var i = 0
+    while i < list.len(sqls)
+        let one = statement_messages(list.get(sqls, i, ""), list.get(parameters, i, []),
+                                     pgmsg.PgText, 0)!
+        sent = pgconn.send_batch(sent, list.concat(one, [pgmsg.PgSync]))!
+        i = i + 1
+    var current = sent
+    var results: [PgResult] = []
+    var faults: [?pgerror.PgFault] = []
+    var j = 0
+    while j < list.len(sqls)
+        let read = read_exchange(current, [])!
+        current = read.conn
+        results = list.concat(results, [only_result(read)])
+        faults = list.concat(faults, [read.fault])
+        j = j + 1
+    Ok(PgPipelined { conn: current, results: results, faults: faults })
 
 // Several statements under ONE `Sync` at the end.
 //
@@ -264,19 +559,26 @@ pub fn pipeline(c: pgconn.PgConn, sqls: [Str],
 //
 // So this answers the results it got AND how many statements the
 // server skipped, and the caller has to look at the second number.
-pub struct PgPipelinedUnsynced
-    conn: pgconn.PgConn
-    results: [PgResult]
-    // The fault that stopped the batch, or `None`.
-    fault: ?pgerror.PgFault
-    // How many statements the server discarded after it.  Zero when
-    // nothing failed.
-    skipped: Int
-
-// Pipeline under one `Sync`.
 pub fn pipeline_unsynced(c: pgconn.PgConn, sqls: [Str],
-                         parameters: [[pgtype.PgValue]]) -> Result<PgPipelinedUnsynced, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgquery.pipeline_unsynced")
+                         parameters: [[pgtype.PgValue]]) -> Result<PgPipelinedUnsynced, pgerror.PgFault> [io, net, time]
+    var all: [pgmsg.PgFrontend] = []
+    var i = 0
+    while i < list.len(sqls)
+        let one = statement_messages(list.get(sqls, i, ""), list.get(parameters, i, []),
+                                     pgmsg.PgText, 0)!
+        all = list.concat(all, one)
+        i = i + 1
+    let sent = pgconn.send_batch(c, list.concat(all, [pgmsg.PgSync]))!
+    let read = read_exchange(sent, [])!
+    // The count is only meaningful against a failure — the server
+    // discards nothing when nothing failed — and it is the whole
+    // reason this call is separate from `pipeline`.
+    let skipped = if read.fault == None
+        0
+    else
+        list.len(sqls) - list.len(read.results)
+    Ok(PgPipelinedUnsynced { conn: read.conn, results: read.results,
+                             fault: read.fault, skipped: skipped })
 
 // ── cursors ──────────────────────────────────────────────────────────
 
@@ -286,6 +588,9 @@ pub fn pipeline_unsynced(c: pgconn.PgConn, sqls: [Str],
 // is refused: zero means every row to the protocol, which is what a
 // cursor exists not to do, and accepting it would make the mistake
 // silent.
+//
+// THE TRANSACTION IS NOT OPTIONAL — see the module comment: a portal
+// does not outlive the transaction that made it, so open one first.
 //
 // ```novo
 // use pgquery
@@ -299,24 +604,58 @@ pub fn pipeline_unsynced(c: pgconn.PgConn, sqls: [Str],
 //                 Ok(o)  => println(o.cursor.portal)
 //                 Err(_) => println("refused")
 // ```
-pub struct PgCursorOpened
-    conn: pgconn.PgConn
-    cursor: PgCursor
-
-// Open.
 pub fn open_cursor(c: pgconn.PgConn, portal: Str, sql: Str, parameters: [pgtype.PgValue],
-                   batch_rows: Int) -> Result<PgCursorOpened, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgquery.open_cursor")
+                   batch_rows: Int) -> Result<PgCursorOpened, pgerror.PgFault> [io, net, time]
+    if batch_rows < 1
+        return Err(pgerror.PgBadMessage(kind: 0, length: batch_rows,
+                   detail: "a cursor's batch_rows must be at least 1; zero means every row, which is what a cursor exists not to do"))
+    let encoded = encode_parameters(parameters, pgmsg.PgText)!
+    let oids = oids_of(parameters)
+    let sent = pgconn.send_batch(c, [pgmsg.PgParse(name: "", sql: sql,
+                                                   parameter_oids: oids),
+                                     pgmsg.PgBind(portal: portal, statement: "",
+                                                  parameter_formats: [],
+                                                  parameters: encoded.0,
+                                                  parameter_nulls: encoded.1,
+                                                  result_formats: [pgmsg.PgBinary]),
+                                     pgmsg.PgDescribePortal(name: portal),
+                                     pgmsg.PgSync])!
+    let read = read_exchange(sent, [])!
+    match read.fault
+        Some(f) => Err(f)
+        None    =>
+            Ok(PgCursorOpened { conn: read.conn,
+                                cursor: PgCursor { portal: portal,
+                                                   statement: PgStatement { name: "",
+                                                                            sql: sql,
+                                                                            parameter_oids: oids,
+                                                                            columns: read.columns },
+                                                   batch_rows: batch_rows,
+                                                   finished: false } })
 
 // The next batch.  An empty batch with `finished` set is the end.
-pub struct PgBatch
-    conn: pgconn.PgConn
-    cursor: PgCursor
-    rows: [[pgtype.PgValue]]
-
-// Fetch.
-pub fn fetch(c: pgconn.PgConn, cur: PgCursor) -> Result<PgBatch, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgquery.fetch")
+//
+// A cursor that has already finished sends nothing: the portal is
+// closed, and an `Execute` against it is an error from the server
+// rather than the empty batch the caller is asking for.
+pub fn fetch(c: pgconn.PgConn, cur: PgCursor) -> Result<PgBatch, pgerror.PgFault> [io, net, time]
+    if cur.finished
+        return Ok(PgBatch { conn: c, cursor: cur, rows: [] })
+    let sent = pgconn.send_batch(c, [pgmsg.PgExecute(portal: cur.portal,
+                                                     max_rows: cur.batch_rows),
+                                     pgmsg.PgSync])!
+    let read = read_exchange(sent, cur.statement.columns)!
+    match read.fault
+        Some(f) => Err(f)
+        None    =>
+            let rows = if read.suspended
+                read.rows
+            else
+                only_result(read).rows
+            let next = PgCursor { portal: cur.portal, statement: cur.statement,
+                                  batch_rows: cur.batch_rows,
+                                  finished: not read.suspended }
+            Ok(PgBatch { conn: read.conn, cursor: next, rows: rows })
 
 // Close a portal before it is exhausted.
 //
@@ -324,26 +663,15 @@ pub fn fetch(c: pgconn.PgConn, cur: PgCursor) -> Result<PgBatch, pgerror.PgFault
 // transaction ends, which is how a "read a million rows and stop at
 // the first bad one" loop blocks a vacuum for an hour.
 pub fn close_cursor(c: pgconn.PgConn,
-                    cur: PgCursor) -> Result<pgconn.PgConn, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgquery.close_cursor")
+                    cur: PgCursor) -> Result<pgconn.PgConn, pgerror.PgFault> [io, net, time]
+    let sent = pgconn.send_batch(c, [pgmsg.PgClosePortal(name: cur.portal),
+                                     pgmsg.PgSync])!
+    let read = read_exchange(sent, [])!
+    match read.fault
+        Some(f) => Err(f)
+        None    => Ok(read.conn)
 
 // ── transactions ─────────────────────────────────────────────────────
-
-// How much a transaction is protected from concurrent ones.
-pub enum PgIsolation
-    // PostgreSQL's default, and NOT what the standard calls read
-    // committed elsewhere: a statement sees a snapshot taken when
-    // THAT STATEMENT started, so two statements in one transaction can
-    // see different data.
-    PgReadCommitted
-    // One snapshot for the whole transaction.  What the standard
-    // calls repeatable read, and PostgreSQL's implementation also
-    // prevents phantom reads, which the standard does not require.
-    PgRepeatableRead
-    // True serialisability, enforced by aborting transactions with
-    // SQLSTATE 40001 — so a caller that asks for it MUST have a retry
-    // loop, and `pgerror.is_retryable` is what it branches on.
-    PgSerializable
 
 // Begin a transaction.
 //
@@ -352,20 +680,23 @@ pub enum PgIsolation
 // `PgReadCommitted` is the default and does not mean what it means in
 // other engines — see the enum.
 pub fn begin(c: pgconn.PgConn, level: PgIsolation,
-             read_only: Bool) -> Result<pgconn.PgConn, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgquery.begin")
+             read_only: Bool) -> Result<pgconn.PgConn, pgerror.PgFault> [io, net, time]
+    let done = simple(c, begin_sql(level, read_only))!
+    Ok(done.conn)
 
 // Commit.
-pub fn commit(c: pgconn.PgConn) -> Result<pgconn.PgConn, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgquery.commit")
+pub fn commit(c: pgconn.PgConn) -> Result<pgconn.PgConn, pgerror.PgFault> [io, net, time]
+    let done = simple(c, "COMMIT")!
+    Ok(done.conn)
 
 // Roll back.
 //
 // Safe to call on a connection whose transaction has already failed,
 // which is the case it exists for: after an error the session is in
 // `PgInFailedTransaction` and every statement but this one is refused.
-pub fn rollback(c: pgconn.PgConn) -> Result<pgconn.PgConn, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgquery.rollback")
+pub fn rollback(c: pgconn.PgConn) -> Result<pgconn.PgConn, pgerror.PgFault> [io, net, time]
+    let done = simple(c, "ROLLBACK")!
+    Ok(done.conn)
 
 // True when the connection is inside a transaction that has FAILED —
 // `pgmsg.PgInFailedTransaction`.
@@ -384,4 +715,6 @@ pub fn rollback(c: pgconn.PgConn) -> Result<pgconn.PgConn, pgerror.PgFault> [net
 //         Ok(c)  => println("${pgquery.in_failed_transaction(c)}")
 // ```
 pub fn in_failed_transaction(c: pgconn.PgConn) -> Bool
-    todo("postgres-nv.pgquery.in_failed_transaction")
+    match c.status
+        PgInFailedTransaction => true
+        _                     => false

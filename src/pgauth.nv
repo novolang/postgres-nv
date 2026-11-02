@@ -1,8 +1,6 @@
 // pgauth.nv — SCRAM-SHA-256 and MD5, as arithmetic over the bytes the
 // server sent.  No socket, no clock, no randomness.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // SCRAM IS A FOUR-MESSAGE EXCHANGE AND THE STATE IS A VALUE.  A
 // client-first, a server-first, a client-final, a server-final — and
 // between them a running `PgScram` holding the nonce, the salted
@@ -40,6 +38,9 @@
 // with no binding rather than silently negotiating the weaker one,
 // which is precisely the downgrade channel binding exists to stop.
 
+use std.bytes
+use digest
+use hashing
 use pgerror
 
 // What a client can prove about the channel it is on.
@@ -82,6 +83,97 @@ pub struct PgScram
     // The channel binding this exchange is using.
     binding: PgChannelBinding
 
+// ── the pieces the exchange is built from ────────────────────────────
+
+// A refusal at one step of the exchange.  The step is named because
+// "SCRAM failed" is not an actionable message: a nonce the server did
+// not extend and a server that does not know the password are both
+// authentication failures and are not the same fault.
+fn scram_fault(step: Str, detail: Str) -> pgerror.PgFault
+    pgerror.PgScramFailed(step: step, detail: detail)
+
+// Whether every byte of `s` is in SCRAM's nonce charset — `%x21-2B /
+// %x2D-7E`, printable ASCII with the comma left out.  The comma is the
+// field separator, so a nonce carrying one makes two messages the two
+// sides parse differently.
+fn printable_nonce(s: Str) -> Bool
+    var ok = str.len(s) > 0
+    var i = 0
+    while i < str.len(s)
+        let c = str.byte_at_or(s, i, 0)
+        if c < '!' or c > '~' or c == ','
+            ok = false
+        i = i + 1
+    ok
+
+// Whether every byte of `s` is ASCII, which is PostgreSQL's own fast
+// path through SASLprep.
+fn ascii_only(s: Str) -> Bool
+    var ok = true
+    var i = 0
+    while i < str.len(s)
+        if str.byte_at_or(s, i, 0) > 0x7F
+            ok = false
+        i = i + 1
+    ok
+
+// Whether every byte of `s` is a decimal digit, which is what an
+// `i=` field of an iteration count has to be.
+fn all_digits(s: Str) -> Bool
+    var ok = str.len(s) > 0
+    var i = 0
+    while i < str.len(s)
+        let c = str.byte_at_or(s, i, 0)
+        if c < '0' or c > '9'
+            ok = false
+        i = i + 1
+    ok
+
+// The GS2 header: the first field of the client-first message, and the
+// first half of what `c=` carries.
+fn gs2_header(binding: PgChannelBinding) -> Str
+    match binding
+        PgBindingNone        => "n,,"
+        PgBindingEndPoint(_) => "p=tls-server-end-point,,"
+
+// The channel-binding input: nothing for plain SCRAM, the certificate
+// hash for `tls-server-end-point`.
+fn cbind_data(binding: PgChannelBinding) -> Bytes
+    // A copy, because the caller is handed a buffer it may write: the
+    // hash belongs to the binding the caller made.
+    match binding
+        PgBindingNone        => bytes.zeros(0)
+        PgBindingEndPoint(h) => bytes.clone(h)
+
+// `c=` and its base64.  The field every signature is over, which is
+// what makes an exchange that was relayed onto another channel fail to
+// verify.
+fn channel_binding_field(binding: PgChannelBinding) -> Str
+    let gs2 = bytes.concat([bytes.from_str(gs2_header(binding)), cbind_data(binding)])
+    "c=${bytes.to_base64(gs2)}"
+
+// The XOR of two byte strings — the one operation in RFC 5802 that no
+// hash provides.  Equal lengths are the caller's business: every use
+// here is over two SHA-256 digests.
+fn xor_bytes(a: Bytes, b: Bytes) -> Bytes
+    var out = bytes.zeros(bytes.len(a))
+    var i = 0
+    while i < bytes.len(a)
+        out = bytes.set_u8(out, i, (bytes.byte_at(a, i) ?? 0) ^ (bytes.byte_at(b, i) ?? 0))
+        i = i + 1
+    out
+
+// The field at `index` with `prefix` removed, or `None` when the field
+// there is not that one.  The position is checked as well as the
+// prefix: RFC 5802 fixes the order of a server-first message, and a
+// message whose fields are shuffled is not one this client should
+// answer.
+fn field_after(fields: [Str], index: Int, prefix: Str) -> ?Str
+    let field = list.get(fields, index, "")
+    if not str.starts_with(field, prefix)
+        return None
+    Some(str.slice(field, str.len(prefix), str.len(field)))
+
 // 4096 — the iteration floor this module enforces.
 //
 // PostgreSQL's own default, and low enough that no real server is
@@ -94,7 +186,12 @@ pub struct PgScram
 //     println("${pgauth.min_iterations()}")
 // ```
 pub fn min_iterations() -> Int
-    todo("postgres-nv.pgauth.min_iterations")
+    4096
+
+// 10000000 — the iteration ceiling this module enforces, a hundred
+// times the 100000 that servers set when they raise the default.
+fn max_iterations() -> Int
+    10000000
 
 // The mechanism to use, given what the server offered and what the
 // caller can bind to.
@@ -113,7 +210,36 @@ pub fn min_iterations() -> Int
 //         Err(_) => println("no mechanism in common")
 // ```
 pub fn choose_mechanism(offered: [Str], binding: PgChannelBinding) -> Result<Str, pgerror.PgFault>
-    todo("postgres-nv.pgauth.choose_mechanism")
+    // PLUS is chosen only when BOTH halves are there: the server has
+    // to offer it and the caller has to have something to bind with.
+    // A server offering PLUS is not a reason to bind, and a caller
+    // holding a binding is not a reason to use it against a server
+    // that never asked.
+    let can_bind = match binding
+        PgBindingNone        => false
+        PgBindingEndPoint(_) => true
+    if can_bind and list.contains(offered, "SCRAM-SHA-256-PLUS")
+        return Ok("SCRAM-SHA-256-PLUS")
+    if list.contains(offered, "SCRAM-SHA-256")
+        return Ok("SCRAM-SHA-256")
+    // Nothing in common.  The first mechanism the server named is the
+    // one reported, because that is the one an operator has to look at.
+    if list.len(offered) > 0
+        // THE FIRST NAME IS COPIED OUT OF THE LIST BEFORE IT IS MOVED
+        // INTO THE FAULT.  The copy is not belt-and-braces: on the
+        // installed toolchain (0.20.2) a `list.get` read of a
+        // mechanism this decoder built from the wire, moved straight
+        // into a `Str` field of a foreign variant, answers the EMPTY
+        // string — so `pgconn.connect` against a server offering only
+        // `SCRAM-SHA-256-PLUS` asked for " authentication, which this
+        // client does not implement" while the same call on a literal
+        // list named it.  `bytes.from_str`/`to_str` takes a fresh
+        // allocation and the name survives; the defect, the reductions
+        // and the rows that moved are in
+        // `novo/a-list-get-into-a-variant-of-another-module-answers-an-empty-str`.
+        let first = bytes.to_str(bytes.from_str(list.get(offered, 0, "")))
+        return Err(pgerror.PgUnsupportedAuth(method: first))
+    Err(pgerror.PgUnsupportedAuth(method: ""))
 
 // Begin a SCRAM exchange.
 //
@@ -133,12 +259,34 @@ pub fn choose_mechanism(offered: [Str], binding: PgChannelBinding) -> Result<Str
 // ```
 pub fn begin(mechanism: Str, client_nonce: Str,
              binding: PgChannelBinding) -> Result<PgScram, pgerror.PgFault>
-    todo("postgres-nv.pgauth.begin")
+    if mechanism != "SCRAM-SHA-256" and mechanism != "SCRAM-SHA-256-PLUS"
+        return Err(pgerror.PgUnsupportedAuth(method: mechanism))
+    let can_bind = match binding
+        PgBindingNone        => false
+        PgBindingEndPoint(_) => true
+    if mechanism == "SCRAM-SHA-256-PLUS" and not can_bind
+        return Err(scram_fault("begin", "SCRAM-SHA-256-PLUS with no channel binding"))
+    if not printable_nonce(client_nonce)
+        return Err(scram_fault("begin", "the client nonce must be printable ASCII with no comma"))
+    Ok(PgScram {
+        mechanism: mechanism,
+        client_nonce: client_nonce,
+        full_nonce: "",
+        // PostgreSQL's client leaves the user out of the bare message
+        // — `n=,r=…` — because the server already has it from the
+        // startup packet, and a name that disagreed with the startup
+        // packet is at best ignored and at worst a second identity.
+        client_first_bare: "n=,r=${client_nonce}",
+        salt: bytes.zeros(0),
+        iterations: 0,
+        salted_password: bytes.zeros(0),
+        auth_message: "",
+        binding: binding })
 
 // The bytes of the client-first message — the payload of a
 // `SASLInitialResponse`.
 pub fn client_first(s: PgScram) -> Bytes
-    todo("postgres-nv.pgauth.client_first")
+    bytes.from_str("${gs2_header(s.binding)}${s.client_first_bare}")
 
 // Take the server-first message, and compute the salted password.
 //
@@ -159,7 +307,77 @@ pub fn client_first(s: PgScram) -> Bytes
 // ```
 pub fn server_first(s: PgScram, message: Bytes, password: Str,
                     min_iters: Int) -> Result<PgScram, pgerror.PgFault>
-    todo("postgres-nv.pgauth.server_first")
+    let text = bytes.to_str(message)
+    let fields = str.split(text, ",")
+    if list.len(fields) != 3
+        return Err(scram_fault("server-first", "expected r=, s= and i=, in that order, and nothing else"))
+    let nonce_field = field_after(fields, 0, "r=")
+    let salt_field = field_after(fields, 1, "s=")
+    let count_field = field_after(fields, 2, "i=")
+    if nonce_field == None or salt_field == None or count_field == None
+        return Err(scram_fault("server-first", "expected r=, s= and i=, in that order, and nothing else"))
+
+    // THE EXTENSION IS THE REPLAY DEFENCE.  A server that answers the
+    // client's nonce unchanged is a server that could have answered a
+    // recorded exchange, so the full nonce has to be the client's plus
+    // something the client has never seen.
+    let full = nonce_field ?? ""
+    if not str.starts_with(full, s.client_nonce) or str.len(full) <= str.len(s.client_nonce)
+        return Err(scram_fault("server-first", "the server did not extend the client nonce"))
+    if not printable_nonce(full)
+        return Err(scram_fault("server-first", "the full nonce is outside the nonce charset"))
+
+    let salt_text = salt_field ?? ""
+    var salt = bytes.zeros(0)
+    match bytes.from_base64(salt_text)
+        Some(b) =>
+            salt = bytes.clone(b)
+        None    =>
+            return Err(scram_fault("server-first", "the salt is not base64"))
+
+    let count_text = count_field ?? ""
+    if not all_digits(count_text)
+        return Err(scram_fault("server-first", "the iteration count is not a number"))
+    var iterations = 0
+    match str.to_int(count_text)
+        Some(n) =>
+            iterations = n
+        None    =>
+            return Err(scram_fault("server-first", "the iteration count is not a number"))
+    // The module's floor is enforced whatever the caller passed, and
+    // the caller may raise it; a caller cannot lower it.  i=1 makes
+    // Hi() free, which is what a hostile server sends to turn this
+    // client into an offline-cracking oracle for its own password.
+    let floor = if min_iters > min_iterations()
+        min_iters
+    else
+        min_iterations()
+    if iterations < floor
+        return Err(scram_fault("server-first",
+            "the iteration count ${str.from_int(iterations)} is below the floor of ${str.from_int(floor)}"))
+
+    // A count with no ceiling lets the server hold the client in Hi()
+    // for as long as it likes.
+    if iterations > max_iterations()
+        return Err(scram_fault("server-first",
+            "the iteration count ${str.from_int(iterations)} is above the ceiling of ${str.from_int(max_iterations())}"))
+
+    // The auth message is assembled from the RECEIVED server-first
+    // message, byte for byte, and not from the fields just parsed: a
+    // signature is over what the server sent, and a parser that
+    // re-renders a field it read is a second chance to disagree.
+    let without_proof = "${channel_binding_field(s.binding)},r=${full}"
+    let auth_message = "${s.client_first_bare},${text},${without_proof}"
+    Ok(PgScram {
+        mechanism: s.mechanism,
+        client_nonce: s.client_nonce,
+        full_nonce: full,
+        client_first_bare: s.client_first_bare,
+        salt: salt,
+        iterations: iterations,
+        salted_password: salted_password(password, salt, iterations),
+        auth_message: auth_message,
+        binding: s.binding })
 
 // The bytes of the client-final message — the payload of a
 // `SASLResponse`, carrying the proof.
@@ -167,7 +385,14 @@ pub fn server_first(s: PgScram, message: Bytes, password: Str,
 // Must be called after `server_first`; a `PgScram` with no salted
 // password is refused rather than producing a proof over nothing.
 pub fn client_final(s: PgScram) -> Result<Bytes, pgerror.PgFault>
-    todo("postgres-nv.pgauth.client_final")
+    // The proof is over the auth message, which only exists once a
+    // server-first message has been taken.  Answering one before that
+    // would be a proof over an empty string — a value the server
+    // never sent anything to compare against.
+    if bytes.len(s.salted_password) == 0
+        return Err(scram_fault("client-final", "no server-first message has been taken"))
+    let proof = bytes.to_base64(client_proof(s.salted_password, s.auth_message))
+    Ok(bytes.from_str("${channel_binding_field(s.binding)},r=${s.full_nonce},p=${proof}"))
 
 // Check the server's final message against the expected signature.
 //
@@ -187,7 +412,32 @@ pub fn client_final(s: PgScram) -> Result<Bytes, pgerror.PgFault>
 //                 Some(f) => println("mutual authentication failed")
 // ```
 pub fn verify_server(s: PgScram, message: Bytes) -> ?pgerror.PgFault
-    todo("postgres-nv.pgauth.verify_server")
+    if bytes.len(s.salted_password) == 0
+        return Some(scram_fault("server-final", "no server-first message has been taken"))
+    let text = bytes.to_str(message)
+    let fields = str.split(text, ",")
+    if list.len(fields) != 1
+        return Some(scram_fault("server-final", "expected v= and nothing else"))
+    let field = list.get(fields, 0, "")
+    // `e=` is the server saying why it gave up — a wrong password, an
+    // unknown user, a nonce it did not like.  Carried, not swallowed:
+    // the text is the server's own and it is the only thing that says
+    // which of those happened.
+    if str.starts_with(field, "e=")
+        return Some(scram_fault("server-final", str.slice(field, 2, str.len(field))))
+    if not str.starts_with(field, "v=")
+        return Some(scram_fault("server-final", "expected v= and nothing else"))
+    let signature = str.slice(field, 2, str.len(field))
+    match bytes.from_base64(signature)
+        None      => Some(scram_fault("server-final", "the server signature is not base64"))
+        Some(got) =>
+            // Constant time, because the value compared against is one
+            // an attacker supplies.
+            if digest.ct_eq(got, server_signature(s.salted_password, s.auth_message))
+                None
+            else
+                Some(scram_fault("server-final",
+                    "the server signature did not verify — the server does not know this password"))
 
 // ── the pieces, published because the vectors are published ──────────
 
@@ -205,26 +455,72 @@ pub fn verify_server(s: PgScram, message: Bytes) -> ?pgerror.PgFault
 //     println("${bytes.len(pgauth.salted_password("pencil", bytes.zeros(16), 4096))}")
 // ```
 pub fn salted_password(password: Str, salt: Bytes, iterations: Int) -> Bytes
-    todo("postgres-nv.pgauth.salted_password")
+    // PBKDF2-HMAC-SHA-256 with one block, which is all of Hi(): the
+    // output is a SHA-256 digest, so the block index is always 1 and
+    // there is no outer loop over blocks to write.
+    let key = bytes.from_str(saslprep(password))
+    let first = hashing.hmac_sha256(key, bytes.concat([salt, bytes.u32_be(1)]),
+                                    bytes.zeros(hashing.SHA256_DIGEST_BYTES))
+    var acc = bytes.clone(first)
+    var u = bytes.clone(first)
+    var round = 1
+    while round < iterations
+        u = hashing.hmac_sha256(key, u, bytes.zeros(hashing.SHA256_DIGEST_BYTES))
+        acc = xor_bytes(acc, u)
+        round = round + 1
+    acc
 
 // The client proof: ClientKey XOR HMAC(H(ClientKey), auth_message).
 pub fn client_proof(salted: Bytes, auth_message: Str) -> Bytes
-    todo("postgres-nv.pgauth.client_proof")
+    // ClientKey = HMAC(SaltedPassword, "Client Key"); the key that is
+    // never sent.  StoredKey = H(ClientKey) is what the server keeps,
+    // which is why the proof is an XOR and not a hash of the key.
+    let client_key = hashing.hmac_sha256(salted, bytes.from_str("Client Key"),
+                                         bytes.zeros(hashing.SHA256_DIGEST_BYTES))
+    let stored_key = hashing.sha256(client_key)
+    let signature = hashing.hmac_sha256(stored_key, bytes.from_str(auth_message),
+                                        bytes.zeros(hashing.SHA256_DIGEST_BYTES))
+    xor_bytes(client_key, signature)
 
 // The server signature: HMAC(HMAC(salted, "Server Key"), auth_message).
 pub fn server_signature(salted: Bytes, auth_message: Str) -> Bytes
-    todo("postgres-nv.pgauth.server_signature")
+    // Two HMACs and no hash in between, which is the whole of the
+    // difference from the proof: the server key is not published, so a
+    // server that answers this has proved it holds the salted
+    // password.  That is the half of SCRAM that makes it mutual.
+    let server_key = hashing.hmac_sha256(salted, bytes.from_str("Server Key"),
+                                         bytes.zeros(hashing.SHA256_DIGEST_BYTES))
+    hashing.hmac_sha256(server_key, bytes.from_str(auth_message),
+                        bytes.zeros(hashing.SHA256_DIGEST_BYTES))
 
-// SASLprep, as far as PostgreSQL applies it: a password that is pure
-// ASCII passes through unchanged, and one that is not is normalised —
-// or, when normalisation would fail, sent as it is.
+// SASLprep, as far as this driver applies it: a password that is pure
+// ASCII passes through unchanged, and one that is not is passed
+// through unchanged as well, because the Unicode tables RFC 4013 needs
+// are not in the standard library.
 //
-// PostgreSQL's own rule, and it is a rule rather than a spec: RFC 4013
-// says to fail, and the server sends the raw bytes instead, so a
-// client that failed cannot log in to a server that accepted the
-// password.
+// PostgreSQL's own rule for the second case, and it is a rule rather
+// than a spec: RFC 4013 says to fail, and the server sends the raw
+// bytes instead, so a client that failed cannot log in to a server
+// that accepted the password.  What this cannot do is the mapping and
+// NFKC steps, so a password the SERVER normalised will not match one
+// sent from here — stated in the CHANGELOG's `### Known` rather than
+// left for a user to discover.
 pub fn saslprep(password: Str) -> Str
-    todo("postgres-nv.pgauth.saslprep")
+    // PostgreSQL's own first move, and the one every password in
+    // practice takes: pure ASCII is sent exactly as typed, with no
+    // table consulted.
+    if ascii_only(password)
+        return password
+    // RFC 4013 proper — the mapping table, NFKC, the prohibited
+    // character classes and the bidi rule — needs Unicode tables a
+    // driver does not carry, and PostgreSQL's answer to a SASLprep
+    // that declines is to send the bytes the user typed.  That is what
+    // a non-ASCII password gets here: the same bytes on both sides,
+    // which is the right answer for a password SASLprep would have
+    // refused and NOT for one it would have rewritten — a stored
+    // password the server normalised will not verify against a client
+    // that did not.  See the CHANGELOG's `### Known`.
+    password
 
 // ── the older exchange ───────────────────────────────────────────────
 
@@ -245,7 +541,13 @@ pub fn saslprep(password: Str) -> Str
 //     println(pgauth.md5_password("secret", "postgres", bytes.zeros(4)))
 // ```
 pub fn md5_password(password: Str, user: Str, salt: Bytes) -> Str
-    todo("postgres-nv.pgauth.md5_password")
+    // The inner digest is over the password AND the user, and it is
+    // hexed before the salt is appended: the server stores
+    // `md5(hex(md5(password + user)))` as the verifier and prefixes the
+    // salt, so the outer digest is the one that proves the password.
+    let inner = bytes.to_hex(hashing.md5(bytes.from_str("${password}${user}")))
+    let outer = hashing.md5(bytes.concat([bytes.from_str(inner), salt]))
+    "md5${bytes.to_hex(outer)}"
 
 // The `AuthenticationCleartextPassword` answer: the password, and a
 // NUL.
@@ -255,4 +557,8 @@ pub fn md5_password(password: Str, user: Str, salt: Bytes) -> Str
 // the password in the clear, and `pgconn` refuses that combination
 // unless the caller has said `allow_cleartext`.
 pub fn cleartext_password(password: Str) -> Bytes
-    todo("postgres-nv.pgauth.cleartext_password")
+    // The NUL is the protocol's, not a nicety: a `PasswordMessage` body
+    // is a null-terminated string, and the terminator counts inside the
+    // message's length.  The caller frames this as the body and adds
+    // nothing.
+    bytes.concat([bytes.from_str(password), bytes.u8(0)])

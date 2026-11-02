@@ -1,10 +1,6 @@
 // pgtype_tests.nv — the OIDs, the epoch that is not 1970, the NULL
 // that is not an empty string, and the errors that are field sets.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: postgres-nv.<module>.<fn>`.
-// That is the expected result until the bodies land.
-//
 // THE OIDs ARE ASSERTED AS NUMBERS because they are numbers in
 // PostgreSQL's `pg_type.h` and have been since before this project
 // existed.  A port that got one wrong decodes a column as the wrong
@@ -118,8 +114,8 @@ fn test_numeric_is_not_a_float_and_the_conversion_is_a_decision() [io]
     test.case("the parts are kept as the wire sent them")
     test.assert(n.weight == 1)
     test.assert(n.scale == 4)
-    test.assert(n.negative == false)
-    test.assert(n.is_nan == false)
+    test.assert(not n.negative)
+    test.assert(not n.is_nan)
 
     test.case("the exact rendering is the one for money")
     test.assert(pgtype.numeric_text(n) != "")
@@ -147,7 +143,7 @@ fn test_a_value_encodes_back_and_knows_the_oid_it_binds_as() [io]
     test.case("an integer encodes and is not null")
     match pgtype.encode(pgtype.PgInt(v: 42), pgmsg.PgBinary)
         Err(_) => test.assert(false)
-        Ok(e)  => test.assert(e.is_null == false)
+        Ok(e)  => test.assert(not e.is_null)
 
     test.case("and a null encodes as null with no bytes")
     match pgtype.encode(pgtype.PgNull, pgmsg.PgBinary)
@@ -206,14 +202,14 @@ fn test_retryable_and_fatal_are_different_questions() [io]
     test.assert(pgerror.is_retryable(pgerror.PgServerError(fields: serialisation)))
 
     test.case("a constraint violation is not — it will fail again")
-    test.assert(pgerror.is_retryable(pgerror.PgServerError(fields: violation)) == false)
+    test.assert(not pgerror.is_retryable(pgerror.PgServerError(fields: violation)))
 
     test.case("a lost connection is retryable and also fatal to the socket")
     test.assert(pgerror.is_retryable(pgerror.PgConnectionLost(during: "query")))
     test.assert(pgerror.is_fatal(pgerror.PgConnectionLost(during: "query")))
 
     test.case("and a constraint violation is neither")
-    test.assert(pgerror.is_fatal(pgerror.PgServerError(fields: violation)) == false)
+    test.assert(not pgerror.is_fatal(pgerror.PgServerError(fields: violation)))
 
     test.case("every fault renders to something a person can read")
     test.assert(pgerror.describe(pgerror.PgUnknownMessage(kind: 122)) != "")

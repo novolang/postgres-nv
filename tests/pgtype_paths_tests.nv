@@ -1,0 +1,628 @@
+// pgtype_paths_tests.nv — every path through the value codec, both
+// formats, the refusals included.
+//
+// WHY THIS FILE EXISTS.  `pgtype_tests.nv` pins the OIDs, the epoch
+// and the headline claims; this one walks the codec.  A decoder is
+// where a protocol client is silently wrong: a length read one byte
+// off, a two's-complement field read as unsigned, an epoch shifted by
+// thirty years, a `DateStyle` ignored.  None of those produce an error
+// — they produce a value that looks fine — so every one of them has an
+// assertion below rather than a comment saying it is handled.
+//
+// NO SERVER IS NEEDED AND NONE WAS REACHED.  A value codec is a
+// function from bytes to bytes: the vectors here are the bytes a
+// server sends, written out from PostgreSQL's own protocol
+// documentation, and the answer is compared against what the server
+// would have sent back.
+
+use std.test
+use std.bytes
+use std.math
+use pgerror
+use pgmsg
+use pgtype
+
+// A buffer from the hex a server would put on the wire.
+fn wire(hex: Str) -> Bytes
+    match bytes.from_hex(hex)
+        Some(b) => b
+        None    => bytes.zeros(0)
+
+// One column of a `RowDescription`, as the wire spells it: the name,
+// the table OID, the attribute number, the type OID, the type's size,
+// its modifier and which format THIS column arrives in.
+fn field(name: Str, type_oid: Int, format: Int) -> Bytes
+    bytes.concat([bytes.from_str(name), bytes.zeros(1), bytes.u32_be(0),
+                  bytes.u16_be(0), bytes.u32_be(type_oid), bytes.u16_be(4),
+                  bytes.u32_be(-1), bytes.u16_be(format)])
+
+// A framed message: the type byte, then a length counting itself and
+// the body and NOT the type byte.
+fn msg(kind: Int, body: Bytes) -> Bytes
+    bytes.concat([bytes.u8(kind), bytes.u32_be(bytes.len(body) + 4), body])
+
+// A `RowDescription` carrying the fields given.
+fn row_description(count: Int, fields: Bytes) -> Bytes
+    msg('T', bytes.concat([bytes.u16_be(count), fields]))
+
+// A `DataRow`: a count, then each value as a length and its bytes, a
+// NULL being a length of -1.
+fn data_row(values: [?Bytes]) -> Bytes
+    var body = bytes.u16_be(list.len(values))
+    for v in values
+        match v
+            None    =>
+                body = bytes.concat([body, bytes.u32_be(-1)])
+            Some(b) =>
+                body = bytes.concat([body, bytes.u32_be(bytes.len(b)), b])
+    msg('D', body)
+
+// The value a decode answered, or the NULL variant when it refused —
+// every test below asserts on `show` of it, so a refusal the test did
+// not expect shows up as the four characters NULL.
+fn decoded(oid: Int, format: pgmsg.PgFormat, raw: Bytes, s: pgtype.PgTextSettings) -> pgtype.PgValue
+    // The `match` is bound and then answered, and not left as this
+    // function's tail expression: a tail `match` whose function
+    // answers a payload-carrying enum leaks one value per call under
+    // `novo test --isolate`, which prints every verdict green and then
+    // fails the run with `the run leaked`.  See
+    // `memory-perceus/a-tail-match-whose-function-returns-a-payload-carrying-user-enum-leaks-one-value`
+    // in the tracker, and the `### Known` bullet in the CHANGELOG.
+    let v = match pgtype.decode(oid, format, raw, false, s)
+        Ok(v)  => v
+        Err(_) => pgtype.PgNull
+    v
+
+// Whether a decode refused, which is the assertion for every vector
+// that is not a value.
+fn refused(oid: Int, format: pgmsg.PgFormat, raw: Bytes, s: pgtype.PgTextSettings) -> Bool
+    match pgtype.decode(oid, format, raw, false, s)
+        Ok(_)  => false
+        Err(_) => true
+
+// What a vector decodes to, as a person reads it.
+fn shown(oid: Int, format: pgmsg.PgFormat, raw: Bytes, s: pgtype.PgTextSettings) -> Str
+    pgtype.show(decoded(oid, format, raw, s))
+
+// The bytes an encode answered, or empty when it refused.
+fn encoded(v: pgtype.PgValue, format: pgmsg.PgFormat) -> Bytes
+    match pgtype.encode(v, format)
+        Ok(e)  => bytes.clone(e.raw)
+        Err(_) => bytes.zeros(0)
+
+// The float a value holds, or a NaN for anything else.
+fn float_of(v: pgtype.PgValue) -> Float
+    match v
+        PgFloat(f) => f
+        _          => math.nan()
+
+// The numeric a value holds, or the NaN numeric for anything else.
+fn numeric_of(v: pgtype.PgValue) -> pgtype.PgNumeric
+    match v
+        PgNumericValue(n) => n
+        _                 => pgtype.numeric_nan()
+
+// A list of values as one line, for an assertion that covers a whole
+// row at once.
+fn shown_all(vs: [pgtype.PgValue]) -> Str
+    var out = ""
+    var first = true
+    for v in vs
+        if not first
+            out = "${out}|"
+        first = false
+        out = "${out}${pgtype.show(v)}"
+    out
+
+// The two messages of a result set, decoded against each other: the
+// description first, then the row.  This is the path a real query
+// takes — pgquery hands these two messages to `pgtype.decode_row` —
+// so it is asserted here rather than only in pieces.
+fn row_line(desc: Bytes, row: Bytes, s: pgtype.PgTextSettings) -> Str
+    match pgmsg.decode_backend(desc, 0, 1048576)
+        Err(_) => "BAD-DESCRIPTION"
+        Ok(dm) =>
+            match pgmsg.decode_backend(row, 0, 1048576)
+                Err(_) => "BAD-ROW"
+                Ok(rm) =>
+                    match dm
+                        PgRowDescription(cols) =>
+                            match rm
+                                PgDataRow(values, nulls) =>
+                                    match pgtype.decode_row(cols, values, nulls, s)
+                                        Ok(vs) => shown_all(vs)
+                                        Err(_) => "REFUSED"
+                                _                        => "NOT-A-ROW"
+                        _                      => "NOT-A-DESCRIPTION"
+
+@test
+fn test_a_binary_integer_is_signed_and_its_width_is_checked() [io]
+    let s = pgtype.default_settings()
+
+    test.case("int2, two bytes, and 0xFFFF is -1 and not 65535")
+    test.assert_eq_str(shown(pgtype.oid_int2(), pgmsg.PgBinary, wire("ffff"), s), "-1")
+    test.assert_eq_str(shown(pgtype.oid_int2(), pgmsg.PgBinary, wire("7fff"), s), "32767")
+
+    test.case("int4, four")
+    test.assert_eq_str(shown(pgtype.oid_int4(), pgmsg.PgBinary, wire("ffffffff"), s), "-1")
+    test.assert_eq_str(shown(pgtype.oid_int4(), pgmsg.PgBinary, wire("0000002a"), s), "42")
+
+    test.case("int8, eight — the width a PgInt binds as")
+    test.assert_eq_str(shown(pgtype.oid_int8(), pgmsg.PgBinary, wire("ffffffffffffffff"), s), "-1")
+    test.assert_eq_str(shown(pgtype.oid_int8(), pgmsg.PgBinary, wire("000000000000002a"), s), "42")
+
+    test.case("a value one byte short is refused, not read as zero")
+    test.assert(refused(pgtype.oid_int2(), pgmsg.PgBinary, wire("ff"), s))
+    test.assert(refused(pgtype.oid_int4(), pgmsg.PgBinary, wire("ffffff"), s))
+    test.assert(refused(pgtype.oid_int8(), pgmsg.PgBinary, wire("ffffffffffffff"), s))
+
+    test.case("and a decimal that is not one is refused in text")
+    test.assert(refused(pgtype.oid_int4(), pgmsg.PgText, bytes.from_str("4 2"), s))
+    test.assert(refused(pgtype.oid_int4(), pgmsg.PgText, bytes.from_str(""), s))
+
+@test
+fn test_a_binary_float_widens_exactly_where_a_widening_is_fine() [io]
+    let s = pgtype.default_settings()
+
+    test.case("float4 1.0 widens to the float8 bits of 1.0")
+    test.assert_eq_str(bytes.to_hex(encoded(
+        decoded(pgtype.oid_float4(), pgmsg.PgBinary, wire("3f800000"), s),
+        pgmsg.PgBinary)),
+        "3ff0000000000000")
+
+    test.case("a float4 subnormal keeps its exponent rather than becoming zero")
+    // 2^-149, the smallest positive binary32.  A widening that only
+    // moved the exponent field answers 2^-126, which is 8388608 times
+    // too big.
+    test.assert_eq_str(bytes.to_hex(encoded(
+        decoded(pgtype.oid_float4(), pgmsg.PgBinary, wire("00000001"), s),
+        pgmsg.PgBinary)),
+        "36a0000000000000")
+
+    test.case("and an infinity and a NaN keep their exponent and payload")
+    test.assert_eq_str(bytes.to_hex(encoded(
+        decoded(pgtype.oid_float4(), pgmsg.PgBinary, wire("7f800000"), s),
+        pgmsg.PgBinary)),
+        "7ff0000000000000")
+    test.assert_eq_str(bytes.to_hex(encoded(
+        decoded(pgtype.oid_float4(), pgmsg.PgBinary, wire("7fc00000"), s),
+        pgmsg.PgBinary)),
+        "7ff8000000000000")
+
+    test.case("float8 moves across bit for bit, subnormals included")
+    test.assert_eq_str(bytes.to_hex(encoded(
+        decoded(pgtype.oid_float8(), pgmsg.PgBinary, wire("3ff0000000000000"), s),
+        pgmsg.PgBinary)),
+        "3ff0000000000000")
+    test.assert_eq_str(bytes.to_hex(encoded(
+        decoded(pgtype.oid_float8(), pgmsg.PgBinary, wire("0000000000000001"), s),
+        pgmsg.PgBinary)),
+        "0000000000000001")
+
+    test.case("a short float is refused in either width")
+    test.assert(refused(pgtype.oid_float4(), pgmsg.PgBinary, wire("3f8000"), s))
+    test.assert(refused(pgtype.oid_float8(), pgmsg.PgBinary, wire("3ff000000000000"), s))
+
+    test.case("the text form is where the spellings a decimal parser has not")
+    test.assert(math.is_nan(float_of(decoded(
+        pgtype.oid_float8(), pgmsg.PgText, bytes.from_str("NaN"), s))))
+    test.assert(math.is_inf(float_of(decoded(
+        pgtype.oid_float8(), pgmsg.PgText, bytes.from_str("Infinity"), s))))
+    test.assert(float_of(decoded(
+        pgtype.oid_float8(), pgmsg.PgText, bytes.from_str("-1.5"), s)) == -1.5)
+    test.assert(refused(pgtype.oid_float8(), pgmsg.PgText, bytes.from_str("1,5"), s))
+
+@test
+fn test_a_bool_a_bytea_a_uuid_and_a_json_are_read_in_both_formats() [io]
+    let s = pgtype.default_settings()
+
+    test.case("a bool is t or f on the wire and not true or false")
+    test.assert_eq_str(shown(pgtype.oid_bool(), pgmsg.PgText, bytes.from_str("t"), s), "true")
+    test.assert_eq_str(shown(pgtype.oid_bool(), pgmsg.PgText, bytes.from_str("f"), s), "false")
+    test.assert(refused(pgtype.oid_bool(), pgmsg.PgText, bytes.from_str("true"), s))
+    test.assert_eq_str(shown(pgtype.oid_bool(), pgmsg.PgBinary, wire("01"), s), "true")
+    test.assert(refused(pgtype.oid_bool(), pgmsg.PgBinary, wire("02"), s))
+    test.assert(refused(pgtype.oid_bool(), pgmsg.PgBinary, wire("0100"), s))
+
+    test.case("a bytea in text is a prefix and then hex")
+    test.assert_eq_str(shown(pgtype.oid_bytea(), pgmsg.PgText, bytes.from_str("\\xdeadbeef"), s),
+                       "4 bytes")
+    test.assert_eq_str(bytes.to_hex(encoded(
+        decoded(pgtype.oid_bytea(), pgmsg.PgText, bytes.from_str("\\xdeadbeef"), s),
+        pgmsg.PgText)),
+        bytes.to_hex(bytes.from_str("\\xdeadbeef")))
+    test.assert(refused(pgtype.oid_bytea(), pgmsg.PgText, bytes.from_str("deadbeef"), s))
+    test.assert(refused(pgtype.oid_bytea(), pgmsg.PgText, bytes.from_str("\\xzz"), s))
+    test.assert(refused(pgtype.oid_bytea(), pgmsg.PgText, bytes.from_str("\\x0"), s))
+
+    test.case("a bytea in binary IS the bytes, and a short one is a bytea too")
+    test.assert_eq_str(bytes.to_hex(encoded(
+        decoded(pgtype.oid_bytea(), pgmsg.PgBinary, wire("00ff00"), s), pgmsg.PgBinary)),
+        "00ff00")
+
+    test.case("a uuid renders canonical, which is what a WHERE clause takes")
+    test.assert_eq_str(pgtype.uuid_text(wire("0102030405060708090a0b0c0d0e0f10")),
+                       "01020304-0506-0708-090a-0b0c0d0e0f10")
+    test.assert_eq_str(shown(pgtype.oid_uuid(), pgmsg.PgText,
+        bytes.from_str("01020304-0506-0708-090a-0b0c0d0e0f10"), s),
+        "01020304-0506-0708-090a-0b0c0d0e0f10")
+    test.assert_eq_str(shown(pgtype.oid_uuid(), pgmsg.PgBinary,
+        wire("0102030405060708090a0b0c0d0e0f10"), s),
+        "01020304-0506-0708-090a-0b0c0d0e0f10")
+    test.assert(refused(pgtype.oid_uuid(), pgmsg.PgText, bytes.from_str("0102"), s))
+    test.assert(refused(pgtype.oid_uuid(), pgmsg.PgText, bytes.from_str("zz03"), s))
+    test.assert(refused(pgtype.oid_uuid(), pgmsg.PgBinary, wire("0102030405060708090a0b0c0d0e0f"), s))
+
+    test.case("a uuid that is not sixteen bytes is refused rather than padded")
+    test.assert(refused(pgtype.oid_uuid(), pgmsg.PgBinary, bytes.zeros(0), s))
+    match pgtype.encode(pgtype.PgUuid(v: bytes.zeros(3)), pgmsg.PgBinary)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("json is text, and jsonb in binary is a version byte first")
+    test.assert_eq_str(shown(pgtype.oid_json(), pgmsg.PgText, bytes.from_str("{\"a\":1}"), s),
+                       "{\"a\":1}")
+    test.assert_eq_str(shown(pgtype.oid_jsonb(), pgmsg.PgText, bytes.from_str("{}"), s), "{}")
+    test.assert_eq_str(shown(pgtype.oid_jsonb(), pgmsg.PgBinary,
+        bytes.concat([wire("01"), bytes.from_str("{}")]), s),
+        "{}")
+    test.assert(refused(pgtype.oid_jsonb(), pgmsg.PgBinary, wire("02"), s))
+    test.assert(refused(pgtype.oid_jsonb(), pgmsg.PgBinary, bytes.zeros(0), s))
+
+@test
+fn test_a_date_reads_in_both_formats_and_moves_with_datestyle() [io]
+    let iso = pgtype.default_settings()
+    let dmy = pgtype.apply_parameter(iso, "DateStyle", "SQL, DMY")
+    let german = pgtype.apply_parameter(iso, "DateStyle", "German, DMY")
+
+    test.case("the binary form is a count of days from 2000-01-01")
+    test.assert_eq_str(shown(pgtype.oid_date(), pgmsg.PgBinary, wire("00000000"), iso), "2000-01-01")
+    test.assert_eq_str(shown(pgtype.oid_date(), pgmsg.PgBinary, wire("ffffffff"), iso), "1999-12-31")
+    test.assert_eq_str(bytes.to_hex(encoded(
+        decoded(pgtype.oid_date(), pgmsg.PgBinary, wire("00000001"), iso), pgmsg.PgBinary)),
+        "00000001")
+    test.assert(refused(pgtype.oid_date(), pgmsg.PgBinary, wire("000000"), iso))
+
+    test.case("and the text form is the one the setting decides")
+    test.assert_eq_str(shown(pgtype.oid_date(), pgmsg.PgText, bytes.from_str("2000-01-01"), iso),
+                       "2000-01-01")
+    test.assert_eq_str(shown(pgtype.oid_date(), pgmsg.PgText, bytes.from_str("31.12.1999"), dmy),
+                       "1999-12-31")
+    test.assert_eq_str(shown(pgtype.oid_date(), pgmsg.PgText, bytes.from_str("31/12/1999"), german),
+                       "1999-12-31")
+
+    test.case("the same three numbers are two different dates without it")
+    // THE CLAIM THE MODULE COMMENT MAKES.  `01/02/2026` is the second
+    // of January under ISO and the first of February under SQL, DMY,
+    // and a decoder that ignored ParameterStatus reads one of them
+    // silently wrong.
+    test.assert_eq_str(shown(pgtype.oid_date(), pgmsg.PgText, bytes.from_str("01/02/2026"), iso),
+                       "2026-01-02")
+    test.assert_eq_str(shown(pgtype.oid_date(), pgmsg.PgText, bytes.from_str("01/02/2026"), dmy),
+                       "2026-02-01")
+
+    test.case("a style that spells the month as a name is refused, not guessed")
+    test.assert(refused(pgtype.oid_date(), pgmsg.PgText, bytes.from_str("Mar 15 2026"),
+                        pgtype.apply_parameter(iso, "DateStyle", "Postgres, MDY")))
+
+    test.case("and a date that does not exist is refused rather than invented")
+    test.assert(refused(pgtype.oid_date(), pgmsg.PgText, bytes.from_str("2026-02-30"), iso))
+    test.assert(refused(pgtype.oid_date(), pgmsg.PgText, bytes.from_str("not a date"), iso))
+
+@test
+fn test_a_timestamp_counts_microseconds_and_the_count_can_go_below_zero() [io]
+    let s = pgtype.default_settings()
+
+    test.case("the binary form is microseconds from 2000-01-01")
+    test.assert_eq_str(shown(pgtype.oid_timestamp(), pgmsg.PgBinary, wire("0000000000000000"), s),
+                       "2000-01-01 00:00:00")
+
+    test.case("one microsecond BELOW the epoch is the last one of 1999")
+    // -1 microsecond is 1999-12-31 23:59:59.999999 and not
+    // 2000-01-01 00:00:00 truncated: the day count is a division that
+    // has to round down.
+    test.assert_eq_str(shown(pgtype.oid_timestamp(), pgmsg.PgBinary, wire("ffffffffffffffff"), s),
+                       "1999-12-31 23:59:59.999999")
+    test.assert_eq_str(shown(pgtype.oid_timestamp(), pgmsg.PgBinary, wire("fffffffffff0bdc0"), s),
+                       "1999-12-31 23:59:59")
+    test.assert_eq_str(bytes.to_hex(encoded(
+        decoded(pgtype.oid_timestamp(), pgmsg.PgBinary, wire("ffffffffffffffff"), s),
+        pgmsg.PgBinary)),
+        "ffffffffffffffff")
+
+    test.case("the text form is the date, a space and the time")
+    test.assert_eq_str(shown(pgtype.oid_timestamp(), pgmsg.PgText,
+        bytes.from_str("2000-01-01 00:00:00"), s),
+        "2000-01-01 00:00:00")
+    test.assert_eq_str(shown(pgtype.oid_timestamp(), pgmsg.PgText,
+        bytes.from_str("2026-03-15 09:30:00.5"), s),
+        "2026-03-15 09:30:00.5")
+    test.assert(refused(pgtype.oid_timestamp(), pgmsg.PgText,
+        bytes.from_str("2000-01-01"), s))
+    test.assert(refused(pgtype.oid_timestamp(), pgmsg.PgText,
+        bytes.from_str("2000-01-01 25:00:00"), s))
+
+    test.case("a timestamptz keeps its offset, because the offset is in the text")
+    test.assert_eq_str(shown(pgtype.oid_timestamptz(), pgmsg.PgText,
+        bytes.from_str("2000-01-01 01:00:00+01"), s),
+        "2000-01-01 00:00:00+00")
+    test.assert_eq_str(shown(pgtype.oid_timestamptz(), pgmsg.PgText,
+        bytes.from_str("2000-01-01 00:00:00-05:30"), s),
+        "2000-01-01 05:30:00+00")
+    test.assert_eq_str(shown(pgtype.oid_timestamptz(), pgmsg.PgText,
+        bytes.from_str("1999-12-31 19:00:00-05"), s),
+        "2000-01-01 00:00:00+00")
+
+    test.case("while a zone NAME is refused: there is no zone table here")
+    test.assert(refused(pgtype.oid_timestamptz(), pgmsg.PgText,
+        bytes.from_str("2000-01-01 00:00:00"), s))
+    test.assert(refused(pgtype.oid_timestamptz(), pgmsg.PgText,
+        bytes.from_str("2000-01-01 00:00:00 CET"), s))
+
+    test.case("and the binary form is the same count as a timestamp's")
+    test.assert_eq_str(shown(pgtype.oid_timestamptz(), pgmsg.PgBinary, wire("0000000000000000"), s),
+                       "2000-01-01 00:00:00+00")
+    test.assert(refused(pgtype.oid_timestamp(), pgmsg.PgBinary, wire("00000000000000"), s))
+
+@test
+fn test_a_numeric_keeps_every_digit_the_wire_sent() [io]
+    let s = pgtype.default_settings()
+
+    test.case("the binary form is a digit count, a weight, a sign and a scale")
+    test.assert_eq_str(shown(pgtype.oid_numeric(), pgmsg.PgBinary,
+        wire("000200000000000100011388"), s),
+        "1.5")
+
+    test.case("and the text form uses them the same way")
+    test.assert_eq_str(bytes.to_hex(encoded(
+        decoded(pgtype.oid_numeric(), pgmsg.PgText, bytes.from_str("1.5"), s),
+        pgmsg.PgBinary)),
+        "000200000000000100011388")
+
+    test.case("1234.5678 round-trips exactly, which a Float would not")
+    test.assert_eq_str(shown(pgtype.oid_numeric(), pgmsg.PgText,
+        bytes.from_str("1234.5678"), s),
+        "1234.5678")
+    test.assert_eq_str(shown(pgtype.oid_numeric(), pgmsg.PgText,
+        bytes.from_str("1234.5678"), s),
+        pgtype.show(decoded(
+            pgtype.oid_numeric(), pgmsg.PgText, bytes.from_str("1234.5678"), s)))
+
+    test.case("a negative one keeps its sign, and a zero does not get one")
+    test.assert_eq_str(shown(pgtype.oid_numeric(), pgmsg.PgText,
+        bytes.from_str("-1234.5678"), s),
+        "-1234.5678")
+    test.assert_eq_str(shown(pgtype.oid_numeric(), pgmsg.PgText, bytes.from_str("-0"), s), "0")
+    test.assert_eq_str(shown(pgtype.oid_numeric(), pgmsg.PgText, bytes.from_str("0"), s), "0")
+
+    test.case("a scale longer than the digits pads with zeros")
+    test.assert_eq_str(pgtype.numeric_text(pgtype.numeric([15], -1, false, 4)), "0.0015")
+    test.assert_eq_str(pgtype.numeric_text(pgtype.numeric([1], 0, false, 7)), "1.0000000")
+    test.assert_eq_str(pgtype.numeric_text(pgtype.numeric([10000], 0, false, 0)), "10000")
+
+    test.case("numeric NaN is a value the wire carries and is not a Float NaN")
+    test.assert_eq_str(shown(pgtype.oid_numeric(), pgmsg.PgBinary, wire("00000000c0000000"), s),
+                       "NaN")
+    test.assert_eq_str(shown(pgtype.oid_numeric(), pgmsg.PgText, bytes.from_str("NaN"), s), "NaN")
+    test.assert(math.is_nan(pgtype.numeric_to_float(pgtype.numeric_nan())))
+
+    test.case("and the lossy conversion is the one a caller asked for")
+    test.assert(pgtype.numeric_to_float(numeric_of(decoded(
+        pgtype.oid_numeric(), pgmsg.PgText, bytes.from_str("1.5"), s))) == 1.5)
+    // Digits [1] with a weight of 1 is one digit standing for 10000^1.
+    test.assert(pgtype.numeric_to_float(pgtype.numeric([1], 1, true, 0)) == -10000.0)
+
+    test.case("a numeric that is not one is refused")
+    test.assert(refused(pgtype.oid_numeric(), pgmsg.PgText, bytes.from_str("1e5"), s))
+    test.assert(refused(pgtype.oid_numeric(), pgmsg.PgText, bytes.from_str("1.2.3"), s))
+    test.assert(refused(pgtype.oid_numeric(), pgmsg.PgText, bytes.from_str("1 2"), s))
+    test.assert(refused(pgtype.oid_numeric(), pgmsg.PgBinary, wire("0002000000000001000113"), s))
+    test.assert(refused(pgtype.oid_numeric(), pgmsg.PgBinary, wire("0001"), s))
+
+@test
+fn test_an_array_is_read_when_it_is_one_dimension_and_kept_whole_when_it_is_not() [io]
+    let s = pgtype.default_settings()
+    let ints = pgtype.element_oid_of(1007)
+
+    test.case("the array's own OID is what names its element type")
+    test.assert_eq(ints, pgtype.oid_int4())
+    test.assert_eq(pgtype.element_oid_of(1009), pgtype.oid_text())
+    test.assert_eq(pgtype.element_oid_of(2951), pgtype.oid_uuid())
+    test.assert_eq(pgtype.element_oid_of(0), 0)
+    test.assert_eq(pgtype.element_oid_of(9999), 0)
+
+    test.case("the text form is braces and commas")
+    test.assert_eq_str(shown(1007, pgmsg.PgText, bytes.from_str("{1,2,3}"), s), "{1, 2, 3}")
+    test.assert_eq_str(shown(1007, pgmsg.PgText, bytes.from_str("{}"), s), "{}")
+    test.assert_eq_str(shown(1009, pgmsg.PgText, bytes.from_str("{\"a,b\",\"c d\"}"), s),
+                       "{a,b, c d}")
+    test.assert_eq_str(shown(1007, pgmsg.PgText, bytes.from_str("{1,NULL}"), s), "{1, NULL}")
+
+    test.case("a shape this reader does not read keeps its bytes instead")
+    test.assert_eq_str(shown(1007, pgmsg.PgText, bytes.from_str("{{1,2},{3,4}}"), s),
+                       "type 1007, 13 byte(s), text")
+    test.assert_eq_str(shown(1007, pgmsg.PgText, bytes.from_str("{1,2"), s),
+                       "type 1007, 4 byte(s), text")
+    test.assert_eq_str(shown(1007, pgmsg.PgText, bytes.from_str("{1,}"), s),
+                       "type 1007, 4 byte(s), text")
+
+    test.case("and an element that is not its type is refused")
+    test.assert(refused(1007, pgmsg.PgText, bytes.from_str("{\"x\"}"), s))
+    test.assert(refused(1009, pgmsg.PgText, bytes.from_str("{a}"), pgtype.apply_parameter(
+        s, "client_encoding", "LATIN1")))
+
+    test.case("the binary form carries the element OID, so nothing depends on the array's")
+    // One dimension, no nulls, element OID 23, two elements, lower
+    // bound 1, then 0x0000002a and a NULL.
+    test.assert_eq_str(shown(1007, pgmsg.PgBinary,
+        wire("0000000100000000000000170000000200000001000000040000002affffffff"), s),
+        "{42, NULL}")
+
+    test.case("an empty array arrives with no dimensions at all")
+    test.assert_eq_str(shown(1007, pgmsg.PgBinary, wire("000000000000000000000017"), s), "{}")
+
+    test.case("two dimensions and a lower bound that is not 1 are kept whole")
+    // Two dimension headers, so twelve bytes of header and sixteen of
+    // dimension: 28 in all.
+    test.assert_eq_str(shown(1007, pgmsg.PgBinary,
+        wire("00000002000000000000001700000001000000020000000100000002"), s),
+        "type 1007, 28 byte(s), binary")
+    test.assert_eq_str(shown(1007, pgmsg.PgBinary,
+        wire("0000000100000000000000170000000200000000"), s),
+        "type 1007, 20 byte(s), binary")
+
+    test.case("a length that runs past the buffer is refused before it is believed")
+    test.assert(refused(1007, pgmsg.PgBinary,
+        wire("0000000100000000000000170000000200000001000000100000002a"), s))
+    test.assert(refused(1007, pgmsg.PgBinary, wire("0000000100000000"), s))
+    test.assert(refused(1007, pgmsg.PgBinary,
+        wire("0000000100000000000000170000000200000001"), s))
+
+    test.case("an array of an element type this package does not name is kept whole")
+    // 1017 is `point[]`, whose element type this package has no reader
+    // for: the OID names no element, so the bytes arrive intact rather
+    // than as an array of zero elements.
+    test.assert_eq_str(shown(1017, pgmsg.PgText, bytes.from_str("{1,2}"), s),
+                       "type 1017, 5 byte(s), text")
+
+@test
+fn test_a_row_is_decoded_against_the_description_that_says_what_it_is() [io]
+    let s = pgtype.default_settings()
+
+    test.case("three columns, three values: int4 in binary, text, bool in binary")
+    test.assert_eq_str(row_line(
+        row_description(3, bytes.concat([field("id", 23, 1),
+                                         field("label", 25, 0),
+                                         field("flag", 16, 1)])),
+        data_row([Some(wire("0000002a")), Some(bytes.from_str("hello")), None]), s),
+        "42|hello|NULL")
+
+    test.case("a NULL is a length of -1 and an empty value is a length of 0")
+    test.assert_eq_str(row_line(
+        row_description(2, bytes.concat([field("a", 25, 0), field("b", 25, 0)])),
+        data_row([Some(bytes.zeros(0)), None]), s),
+        "|NULL")
+
+    test.case("a row whose value count disagrees with its description is refused")
+    test.assert_eq_str(row_line(
+        row_description(3, bytes.concat([field("a", 23, 1), field("b", 23, 1),
+                                         field("c", 23, 1)])),
+        data_row([Some(wire("00000001")), Some(wire("00000002"))]), s),
+        "REFUSED")
+
+    test.case("a column whose value does not decode refuses the row")
+    test.assert_eq_str(row_line(
+        row_description(2, bytes.concat([field("a", 23, 1), field("b", 23, 1)])),
+        data_row([Some(wire("00000001")), Some(wire("000000"))]), s),
+        "REFUSED")
+
+    test.case("a description with every format and a value for each")
+    test.assert_eq_str(row_line(
+        row_description(6, bytes.concat([field("i", 23, 1), field("f", 701, 1),
+                                         field("n", 1700, 0), field("d", 1082, 1),
+                                         field("t", 1114, 1), field("u", 2950, 1)])),
+        data_row([Some(wire("00000007")), Some(wire("4000000000000000")),
+                  Some(bytes.from_str("2.50")), Some(wire("00000000")),
+                  Some(wire("0000000000000000")),
+                  Some(wire("0102030405060708090a0b0c0d0e0f10"))]),
+                  s),
+        "7|2|2.50|2000-01-01|2000-01-01 00:00:00|01020304-0506-0708-090a-0b0c0d0e0f10")
+
+@test
+fn test_a_type_this_package_does_not_name_is_reachable_rather_than_an_error() [io]
+    let s = pgtype.default_settings()
+
+    test.case("an unknown OID keeps its OID, its format and its bytes")
+    test.assert_eq_str(shown(9999, pgmsg.PgText, bytes.from_str("abc"), s),
+                       "type 9999, 3 byte(s), text")
+    test.assert_eq_str(shown(9999, pgmsg.PgBinary, bytes.from_str("abc"), s),
+                       "type 9999, 3 byte(s), binary")
+
+    test.case("and it encodes back as the same bytes")
+    let raw = bytes.from_str("abc")
+    let v = decoded(9999, pgmsg.PgBinary, raw, s)
+    test.assert_eq_str(bytes.to_hex(encoded(v, pgmsg.PgBinary)), bytes.to_hex(raw))
+    test.assert_eq_str(bytes.to_hex(encoded(v, pgmsg.PgText)), bytes.to_hex(raw))
+    test.assert_eq(pgtype.oid_for(v), 9999)
+
+    test.case("a fault names the length it wanted")
+    match pgtype.decode(pgtype.oid_int4(), pgmsg.PgBinary, wire("000000"), false, s)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(pgerror.describe(f) != "")
+
+@test
+fn test_a_value_knows_the_oid_it_binds_as_and_encodes_back() [io]
+    let s = pgtype.default_settings()
+
+    test.case("the OID a value binds as when the caller names none")
+    test.assert_eq(pgtype.oid_for(pgtype.PgNull), 0)
+    test.assert_eq(pgtype.oid_for(pgtype.PgBool(v: true)), pgtype.oid_bool())
+    test.assert_eq(pgtype.oid_for(pgtype.PgInt(v: 1)), pgtype.oid_int8())
+    test.assert_eq(pgtype.oid_for(pgtype.PgFloat(v: 1.0)), pgtype.oid_float8())
+    test.assert_eq(pgtype.oid_for(pgtype.PgNumericValue(v: pgtype.numeric([1], 0, false, 0))),
+                   pgtype.oid_numeric())
+    test.assert_eq(pgtype.oid_for(pgtype.PgStr(v: "a")), pgtype.oid_text())
+    test.assert_eq(pgtype.oid_for(pgtype.PgBytea(v: bytes.zeros(1))), pgtype.oid_bytea())
+    test.assert_eq(pgtype.oid_for(pgtype.PgJson(v: "{}")), pgtype.oid_json())
+    test.assert_eq(pgtype.oid_for(decoded(pgtype.oid_date(), pgmsg.PgBinary, wire("00000000"), s)),
+                   pgtype.oid_date())
+    test.assert_eq(pgtype.oid_for(decoded(pgtype.oid_timestamp(), pgmsg.PgBinary, wire("0000000000000000"), s)),
+                   pgtype.oid_timestamp())
+    test.assert_eq(pgtype.oid_for(decoded(pgtype.oid_timestamptz(), pgmsg.PgBinary, wire("0000000000000000"), s)),
+                   pgtype.oid_timestamptz())
+    test.assert_eq(pgtype.oid_for(pgtype.PgUuid(v: bytes.zeros(16))), pgtype.oid_uuid())
+    test.assert_eq(pgtype.oid_for(decoded(1007, pgmsg.PgText, bytes.from_str("{}"), s)), 1007)
+
+    test.case("an array's OID is the one its element's array type has, or none")
+    test.assert_eq(pgtype.oid_for(pgtype.PgArray(element_oid: pgtype.oid_int4(), elements: [])), 1007)
+    test.assert_eq(pgtype.oid_for(pgtype.PgArray(element_oid: pgtype.oid_numeric(), elements: [])), 1231)
+    test.assert_eq(pgtype.oid_for(pgtype.PgArray(element_oid: 9999, elements: [])), 0)
+    test.assert_eq(pgtype.oid_for(pgtype.PgArray(element_oid: 0, elements: [])), 0)
+
+    test.case("nothing is encoded as a null but a null")
+    match pgtype.encode(pgtype.PgNull, pgmsg.PgText)
+        Ok(e)  =>
+            test.assert(e.is_null)
+            test.assert_eq(bytes.len(e.raw), 0)
+        Err(_) => test.assert(false)
+    match pgtype.encode(pgtype.PgStr(v: ""), pgmsg.PgText)
+        Ok(e)  =>
+            test.assert(not e.is_null)
+            test.assert_eq(bytes.len(e.raw), 0)
+        Err(_) => test.assert(false)
+
+    test.case("an integer is eight bytes in binary and its decimal in text")
+    test.assert_eq_str(bytes.to_hex(encoded(pgtype.PgInt(v: 42), pgmsg.PgBinary)),
+                       "000000000000002a")
+    test.assert_eq_str(bytes.to_hex(encoded(pgtype.PgInt(v: 42), pgmsg.PgText)),
+                       bytes.to_hex(bytes.from_str("42")))
+
+    test.case("a bool is one byte in binary and one character in text")
+    test.assert_eq_str(bytes.to_hex(encoded(pgtype.PgBool(v: true), pgmsg.PgBinary)), "01")
+    test.assert_eq_str(bytes.to_hex(encoded(pgtype.PgBool(v: false), pgmsg.PgBinary)), "00")
+    test.assert_eq_str(bytes.to_hex(encoded(pgtype.PgBool(v: true), pgmsg.PgText)),
+                       bytes.to_hex(bytes.from_str("t")))
+
+    test.case("a date is a day count from 2000 and a text value is ISO whatever the session says")
+    let epoch = decoded(pgtype.oid_date(), pgmsg.PgBinary, wire("00000000"),
+                        pgtype.apply_parameter(s, "DateStyle", "SQL, DMY"))
+    test.assert_eq_str(bytes.to_hex(encoded(epoch, pgmsg.PgBinary)), "00000000")
+    test.assert_eq_str(bytes.to_hex(encoded(epoch, pgmsg.PgText)),
+                       bytes.to_hex(bytes.from_str("2000-01-01")))
+
+    test.case("an array in binary is a header and length-prefixed elements")
+    let arr = decoded(1007, pgmsg.PgText, bytes.from_str("{1,2}"), s)
+    test.assert_eq_str(bytes.to_hex(encoded(arr, pgmsg.PgBinary)),
+                       "000000010000000000000017000000020000000100000004000000010000000400000002")
+
+    test.case("and in text it is braces and commas, quoted only where it has to be")
+    test.assert_eq_str(bytes.to_hex(encoded(decoded(1009, pgmsg.PgText,
+                                                      bytes.from_str("{\"a,b\",c}"), s),
+                                                      pgmsg.PgText)),
+                       bytes.to_hex(bytes.from_str("{\"a,b\",c}")))
+
+    test.case("show renders a value and never SQL")
+    test.assert_eq_str(pgtype.show(pgtype.PgStr(v: "a\tb")), "a\tb")
+    test.assert_eq_str(pgtype.show(pgtype.PgBool(v: false)), "false")
+    test.assert_eq_str(pgtype.show(pgtype.PgNull), "NULL")
+    test.assert_eq_str(pgtype.show(pgtype.PgInt(v: 0)), "0")

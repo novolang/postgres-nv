@@ -1,23 +1,32 @@
 // pgconn.nv — the socket, the startup handshake, and the read loop
 // that turns bytes into `pgmsg.PgBackend`.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// `[io, net]`, AND THE `[io]` IS THE HONEST COST.  The handle in
+// `PgConn` and in every `PgTransport` call is an `Int`, because that
+// is what both halves of the ecosystem speak: `std.tls`'s session is
+// an `Int`, and a plain socket is a file descriptor reachable from a
+// `std.net` `Sock` through `net.sock_fd` and from nowhere else —
+// there is no `Int` back to a `Sock`.  So the plaintext transport
+// moves bytes with `io.read_fd`/`io.write_fd` and closes with
+// `tty.close`, which are `[io]`, while a transport wrapping
+// `std.tls` performs `[net]`.  A fn value may go where MORE effects
+// are allowed and never fewer, so the `PgTransport` slots are typed
+// `[io, net]` and every function here that touches a handle declares
+// both.  The interface release claimed `[net]` alone; measured
+// against the toolchain, an effect-free slot cannot hold anything
+// that can open a socket.
 //
-// `[net]` AND NOT `[io, net]`.  `std.net`'s free functions —
-// `net.connect`, `net.send_bytes`, `net.recv_bytes`, `net.close` —
-// declare `[net]` alone, so a client built on them costs `[net]` and
-// the `[io]` a `TcpStream` method would add is not owed.  `[time]`
-// appears only on the functions that consult a deadline, and nothing
-// here prints.
+// `[time]` appears only on the functions that consult a deadline, and
+// nothing here prints.
 //
 // TLS IS A HOOK AND NOT A DEPENDENCY.  A driver that chose a TLS
 // implementation would choose it for every program that links the
-// driver.  `PgTransport` is the seam: a caller supplies the two
-// functions that move bytes, and the default pair is `std.net`'s.
-// PostgreSQL's own `SSLRequest` is one eight-byte packet before any of
-// it — the server answers a single BYTE, `S` or `N`, not a message —
-// so the negotiation happens here and the handshake happens in the
-// caller's code.
+// driver.  `PgTransport` is the seam: a caller supplies the three
+// functions that move bytes, and the default set is the file
+// descriptor's.  PostgreSQL's own `SSLRequest` is one eight-byte
+// packet before any of it — the server answers a single BYTE, `S` or
+// `N`, not a message — so the negotiation happens here and the
+// handshake happens in the caller's code.
 //
 // A SERVER THAT ANSWERS `N` HAS NOT FAILED, AND THAT IS THE DANGER.
 // It has said "no TLS", and a client that continued has silently
@@ -78,30 +87,38 @@ pub enum PgSslMode
 // wants plaintext uses `plain_transport`; one that wants TLS wraps its
 // own handshake and supplies these three.
 //
+// The three slots are `[io, net]` because the two transports this
+// package is written for differ in exactly that: a file descriptor is
+// `[io]`, a `std.tls` session is `[net]`, and the slot has to be wide
+// enough for the more demanding of the two.
+//
 // The functions are NAMED FUNCTIONS and not lambdas: a lambda that
 // becomes a value is refused at `@tier(embedded)`, and while this
 // package makes no device claim, the shape is the one the rest of the
 // grid uses and there is no reason for this to be the exception.
 pub struct PgTransport
     // Send every byte, or answer the fault.  `handle` is whatever the
-    // caller's `connect` produced — a socket for plaintext, a session
-    // for TLS.
-    send: fn(Int, Bytes) -> ?pgerror.PgFault
+    // caller's `connect` produced — a file descriptor for plaintext,
+    // a session for TLS.
+    send: fn(Int, Bytes) -> ?pgerror.PgFault [io, net]
     // Read up to `n` bytes.  An empty answer means the peer closed.
-    recv: fn(Int, Int) -> Result<Bytes, pgerror.PgFault>
+    recv: fn(Int, Int) -> Result<Bytes, pgerror.PgFault> [io, net]
     // Close it.
-    close: fn(Int) -> ?pgerror.PgFault
+    close: fn(Int) -> ?pgerror.PgFault [io, net]
 
 // Where and as whom to connect.
 pub struct PgConnectOptions
     // A host name or address, or a filesystem path for a Unix socket
-    // — `std.net`'s `unix_connect` takes the same handle type, so one
-    // field covers both and `is_unix_socket` is the question.
+    // — a socket path is a DIRECTORY, and the socket file inside it is
+    // `.s.PGSQL.<port>` — so one field covers both and
+    // `is_unix_socket` is the question.
     host: Str
     port: Int
     user: Str
     password: Str
-    // Empty means the user's own name, which is PostgreSQL's rule.
+    // Empty means the user's own name, which is PostgreSQL's rule and
+    // is applied by the server rather than here: the field's emptiness
+    // is what leaves `database` out of the startup packet.
     database: Str
     // Sent as the `application_name` parameter, which is what shows
     // up in `pg_stat_activity`.  A client that leaves it empty is one
@@ -115,6 +132,19 @@ pub struct PgConnectOptions
     allow_cleartext: Bool
     // What the caller can bind the SCRAM exchange to.
     channel_binding: pgauth.PgChannelBinding
+    // The SCRAM client nonce, or empty for one taken from the clock.
+    //
+    // A FIELD RATHER THAN A DRAW, because the draw cannot be made
+    // from here.  Every source of randomness in the standard library
+    // charges `[rand]` — `crypto.rand_bytes` reads /dev/urandom and
+    // `rand.*` is a seeded xorshift — and an effect row is an
+    // interface: `[rand]` on `connect` would be charged to every
+    // program that links this package, including the ones that never
+    // reach a SCRAM exchange.  So the caller who has a random-number
+    // generator passes the nonce, and an empty one is answered with
+    // `fresh_nonce`'s clock reading, which is unique per connection
+    // and NOT unpredictable.
+    nonce: Str
     // Refuse a message larger than this.  A `DataRow` can
     // legitimately be a gigabyte, so the ceiling is the caller's
     // rather than a constant.
@@ -152,12 +182,345 @@ pub struct PgConn
     // THE FIELD A CALLER CHECKS before it decides a statement
     // succeeded — see `pgmsg`'s module comment.
     status: pgmsg.PgTxStatus
-    // True once the connection is unusable.
+    // True once the connection is unusable.  Set when the last thing
+    // heard was an `ErrorResponse` of severity `FATAL` or `PANIC`,
+    // which is the server saying the session is over — there is no
+    // `ReadyForQuery` after one, so no later read is going to say so.
     broken: Bool
+
+// A message and the connection it left behind.
+//
+// `next_message` answers both because the read loop MOVES the
+// connection: the bytes it consumed are out of the inbox, the
+// `ParameterStatus` it routed is in the settings, and a caller that
+// dropped the answer would be reading the same message again.
+pub struct PgReceived
+    conn: PgConn
+    message: pgmsg.PgBackend
+
+// The notifications that had arrived, and the connection without them.
+pub struct PgNotifications
+    conn: PgConn
+    notifications: [pgmsg.PgBackend]
+
+// The two numbers a cancel needs, so a caller can keep them somewhere
+// else — another task, another process — and cancel a query whose
+// connection it does not hold.
+//
+// Which is the realistic case: the thing that wants to cancel is
+// usually a timeout or a signal handler, and the connection is busy.
+pub struct PgCancelKey
+    host: Str
+    port: Int
+    process_id: Int
+    secret_key: Int
+
+// ── the pieces the bodies are built from ─────────────────────────────
+
+// How many bytes one read asks for.
+//
+// A message smaller than this usually arrives whole and a `DataRow`
+// larger than it in several; the loop does not care which, because a
+// short read is not an error to it.
+fn read_chunk() -> Int
+    8192
+
+// Send every byte, or answer the fault.
+//
+// `io.write_fd` already loops on a partial write and answers the count
+// it managed.  A count short of the whole is a socket that went away
+// between bytes, and the message the server is left holding half of is
+// a protocol error somewhere far from this line.
+fn fd_send(fd: Int, data: Bytes) -> ?pgerror.PgFault [io]
+    if io.write_fd(fd, data) < bytes.len(data)
+        return Some(pgerror.PgConnectionLost(during: "write"))
+    None
+
+// Read up to `n` bytes.
+//
+// `io.read_fd` tells EOF from an error — an empty value for the first,
+// `None` for the second — and this collapses them on purpose: a peer
+// that closed and a read that failed both mean the bytes are not
+// coming, which is all any caller here can do anything about.
+fn fd_recv(fd: Int, n: Int) -> Result<Bytes, pgerror.PgFault> [io]
+    match io.read_fd(fd, n)
+        None    => Err(pgerror.PgConnectionLost(during: "read"))
+        Some(b) =>
+            if bytes.len(b) == 0
+                return Err(pgerror.PgConnectionLost(during: "read"))
+            Ok(b)
+
+// Close a file descriptor.  `tty.close` is `close(2)` and answers
+// nothing, which is the whole of what says whether it worked.
+fn fd_close(fd: Int) -> ?pgerror.PgFault [io]
+    tty.close(fd)
+    None
+
+// The socket file PostgreSQL creates for a port inside the directory
+// the caller named — its own naming, and the reason `host` for a Unix
+// socket is a directory rather than a path to the socket itself.
+fn socket_path(host: Str, port: Int) -> Str
+    "${host}/.s.PGSQL.${port}"
+
+// Milliseconds on the same clock `time.now` reads.
+fn now_ms() -> Int [time]
+    float.to_int(time.now() * 1000.0)
+
+// A deadline `ms` from now, or 0 for "no deadline" — which is what a
+// timeout of zero means everywhere in this package.
+fn deadline_after(ms: Int) -> Int [time]
+    if ms <= 0
+        return 0
+    now_ms() + ms
+
+// How long is left, or -1 when there is no deadline to be inside.
+//
+// A deadline that has already passed answers 0 and never a negative
+// number: `poll` reads a negative timeout as "wait forever", which is
+// the one answer a deadline must not give.
+fn left_ms(deadline: Int) -> Int [time]
+    if deadline <= 0
+        return -1
+    let left = deadline - now_ms()
+    if left < 0
+        // cov: skip — a deadline can only be overrun by a transport
+        // whose own `recv` blocks past it, and every wait this module
+        // makes is capped at the deadline, so no test here can drive
+        // the clamp; it is kept because a caller's transport may block
+        // (`poll` reads a negative timeout as "wait forever", which is
+        // the one answer a deadline must not give).
+        return 0
+    left
+
+// Wait for the handle to be readable, or answer a fault when the
+// deadline passes first.
+//
+// The handle is waited on as a FILE DESCRIPTOR, which is what the
+// plaintext transport's handle is.  A caller whose transport wraps
+// something else enforces its own deadline inside `recv`, and asking
+// costs it nothing: `poll` on a number that is not an open descriptor
+// returns at once rather than blocking, so the wait simply does not
+// happen.
+fn wait_readable(fd: Int, deadline: Int) -> ?pgerror.PgFault [io, time]
+    let ms = left_ms(deadline)
+    if ms < 0
+        return None
+    if io.wait_either(fd, -1, ms) == 0
+        return Some(pgerror.PgTimedOut(operation: "read", ms: ms))
+    None
+
+// True when a fault is a deadline passing rather than an accident on
+// the wire.
+fn is_timeout(f: pgerror.PgFault) -> Bool
+    match f
+        PgTimedOut(_, _) => true
+        _                => false
+
+// The client nonce for a SCRAM exchange, taken from the clock.
+//
+// WHAT THIS IS AND WHAT IT IS NOT.  It is unique per connection to the
+// microsecond, and uniqueness is what the exchange asks of it: the
+// server's own contribution is what the client checks, and a nonce the
+// client has used before is the one failure that is visible on the
+// wire.  It is NOT unpredictable, and unpredictability is what a
+// caller who does not trust the server wants — so the caller that has
+// a random-number generator passes one in
+// `PgConnectOptions.nonce` and this is only the default.  The reason
+// it is a default rather than a draw is in that field's comment: the
+// draw costs `[rand]` and the row is the interface.
+fn fresh_nonce() -> Str [time]
+    "nv${float.to_int(time.now() * 1000000.0)}"
+
+// The nonce to begin an exchange with: the caller's, or the clock's.
+fn nonce_for(o: PgConnectOptions) -> Str [time]
+    if str.len(o.nonce) > 0
+        return o.nonce
+    fresh_nonce()
+
+// Where a parameter name sits in the list, or `None` when it is new.
+//
+// `list.find` answers the element and this needs the POSITION, because
+// the name and the value live in two lists that have to stay in step.
+fn parameter_index(names: [Str], name: Str) -> ?Int
+    for i in 0..list.len(names)
+        if list.get(names, i, "") == name
+            return Some(i)
+    None
+
+// The same list with one position replaced.
+fn replace_at(xs: [Str], i: Int, v: Str) -> [Str]
+    let head = list.slice(xs, 0, i)
+    let tail = list.slice(xs, i + 1, list.len(xs))
+    list.concat(list.concat(head, [v]), tail)
+
+// One `ParameterStatus` folded into the two lists: a name that has
+// arrived before replaces its value rather than being appended.
+//
+// The contract is "most recent value per name" and not "every message
+// the server ever sent": a caller asking for `TimeZone` wants the
+// session's zone, and a server sends `TimeZone` again every time the
+// session changes it.
+fn remember(names: [Str], values: [Str], name: Str, value: Str) -> ([Str], [Str])
+    match parameter_index(names, name)
+        None     => (list.concat(names, [name]), list.concat(values, [value]))
+        Some(at) => (names[:], replace_at(values, at, value))
+
+// `PgConn` again with the four fields the read loop absorbs into.
+//
+// Written once because a record has no update syntax and a struct
+// literal here would be twelve fields repeated at every call.
+fn with_absorbed(c: PgConn, names: [Str], values: [Str], settings: pgtype.PgTextSettings,
+                 notifications: [pgmsg.PgBackend]) -> PgConn
+    PgConn { handle: c.handle, transport: c.transport, options: c.options,
+             process_id: c.process_id, secret_key: c.secret_key,
+             parameter_names: names, parameter_values: values,
+             settings: settings, inbox: c.inbox, notifications: notifications,
+             status: c.status, broken: c.broken }
+
+// `PgConn` again with less in its inbox.
+fn with_inbox(c: PgConn, inbox: Bytes) -> PgConn
+    PgConn { handle: c.handle, transport: c.transport, options: c.options,
+             process_id: c.process_id, secret_key: c.secret_key,
+             parameter_names: c.parameter_names,
+             parameter_values: c.parameter_values, settings: c.settings,
+             inbox: inbox, notifications: c.notifications,
+             status: c.status, broken: c.broken }
+
+// `PgConn` again with a different identity or a different end state.
+fn with_ended(c: PgConn, process_id: Int, secret_key: Int, status: pgmsg.PgTxStatus,
+              broken: Bool) -> PgConn
+    PgConn { handle: c.handle, transport: c.transport, options: c.options,
+             process_id: process_id, secret_key: secret_key,
+             parameter_names: c.parameter_names,
+             parameter_values: c.parameter_values, settings: c.settings,
+             inbox: c.inbox, notifications: c.notifications,
+             status: status, broken: broken }
+
+// True when a message says the backend is going away.
+//
+// A `FATAL` or a `PANIC` is the last thing a session hears: the
+// backend stops, or is about to, and there is no `ReadyForQuery`
+// after it.  An ordinary `ERROR` is not this — the transaction is
+// aborted and a rollback restores the session.
+fn dead(m: pgmsg.PgBackend) -> Bool
+    match m
+        PgErrorResponse(fields) =>
+            pgerror.is_fatal(pgerror.PgServerError(fields: fields))
+        _                       => false
+
+// Take in one of the messages that belongs to no exchange.
+//
+// `ParameterStatus` is the one that matters: every text-format value
+// arrives against these settings, so a connection that did not record
+// them decodes dates against whatever the client assumed.  A
+// notification is queued for `take_notifications`; a notice is
+// dropped, which is what the server's own log is for.
+fn settle(c: PgConn, m: pgmsg.PgBackend) -> PgConn
+    match m
+        PgParameterStatus(name, value) =>
+            let pair = remember(c.parameter_names, c.parameter_values, name, value)
+            with_absorbed(c, pair.0, pair.1,
+                          pgtype.apply_parameter(c.settings, name, value),
+                          c.notifications)
+        PgNotification(_, _, _)        =>
+            with_absorbed(c, c.parameter_names, c.parameter_values, c.settings,
+                          list.concat(c.notifications, [m]))
+        _                              =>
+            c
+
+// Fold in what a message that IS handed back changes: the identity
+// the server announced, the transaction status, and whether the
+// connection is still usable.
+//
+// Routed here rather than left to the caller because a caller that
+// forgot `BackendKeyData` would have a connection that cannot be
+// cancelled, and one that forgot `ReadyForQuery` would have a
+// connection that lies about being in a failed transaction.
+// ONE REFERENCE THE MATCH WOULD OTHERWISE FREE.
+//
+// A SCRAM state that is the payload of a matched `Result` and is then
+// put into a tuple this module answers loses its reference: the tuple
+// slot takes the pointer without a `dup`, and the `drop` of the
+// scrutinee frees it, so the caller reads reclaimed memory.  Passing
+// it through this call takes the reference that the slot needs.
+// Filed as
+// `memory-perceus/a-match-bound-result-payload-carried-into-a-returned-tuple-is-freed-with-its-scrutinee`;
+// the comment goes when the filing is fixed.
+fn carry(s: ?pgauth.PgScram) -> ?pgauth.PgScram
+    match s
+        None        => None
+        Some(inner) => Some(inner)
+
+fn note(c: PgConn, m: pgmsg.PgBackend) -> PgConn
+    let status = match pgmsg.tx_status(m)
+        Some(s) => s
+        None    => c.status
+    let gone = c.broken or dead(m)
+    match m
+        PgBackendKeyData(pid, key) => with_ended(c, pid, key, status, gone)
+        _                          => with_ended(c, c.process_id, c.secret_key,
+                                                  status, gone)
+
+// One encoded frame, written.
+fn write_frame(c: PgConn, frame: Bytes) -> Result<PgConn, pgerror.PgFault> [io, net]
+    let push = c.transport.send
+    match push(c.handle, frame)
+        None    => Ok(c)
+        Some(f) => Err(f)
+
+// Read exactly one message off the wire, reassembling across reads.
+//
+// THE LOOP THE PACKAGE HAS.  `frame_length` answers whether the inbox
+// holds a whole message and `decode_backend` needs that answer to be
+// yes, so both of the things a socket read produces — half a message,
+// and a message and a half — are handled here rather than by every
+// caller.  The connection that comes back has the frame taken out of
+// its inbox.
+fn read_frame(c: PgConn, deadline: Int) -> Result<PgReceived, pgerror.PgFault> [io, net, time]
+    var conn = c
+    while true
+        match pgmsg.frame_length(conn.inbox, 0, conn.options.max_message_bytes)
+            Err(f)          =>
+                return Err(f)
+            Ok(Some(total)) =>
+                let rest = bytes.slice(conn.inbox, total, bytes.len(conn.inbox))
+                match pgmsg.decode_backend(conn.inbox, 0, conn.options.max_message_bytes)
+                    Err(f) =>
+                        return Err(f)
+                    Ok(m)  =>
+                        return Ok(PgReceived { conn: with_inbox(conn, rest),
+                                                     message: m })
+            Ok(None)        =>
+                match wait_readable(conn.handle, deadline)
+                    Some(f) =>
+                        return Err(f)
+                    None    =>
+                        match read_more(conn)
+                            Err(f) =>
+                                return Err(f)
+                            Ok(b)  =>
+                                conn = with_inbox(conn, conn.inbox + b)
+
+// One more read, appended to what is already buffered.
+fn read_more(c: PgConn) -> Result<Bytes, pgerror.PgFault> [io, net]
+    let pull = c.transport.recv
+    pull(c.handle, read_chunk())
+
+// Close a handle the connection does not own yet — a socket opened for
+// a cancel, or one whose handshake failed.
+//
+// The fault is dropped on purpose: there is nothing left to do about a
+// close that failed, and the caller is being told about the accident
+// that caused this one.
+fn hang_up(fd: Int, t: PgTransport) -> Unit [io, net]
+    let stop = t.close
+    let _ = stop(fd)
+    ()
 
 // ── transports ───────────────────────────────────────────────────────
 
-// The plaintext transport over `std.net`.
+// The plaintext transport: a file descriptor, read and written
+// directly.
 //
 // ```novo
 // use pgconn
@@ -166,15 +529,15 @@ pub struct PgConn
 //     let t = pgconn.plain_transport()
 //     println("ready")
 // ```
-pub fn plain_transport() -> PgTransport
-    todo("postgres-nv.pgconn.plain_transport")
+pub fn plain_transport() -> PgTransport [io]
+    PgTransport { send: fd_send, recv: fd_recv, close: fd_close }
 
 // Sensible options for a local server: 127.0.0.1, port 5432, TLS
 // preferred, a one-megabyte message ceiling and a ten-second connect
 // deadline.
 //
 // A function and not a constant so that a caller starts from
-// something rather than filling in fourteen fields, and so that the
+// something rather than filling in fifteen fields, and so that the
 // defaults are readable in one place.
 //
 // ```novo
@@ -184,7 +547,12 @@ pub fn plain_transport() -> PgTransport
 //     println("${pgconn.default_options("postgres").port}")
 // ```
 pub fn default_options(user: Str) -> PgConnectOptions
-    todo("postgres-nv.pgconn.default_options")
+    PgConnectOptions { host: "127.0.0.1", port: 5432, user: user,
+                       password: "", database: "", application_name: "postgres-nv",
+                       ssl_mode: PgSslPrefer, allow_cleartext: false,
+                       channel_binding: pgauth.PgBindingNone, nonce: "",
+                       max_message_bytes: 1048576, connect_timeout_ms: 10000,
+                       read_timeout_ms: 10000 }
 
 // True when `host` names a filesystem path rather than a host — it
 // begins with a `/`.
@@ -192,9 +560,239 @@ pub fn default_options(user: Str) -> PgConnectOptions
 // PostgreSQL's own rule, and the one that decides between
 // `net.connect` and `net.unix_connect`.
 pub fn is_unix_socket(host: Str) -> Bool
-    todo("postgres-nv.pgconn.is_unix_socket")
+    str.starts_with(host, "/")
 
 // ── connecting ───────────────────────────────────────────────────────
+
+// Open the socket and hand back its file descriptor.
+//
+// A `Sock` is a boxed descriptor and nothing more: `net.sock_fd` is
+// the only way across and there is no way back, so the descriptor is
+// taken once and the `Sock` is dropped — dropping it does not close
+// it, and the connection keeps the number for its whole life.
+fn open_socket(o: PgConnectOptions) -> Result<Int, pgerror.PgFault> [net]
+    let opened = if is_unix_socket(o.host)
+        net.unix_connect(socket_path(o.host, o.port))
+    else
+        net.connect_timeout(o.host, o.port, o.connect_timeout_ms)
+    match opened
+        None    => Err(pgerror.PgConnectFailed(host: o.host, port: o.port,
+                         detail: "no socket could be opened to that address"))
+        Some(s) => Ok(net.sock_fd(s))
+
+// True for every mode that asks the server the question at all.
+fn asks_for_tls(mode: PgSslMode) -> Bool
+    mode != PgSslDisable
+
+// What one byte of answer to `SSLRequest` means.
+//
+// `S` is the server saying it will; `N` is a refusal, which
+// `PgSslPrefer` accepts and everything above it does not — see the
+// module comment for why that refusal has to be an error rather than a
+// quiet downgrade.  Anything else is a server that did not understand
+// the question: PostgreSQL before 9.5 answers an `ErrorResponse`,
+// whose first byte is `E`.
+fn tls_answer(answer: Bytes, mode: PgSslMode) -> Result<Bool, pgerror.PgFault>
+    let first = bytes.byte_at(answer, 0) ?? 0
+    if first == 'S'
+        return Ok(true)
+    if first == 'N'
+        if mode == PgSslPrefer
+            return Ok(false)
+        return Err(pgerror.PgTlsRefused(detail: "the server refused TLS, and ${mode_name(mode)} does not continue in the clear"))
+    Err(pgerror.PgTlsRefused(detail: "the server answered SSLRequest with byte ${first}, which is neither S nor N, asked under ${mode_name(mode)}"))
+
+// A mode's name, for a refusal a human has to act on.
+fn mode_name(mode: PgSslMode) -> Str
+    match mode
+        // cov: skip — unreachable by construction: `negotiate_tls`
+        // answers `false` for `PgSslDisable` before `SSLRequest` is
+        // sent, so no answer byte is ever read under that mode and no
+        // refusal is ever written with its name in it.
+        PgSslDisable    => "PgSslDisable"
+        PgSslPrefer     => "PgSslPrefer"
+        PgSslRequire    => "PgSslRequire"
+        PgSslVerifyCa   => "PgSslVerifyCa"
+        PgSslVerifyFull => "PgSslVerifyFull"
+
+// The startup packet's parameter pairs, in the order it carries them.
+//
+// One function and not two: the packet is two parallel lists, and two
+// functions that have to agree about how many entries each produced is
+// the shape in which a parameter goes missing.
+//
+// `user` is required, `database` is left out so that the server applies
+// its own rule, and `client_encoding` is asked for rather than assumed
+// — the text decoder reads what the session says it is, and a client
+// that took the server's own locale encoding would be handed bytes it
+// cannot decode.
+fn startup_pairs(o: PgConnectOptions) -> [(Str, Str)]
+    var pairs: [(Str, Str)] = [("user", o.user), ("client_encoding", "UTF8")]
+    if str.len(o.database) > 0
+        pairs = list.concat(pairs, [("database", o.database)])
+    if str.len(o.application_name) > 0
+        pairs = list.concat(pairs, [("application_name", o.application_name)])
+    pairs
+
+// A connection as it exists before the server has said anything.
+fn fresh_conn(fd: Int, t: PgTransport, o: PgConnectOptions) -> PgConn
+    PgConn { handle: fd, transport: t, options: o, process_id: 0, secret_key: 0,
+             parameter_names: [], parameter_values: [],
+             settings: pgtype.default_settings(), inbox: bytes.zeros(0),
+             notifications: [], status: pgmsg.PgIdle, broken: false }
+
+// What to send back for one authentication request.
+//
+// Answers the MESSAGE to send and the SASL state to carry: `None` for
+// the message when the request is `AuthenticationOk`, which the server
+// follows with nothing to answer; `Some` for the state at the two
+// steps of a SASL exchange, because the proof is over the whole
+// exchange and not over the last message.
+//
+// THE MESSAGE AND NOT THE PAYLOAD, BECAUSE THERE ARE THREE `p` SHAPES.
+// A cleartext password, an MD5 answer and the two SASL steps all go
+// out under one type byte and are framed differently: the password
+// shapes are a null-terminated string, while the SASL INITIAL response
+// carries the mechanism's name and a length in front of its data.  A
+// function answering bare bytes would have to be paired with a rule
+// about which frame the caller should put around them, and the first
+// shape to get the wrong frame is a login that fails with a message
+// about an unsupported mechanism.  So the frame is chosen here, once,
+// next to the ask that decided it.
+//
+// THE EXCHANGE THE SERVER LEADS.  Four different asks arrive here — a
+// cleartext password, an MD5 answer, SASL, and "none of those" — and
+// which one arrives is the server's decision, not the caller's.  The
+// refusals are as much a part of it as the answers: a cleartext
+// password is not sent because a server asked for one, and a mechanism
+// this client cannot do is named rather than skipped.
+fn auth_answer(o: PgConnectOptions, request: pgmsg.PgAuthRequest,
+               pending: ?pgauth.PgScram) -> Result<(?pgmsg.PgFrontend, ?pgauth.PgScram), pgerror.PgFault> [time]
+    match request
+        PgAuthOk                     => Ok((None, carry(pending)))
+        PgAuthCleartext              =>
+            if not o.allow_cleartext
+                return Err(pgerror.PgUnsupportedAuth(method: "AuthenticationCleartextPassword, which this connection was not told to allow"))
+            Ok((Some(pgmsg.PgPasswordMessage(data: pgauth.cleartext_password(o.password))),
+                carry(pending)))
+        PgAuthMd5(salt)              =>
+            // THE TERMINATOR IS OURS.  A `PasswordMessage` body is a
+            // null-terminated string and the NUL counts inside the
+            // length; `md5_password` answers the text of the answer
+            // and nothing else, so the byte is added where the message
+            // is framed.  A frame that stopped at the last hex digit
+            // is one the server reads as a string with no end.
+            Ok((Some(pgmsg.PgPasswordMessage(data: bytes.concat([
+                    bytes.from_str(pgauth.md5_password(o.password, o.user, salt)),
+                    bytes.u8(0)]))),
+                carry(pending)))
+        PgAuthSasl(mechanisms)       =>
+            let mechanism = pgauth.choose_mechanism(mechanisms, o.channel_binding)!
+            let s = pgauth.begin(mechanism, nonce_for(o), o.channel_binding)!
+            // The mechanism's name and the length of
+            // the response in front of it — see this
+            // function's own comment.
+            Ok((Some(pgmsg.PgSaslInitialResponse(
+                    mechanism: mechanism,
+                    data: pgauth.client_first(s))),
+                    carry(Some(s))))
+        PgAuthSaslContinue(data)     =>
+            match pending
+                None    =>
+                    Err(pgerror.PgScramFailed(step: "continue",
+                        detail: "the server continued a SASL exchange that never began"))
+                Some(s) =>
+                    let s2 = pgauth.server_first(s, data, o.password, pgauth.min_iterations())!
+                    match pgauth.client_final(s2)
+                        // cov: skip — unreachable by construction:
+                        // `client_final` refuses only a `PgScram`
+                        // with no salted password, and this arm is
+                        // reached only with an `s2` from a
+                        // successful `server_first`, which always
+                        // sets the 32-byte PBKDF2 output.  The
+                        // refusal itself is driven from `pgauth`
+                        // directly, where a caller can hold a
+                        // `PgScram` from `begin` and no server has
+                        // answered yet.
+                        Err(f)  => Err(f)
+                        Ok(out) => Ok((Some(pgmsg.PgSaslResponse(data: out)),
+                                       carry(Some(s2))))
+        PgAuthSaslFinal(data)        =>
+            match pending
+                None    =>
+                    Err(pgerror.PgScramFailed(step: "final",
+                        detail: "the server finished a SASL exchange that never began"))
+                Some(s) =>
+                    match pgauth.verify_server(s, data)
+                        Some(f) => Err(f)
+                        None    => Ok((None, None))
+        PgAuthUnsupported(method, _) =>
+            Err(pgerror.PgUnsupportedAuth(method: method))
+
+// One message of the startup exchange, folded in.
+//
+// Answers the connection to carry on with, the SASL state to carry,
+// and whether the exchange is over.  Split out of the loop below
+// because the dispatch is four exchanges and none of them belongs
+// inside a `while` inside a `match`.
+fn handshake_step(conn: PgConn, r: PgReceived,
+                  scram: ?pgauth.PgScram) -> Result<(PgConn, ?pgauth.PgScram, Bool), pgerror.PgFault> [io, net, time]
+    if pgmsg.ends_exchange(r.message)
+        return Ok((r.conn, None, true))
+    if pgmsg.is_asynchronous(r.message)
+        return Ok((settle(r.conn, r.message), carry(scram), false))
+    match r.message
+        PgAuthentication(request) =>
+            let answer = auth_answer(r.conn.options, request, scram)!
+            match answer.0
+                None    => Ok((r.conn, carry(answer.1), false))
+                Some(m) =>
+                    let next = send(r.conn, m)!
+                    Ok((next, carry(answer.1), false))
+        PgErrorResponse(fields)   => Err(pgerror.PgServerError(fields: fields))
+        // cov: skip — unreachable by construction: `is_asynchronous` is
+        // true for a `PgNoticeResponse`, so the early return above
+        // absorbs a notice before this match is reached.  That is a
+        // measurement and not an argument — a mutation that made this
+        // arm answer a fault instead of `Ok` turned no test red in any
+        // of the thirteen suites.  The arm stays for what it says: a
+        // notice during startup is absorbed and not a fault, which is
+        // the answer a narrowed routing predicate would need here.
+        PgNoticeResponse(_)       => Ok((r.conn, carry(scram), false))
+        // `BackendKeyData` IS PART OF THE HANDSHAKE AND IS ABSORBED HERE
+        // RATHER THAN REFUSED.  Every server sends one between the last
+        // `Authentication` and the first `ReadyForQuery` — it is the
+        // identity a later `CancelRequest` needs — and it is not one of
+        // the three messages `is_asynchronous` routes, so the arm above
+        // does not catch it.  Refusing it here would make `connect`
+        // fail against every real server that answered the password
+        // correctly, which is the worst possible shape for this bug:
+        // the exchange looks complete on the wire and the client is the
+        // only end that thinks anything went wrong.
+        PgBackendKeyData(_, _)    => Ok((note(r.conn, r.message), carry(scram), false))
+        _                         =>
+            Err(pgerror.PgBadMessage(kind: 0, length: 0,
+                detail: "a message that belongs to no exchange arrived during startup"))
+
+// Everything the server says between the startup packet and the first
+// `ReadyForQuery`.
+fn handshake(c: PgConn, deadline: Int) -> Result<PgConn, pgerror.PgFault> [io, net, time]
+    var conn = c
+    var scram: ?pgauth.PgScram = None
+    while true
+        match read_frame(conn, deadline)
+            Err(f) =>
+                return Err(f)
+            Ok(r)  =>
+                match handshake_step(conn, r, scram)
+                    Err(f)   =>
+                        hang_up(conn.handle, conn.transport)
+                        return Err(f)
+                    Ok(step) =>
+                        conn = step.0
+                        scram = step.1
+                        if step.2
+                            return Ok(conn)
 
 // Open a connection: socket, `SSLRequest`, startup packet,
 // authentication, and every message up to the first
@@ -202,7 +800,9 @@ pub fn is_unix_socket(host: Str) -> Bool
 //
 // Answers a connection that is ready for work, which means the
 // `BackendKeyData` and every startup `ParameterStatus` have already
-// been absorbed.
+// been absorbed.  A connection that fails anywhere after the socket is
+// open has that socket closed before the fault comes back — a refused
+// password is not a reason to leave a descriptor behind.
 //
 // ```novo
 // use pgconn
@@ -212,8 +812,33 @@ pub fn is_unix_socket(host: Str) -> Bool
 //         Ok(c)  => println("${c.process_id}")
 //         Err(_) => println("could not connect")
 // ```
-pub fn connect(o: PgConnectOptions, t: PgTransport) -> Result<PgConn, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgconn.connect")
+pub fn connect(o: PgConnectOptions,
+               t: PgTransport) -> Result<PgConn, pgerror.PgFault> [io, net, time]
+    let deadline = deadline_after(o.connect_timeout_ms)
+    let fd = open_socket(o)!
+    match negotiate_tls(fd, t, o.ssl_mode)
+        Err(f) =>
+            hang_up(fd, t)
+            Err(f)
+        Ok(_)  =>
+            let conn = fresh_conn(fd, t, o)
+            // THE PAIR IS UNPACKED BY A `match` AND NOT BY A
+            // `let`.  `list.unzip` is a runtime-built tuple, and
+            // reading a heap member out of one through a `let`
+            // binding never releases it — four objects per
+            // connection (both lists and both their buffers),
+            // which is why this read a `split.0`/`split.1` and
+            // the leak table said 4 per login.  A `match`
+            // binder walks the tuple and is clean.  Filed as
+            // `memory-perceus/a-heap-member-read-out-of-a-let-bound-runtime-built-tuple-is-never-released`;
+            // the `let` can come back when the filing is fixed.
+            match list.unzip(startup_pairs(o))
+                (names, values) =>
+                    match send(conn, pgmsg.PgStartup(parameters: names, values: values))
+                        Err(f)   =>
+                            hang_up(fd, t)
+                            Err(f)
+                        Ok(sent) => handshake(sent, deadline)
 
 // Ask the server whether it will speak TLS, and answer what it said.
 //
@@ -224,6 +849,10 @@ pub fn connect(o: PgConnectOptions, t: PgTransport) -> Result<PgConn, pgerror.Pg
 // `N`, and `PgSslRequire` and above turn that into `PgTlsRefused`
 // rather than continuing — see the module comment.
 //
+// A mode of `PgSslDisable` answers `false` without writing anything,
+// which is what makes it the honest mode for a Unix socket: the server
+// has no TLS to offer there and asking would be eight bytes of noise.
+//
 // ```novo
 // use pgconn
 //
@@ -231,24 +860,80 @@ pub fn connect(o: PgConnectOptions, t: PgTransport) -> Result<PgConn, pgerror.Pg
 //     println("negotiation is a separate step")
 // ```
 pub fn negotiate_tls(handle: Int, t: PgTransport,
-                     mode: PgSslMode) -> Result<Bool, pgerror.PgFault> [net]
-    todo("postgres-nv.pgconn.negotiate_tls")
+                     mode: PgSslMode) -> Result<Bool, pgerror.PgFault> [io, net]
+    if not asks_for_tls(mode)
+        return Ok(false)
+    match pgmsg.encode_frontend(pgmsg.PgSslRequest)
+        // cov: skip — `PgSslRequest` is a fixed eight-byte frame that
+        // carries no caller data, so its encoder has no refusal to
+        // answer; the arm is the exhaustive match's.
+        Err(f)    => Err(f)
+        Ok(frame) =>
+            let push = t.send
+            match push(handle, frame)
+                Some(f) => Err(f)
+                None    =>
+                    let pull = t.recv
+                    // THE CALL IS BOUND BEFORE IT IS MATCHED, one
+                    // reference the match would otherwise leave to
+                    // nobody.  This is the shape — a `match` directly
+                    // over the `Result` of a call through a fn-typed
+                    // field — that novo 0.20.2 leaks one cell per call
+                    // for, filed as
+                    // `memory-perceus/a-match-that-rebuilds-the-result-of-a-call-through-a-fn-typed-struct-field-leaks`
+                    // (fixed in 0.20.3).  The binding is the filing's
+                    // own workaround and costs nothing: the same call,
+                    // in the same order, read into a name first.
+                    //
+                    // The `match` stays a `match`: `let b = answer!` in its
+                    // place leaves objects unreclaimed under the leak check.
+                    let answer = pull(handle, 1)
+                    match answer
+                        Err(e) =>
+                            Err(e)
+                        Ok(b)  =>
+                            tls_answer(b, mode)
 
 // Close the connection, sending `Terminate` first.
 //
 // Without the `Terminate` the server logs every disconnect as
 // unexpected, which is a log full of noise and a real problem hidden
-// in it.
-pub fn close(c: PgConn) -> ?pgerror.PgFault [net]
-    todo("postgres-nv.pgconn.close")
+// in it.  The `Terminate` is attempted whatever state the connection
+// is in, and its fault is preferred over the close's because it is the
+// one that says something went wrong while there was still a session.
+pub fn close(c: PgConn) -> ?pgerror.PgFault [io, net]
+    match send(c, pgmsg.PgTerminate)
+        Err(f) =>
+            hang_up(c.handle, c.transport)
+            Some(f)
+        Ok(_)  =>
+            let stop = c.transport.close
+            stop(c.handle)
 
 // ── the read loop ────────────────────────────────────────────────────
+
+// Whether an asynchronous message is one this loop ABSORBS.
+//
+// A NOTICE IS NOT ABSORBED.  It is asynchronous — it belongs to no
+// exchange and can arrive at any moment — but it is also the one
+// asynchronous message a caller is entitled to see: `pgquery`'s read
+// loop collects the notices that arrived during a statement onto that
+// statement's result, which is the whole difference between a driver
+// that reports `RAISE NOTICE` and one that swallows it.  The other two
+// are state and are folded into the connection instead: a
+// `ParameterStatus` changes how every later text value decodes, and a
+// `Notification` is queued for `take_notifications`.
+fn settles(m: pgmsg.PgBackend) -> Bool
+    match m
+        PgNoticeResponse(_) => false
+        _                   => pgmsg.is_asynchronous(m)
 
 // The next message from the server that belongs to the caller.
 //
 // THE PACKAGE'S ONE LOOP — see the module comment.  Reassembles across
 // socket reads, absorbs `ParameterStatus` into `settings`, queues
-// `NotificationResponse`, and hands back everything else.
+// `NotificationResponse`, and hands back everything else — notices
+// included, for the reason `settles` gives.
 //
 // ```novo
 // use pgconn
@@ -262,17 +947,24 @@ pub fn close(c: PgConn) -> ?pgerror.PgFault [net]
 //                 Ok(r)  => println("a message")
 //                 Err(_) => println("connection lost")
 // ```
-pub struct PgReceived
-    conn: PgConn
-    message: pgmsg.PgBackend
-
-// Read one message.
-pub fn next_message(c: PgConn) -> Result<PgReceived, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgconn.next_message")
+pub fn next_message(c: PgConn) -> Result<PgReceived, pgerror.PgFault> [io, net, time]
+    let deadline = deadline_after(c.options.read_timeout_ms)
+    var conn = c
+    while true
+        match read_frame(conn, deadline)
+            Err(f) =>
+                return Err(f)
+            Ok(r)  =>
+                if settles(r.message)
+                    conn = settle(r.conn, r.message)
+                else
+                    return Ok(PgReceived { conn: note(r.conn, r.message),
+                                           message: r.message })
 
 // Send one message.
-pub fn send(c: PgConn, m: pgmsg.PgFrontend) -> Result<PgConn, pgerror.PgFault> [net]
-    todo("postgres-nv.pgconn.send")
+pub fn send(c: PgConn, m: pgmsg.PgFrontend) -> Result<PgConn, pgerror.PgFault> [io, net]
+    let b = pgmsg.encode_frontend(m)!
+    write_frame(c, b)
 
 // Send several messages in one write.
 //
@@ -280,8 +972,9 @@ pub fn send(c: PgConn, m: pgmsg.PgFrontend) -> Result<PgConn, pgerror.PgFault> [
 // write rather than four, which turns four round trips into one.
 // Read `pgmsg.discards_until_sync` before pipelining two statements
 // under one `Sync`.
-pub fn send_batch(c: PgConn, ms: [pgmsg.PgFrontend]) -> Result<PgConn, pgerror.PgFault> [net]
-    todo("postgres-nv.pgconn.send_batch")
+pub fn send_batch(c: PgConn, ms: [pgmsg.PgFrontend]) -> Result<PgConn, pgerror.PgFault> [io, net]
+    let b = pgmsg.encode_batch(ms)!
+    write_frame(c, b)
 
 // Read until `ReadyForQuery`, discarding everything in between.
 //
@@ -289,8 +982,25 @@ pub fn send_batch(c: PgConn, ms: [pgmsg.PgFrontend]) -> Result<PgConn, pgerror.P
 // `Sync`, so the client sends one and drains to the boundary.  The
 // alternative — carrying on — is a client reading the previous
 // statement's results as this one's.
-pub fn drain_to_ready(c: PgConn) -> Result<PgConn, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgconn.drain_to_ready")
+//
+// An `ErrorResponse` met on the way is DISCARDED rather than returned:
+// the caller that drains is one that has already been told, and
+// re-reporting it here would turn every routine constraint violation
+// into two errors.  A fatal one still sets `broken`, and a connection
+// that the server closes mid-drain answers `PgConnectionLost` from the
+// read itself, which is the case where there is no boundary to reach.
+pub fn drain_to_ready(c: PgConn) -> Result<PgConn, pgerror.PgFault> [io, net, time]
+    var conn = c
+    var done = false
+    while not done
+        match next_message(conn)
+            Err(f) =>
+                return Err(f)
+            Ok(r)  =>
+                conn = r.conn
+                if pgmsg.ends_exchange(r.message)
+                    done = true
+    Ok(conn)
 
 // ── what arrived on its own ──────────────────────────────────────────
 
@@ -311,21 +1021,48 @@ pub fn drain_to_ready(c: PgConn) -> Result<PgConn, pgerror.PgFault> [net, time]
 //         Err(_) => println("no")
 //         Ok(c)  => println("${list.len(pgconn.take_notifications(c).notifications)}")
 // ```
-pub struct PgNotifications
-    conn: PgConn
-    notifications: [pgmsg.PgBackend]
-
-// Take the queued notifications, leaving the queue empty.
 pub fn take_notifications(c: PgConn) -> PgNotifications
-    todo("postgres-nv.pgconn.take_notifications")
+    let queued = c.notifications
+    PgNotifications { conn: with_absorbed(c, c.parameter_names, c.parameter_values,
+                                          c.settings, []),
+                      notifications: queued }
 
 // Wait up to `ms` for a notification, reading nothing else.
 //
 // The one call that blocks on purpose, for a program whose whole job
 // is to wait for a `NOTIFY`.  Zero notifications back means the
 // deadline passed, not that the connection is broken.
-pub fn wait_notification(c: PgConn, ms: Int) -> Result<PgNotifications, pgerror.PgFault> [net, time]
-    todo("postgres-nv.pgconn.wait_notification")
+//
+// WHAT IT WILL NOT READ.  A notification arrives on its own, so
+// anything else that arrives while waiting for one is a query answer
+// the caller did not expect to be standing at — and it is refused
+// rather than dropped, because a dropped `DataRow` is a result set
+// that is silently short a row.
+pub fn wait_notification(c: PgConn,
+                         ms: Int) -> Result<PgNotifications, pgerror.PgFault> [io, net, time]
+    let deadline = deadline_after(ms)
+    var conn = c
+    var fault: ?pgerror.PgFault = None
+    var done = false
+    while not done
+        if list.len(conn.notifications) > 0
+            done = true
+        else
+            match read_frame(conn, deadline)
+                Err(f) =>
+                    done = true
+                    if not is_timeout(f)
+                        fault = Some(f)
+                Ok(r)  =>
+                    if pgmsg.is_asynchronous(r.message)
+                        conn = settle(r.conn, r.message)
+                    else
+                        done = true
+                        fault = Some(pgerror.PgBadMessage(kind: 0, length: 0,
+                            detail: "a message that belongs to an exchange arrived while waiting for a notification"))
+    match fault
+        Some(f) => Err(f)
+        None    => Ok(take_notifications(conn))
 
 // A server parameter's current value, or empty.
 //
@@ -333,7 +1070,9 @@ pub fn wait_notification(c: PgConn, ms: Int) -> Result<PgNotifications, pgerror.
 // the last of which is how a client discovers it has connected to a
 // replica and cannot write.
 pub fn parameter(c: PgConn, name: Str) -> Str
-    todo("postgres-nv.pgconn.parameter")
+    match parameter_index(c.parameter_names, name)
+        None     => ""
+        Some(at) => list.get(c.parameter_values, at, "")
 
 // ── cancellation ─────────────────────────────────────────────────────
 
@@ -359,25 +1098,39 @@ pub fn parameter(c: PgConn, name: Str) -> Str
 //                 None    => println("the request was sent")
 //                 Some(_) => println("could not send it")
 // ```
-pub fn cancel(c: PgConn) -> ?pgerror.PgFault [net, time]
-    todo("postgres-nv.pgconn.cancel")
-
-// The two numbers a cancel needs, so a caller can keep them somewhere
-// else — another task, another process — and cancel a query whose
-// connection it does not hold.
-//
-// Which is the realistic case: the thing that wants to cancel is
-// usually a timeout or a signal handler, and the connection is busy.
-pub struct PgCancelKey
-    host: Str
-    port: Int
-    process_id: Int
-    secret_key: Int
+pub fn cancel(c: PgConn) -> ?pgerror.PgFault [io, net, time]
+    cancel_by_key(cancel_key(c), c.transport)
 
 // The cancel key of a connection.
 pub fn cancel_key(c: PgConn) -> PgCancelKey
-    todo("postgres-nv.pgconn.cancel_key")
+    PgCancelKey { host: c.options.host, port: c.options.port,
+                  process_id: c.process_id, secret_key: c.secret_key }
 
 // Send a cancel request from a key alone, with no connection.
-pub fn cancel_by_key(k: PgCancelKey, t: PgTransport) -> ?pgerror.PgFault [net, time]
-    todo("postgres-nv.pgconn.cancel_by_key")
+//
+// The socket is opened the same way a connection's is — a Unix socket
+// path is a directory here too — and the sixteen bytes go out before
+// anything is read, because there is nothing to read.
+pub fn cancel_by_key(k: PgCancelKey, t: PgTransport) -> ?pgerror.PgFault [io, net, time]
+    let o = PgConnectOptions { host: k.host, port: k.port, user: "", password: "",
+                               database: "", application_name: "",
+                               ssl_mode: PgSslDisable, allow_cleartext: false,
+                               channel_binding: pgauth.PgBindingNone, nonce: "",
+                               max_message_bytes: 1048576, connect_timeout_ms: 10000,
+                               read_timeout_ms: 0 }
+    match open_socket(o)
+        Err(f) => Some(f)
+        Ok(fd) =>
+            match pgmsg.encode_frontend(pgmsg.PgCancelRequest(process_id: k.process_id,
+                                                              secret_key: k.secret_key))
+                // cov: skip — sixteen fixed bytes with two `Int`s in
+                // them, so the encoder has no refusal to answer; the arm
+                // is the exhaustive match's.
+                Err(f)    =>
+                    hang_up(fd, t)
+                    Some(f)
+                Ok(frame) =>
+                    let push = t.send
+                    let sent = push(fd, frame)
+                    hang_up(fd, t)
+                    sent

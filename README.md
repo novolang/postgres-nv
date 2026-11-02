@@ -9,12 +9,6 @@ authentication, the two query protocols, the value formats, `COPY`,
 `LISTEN`/`NOTIFY`, cancellation, a connection pool and a `std.sql`
 driver.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called. The package is published so its design can be
-reviewed and depended on before it is implemented. Version 0.1.0 will
-be the first working release.
-
 ## What the protocol is
 
 A client opens a socket and sends a **startup message** naming the
@@ -118,10 +112,7 @@ fn main() [io, net, time]
                                 Some(v) => println(pgtype.show(v))
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: postgres-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`.
 
 ## What the package contains
 
@@ -141,8 +132,10 @@ The first four modules perform no input or output at all: bytes in,
 messages out, and messages in, bytes out. That is what lets the whole
 protocol be tested against wire captures with no server running, and
 what lets the same codec serve a client, a connection pooler and a
-test double. The last five declare `[net]`, and `[time]` where a
-deadline is consulted. No module here declares `[io]` or `[fs]`.
+test double. The last five move bytes on a handle, so they declare
+`[io, net]` — a transport is file descriptors — and `[time]` where a
+deadline or a clock reading is consulted. No module here declares
+`[fs]` or `[rand]`.
 
 ## How to choose an entry point
 
@@ -392,50 +385,75 @@ above refuse.
 ## Tests
 
 ```bash
-novo test tests/pgmsg_tests.nv    #  8 tests: the framing and the four predicates
-novo test tests/pgtype_tests.nv   #  9 tests: both value formats and the settings
-novo test tests/pgauth_tests.nv   #  8 tests: SCRAM against RFC 7677's vectors
-novo test tests/pghost_tests.nv   # 12 tests: the connection, the queries and the pool
+novo test tests/pgmsg_tests.nv          #  8 tests: the framing and the four predicates
+novo test tests/pgwire_edge_tests.nv    #  9 tests: every length field, byte for byte
+novo test tests/pgtype_tests.nv         #  9 tests: both value formats and the settings
+novo test tests/pgtype_paths_tests.nv   # 10 tests: every decoder path, and the refusals
+novo test tests/pgauth_tests.nv         #  8 tests: SCRAM against RFC 7677's vectors
+novo test tests/pgauth_vectors_tests.nv #  8 tests: the published exchange, value by value
+novo test tests/pghost_tests.nv         # 12 tests: the connection, the queries and the pool
+novo test tests/pgwire_server_tests.nv  #  8 tests: the client over a scripted server
+novo test tests/pgcover_codec_tests.nv  # 35 tests: the codec's refusals and its encoders
+novo test tests/pgcover_pool_tests.nv   # 22 tests: the pool's three decisions and its reset
+novo test tests/pgcover_api_tests.nv    # 16 tests: a whole exchange in a scripted inbox
+novo test tests/pgcover_conn_tests.nv   # 13 tests: the descriptor as a transport
+novo test tests/pgcover_driver_tests.nv #  8 tests: the `std.sql` driver's own questions
 ```
+
+Thirteen suites, 166 tests, all of them green.
 
 The wire is PostgreSQL's own Frontend/Backend Protocol chapter, which
 is the normative document. RFC 5802 and RFC 7677 are the SCRAM
 specifications, and RFC 7677 section 3's published exchange is what
-`pgauth_tests.nv` asserts against, intermediate value by intermediate
-value. `tokio-postgres` and `psycopg` are the reference
-implementations for the shape of the API.
+`pgauth_tests.nv` and `pgauth_vectors_tests.nv` assert against,
+intermediate value by intermediate value — the salted password, the
+client proof and the server signature, then the same exchange as the
+PostgreSQL form spells it, byte for byte. `tokio-postgres` and
+`psycopg` are the reference implementations for the shape of the API.
 
-No test opens a socket. The nonce, the salt and the server's bytes are
-all arguments, so a handshake is a value the test writes out and the
-same bytes produce the same proof on every run. The suite checks that
-a message split across two reads is reassembled, that a length field
-past the ceiling is refused, that an error message sets the
-discard-until-sync state, that an asynchronous message arriving inside
-a result set is routed and not counted as a row, that a text value
-reads differently under `DateStyle = SQL, DMY`, that a timestamp is
-read against the 2000 epoch, and that a SCRAM iteration count of 1 is
-refused.
+Eight of the thirteen suites open no socket. The nonce, the salt and
+the server's bytes are all arguments, so a handshake is a value the
+test writes out and the same bytes produce the same proof on every
+run. Those suites check that a message split across two reads is
+reassembled, that a length field past the ceiling is refused rather
+than allocated, that every frontend message encodes to the bytes a
+server reads, that a text field carrying a NUL is refused rather than
+truncated, that an error message sets the discard-until-sync state,
+that a text value reads differently under `DateStyle = SQL, DMY`, that
+a timestamp is read against the 2000 epoch, and that a SCRAM iteration
+count of 1 is refused.
 
-The tests compile today and fail at run, each on the
-`not implemented: postgres-nv.<module>.<fn>` panic that is its body.
-That is the expected state of an interface release. They turn green
-one at a time as bodies land.
+**`pgwire_server_tests.nv` puts the client on a socket**, because a
+codec has no self-consistency to check: the eight-byte `SSLRequest`
+going out before the startup packet, the password frame being read as
+a frame of the length it declares, the four messages of the SASL
+exchange in the order the server expects them, and a `CopyData` chunk
+being a chunk and not a row are all statements about two ends. So that
+file starts a scripted PostgreSQL on an ephemeral loopback port and
+runs the real client against it. The fixture builds every frame out of
+raw bytes rather than out of `pgmsg` — a fixture that asked this
+package's writer what to send would agree with it by construction — and
+asserts every frame the client sends as a literal hex string, the
+length fields included.
 
-## Implementation status
+**TESTED AGAINST A SCRIPTED SERVER, NOT A REAL ONE.** No PostgreSQL
+server was reachable on the machine this package was written on: no
+`postgres`, `psql`, `pg_isready` or `initdb` binary, nothing listening
+on 5432 or 5433, no `/var/run/postgresql` and no `/tmp/.s.PGSQL.*`
+socket. So the client's half of the protocol is what is pinned, message
+by message and byte by byte, and a real server's behaviour is not.
 
-Nothing is implemented. Every function below is a `todo()`.
-
-| Module | Public surface |
-| --- | --- |
-| `pgmsg` | `protocol_version`, `ssl_request_code`, `cancel_request_code`, `frame_length`, `frame_kind`, `decode_backend`, `encode_frontend`, `encode_batch`, `discards_until_sync`, `ends_exchange`, `is_asynchronous`, `tx_status`, `tag_rows`, `tag_command` |
-| `pgtype` | The sixteen type-OID accessors, `postgres_epoch_day`, `numeric`, `numeric_nan`, `default_settings`, `apply_parameter`, `decode`, `decode_row`, `encode`, `oid_for`, `uuid_text`, `numeric_to_float`, `numeric_text`, `show` |
-| `pgauth` | `min_iterations`, `choose_mechanism`, `begin`, `client_first`, `server_first`, `client_final`, `verify_server`, `salted_password`, `client_proof`, `server_signature`, `saslprep`, `md5_password`, `cleartext_password` |
-| `pgerror` | `describe`, `fields_new`, `set_field`, `sqlstate`, `sqlstate_class`, `is_retryable`, `is_fatal` |
-| `pgconn` | `plain_transport`, `default_options`, `is_unix_socket`, `connect`, `negotiate_tls`, `close`, `next_message`, `send`, `send_batch`, `drain_to_ready`, `take_notifications`, `wait_notification`, `parameter`, `cancel`, `cancel_key`, `cancel_by_key` |
-| `pgquery` | `simple`, `prepare`, `close_statement`, `execute`, `query`, `execute_count`, `pipeline`, `pipeline_unsynced`, `open_cursor`, `fetch`, `close_cursor`, `begin`, `commit`, `rollback`, `in_failed_transaction` |
-| `pgcopy` | `begin_in`, `send_raw`, `send_row`, `finish_in`, `fail_in`, `begin_out`, `recv_raw`, `recv_rows`, `finish_out`, `binary_header`, `binary_trailer`, `encode_binary_row`, `encode_text_row` |
-| `pgpool` | `default_policy`, `new_pool`, `warm`, `acquire`, `release`, `discard`, `reap`, `close_pool`, `stats`, `has_idle` |
-| `pgdriver` | `open`, `of_conn`, `borrow`, `give_back`, `last_fault`, `conn_of`, `query`, `to_db_error`, and the `Database` members `close`, `exec` and `query_count` |
+**One suite exits non-zero with every verdict green, and the object is
+the runtime's, not this package's.** `pgcover_conn_tests.nv` reads
+from a descriptor the kernel does not know on purpose — the read
+failure is what that test is for — and `novo_io_read_fd` on the 0.20.2
+toolchain answers `None` without releasing the buffer it allocated for
+the read, so the run reports one leaked object of tag 0 and exits 1
+with `novo test: the run leaked (exit 23 above)` under the verdicts.
+It is filed as
+`stdlib/io-read-fd-leaks-one-object-per-failed-read`, `fixed_in:
+0.20.3`. The CHANGELOG's `### Known` has the measurement and the
+resolved allocation site.
 
 ## Licence
 

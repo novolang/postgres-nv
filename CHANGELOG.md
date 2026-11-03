@@ -5,7 +5,7 @@ All notable changes to postgres-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## Unreleased
+## 0.1.0 — 2026-11-03
 
 ### Fixed
 
@@ -16,6 +16,8 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
 ### Changed
 
 - Error propagation reads `!` where it was a `match` returning the `Err` unchanged, the array-element reader, the text-format escape table and the private searches (`parameter_index`, `nul_at`, `first_number_at`, `zone_start`, `element_end`) use `match` and `?Int` rather than `-1`, and byte codes are character literals; no public signature or behaviour changes.
+
+This release requires novo 0.23.0 or later.
 
 ## 0.1.0 — 2026-10-13
 

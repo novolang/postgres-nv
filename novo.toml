@@ -38,7 +38,7 @@ category    = "databases"
 tags        = ["postgresql", "postgres", "wire-protocol", "scram", "database", "driver", "sql", "native-port"]
 repository  = "https://github.com/novolang/postgres-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.20.2"
+novo        = ">= 0.23.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
